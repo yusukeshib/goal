@@ -10,6 +10,9 @@ use serde_json::Value;
 
 use crate::state::unix_timestamp;
 
+const MAX_STREAM_PAYLOAD_BYTES: usize = 16 * 1024;
+const CONTENT_PREVIEW_BYTES: usize = 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum OutputMode {
     Plain,
@@ -72,9 +75,18 @@ impl Output {
             "run_id": run_id,
         });
         if let Ok(payload) = serde_json::from_slice::<Value>(trimmed) {
-            details["payload"] = payload;
+            details["payload"] = if trimmed.len() > MAX_STREAM_PAYLOAD_BYTES {
+                summarize_large_payload(&payload, trimmed.len())
+            } else {
+                payload
+            };
         } else {
-            details["content"] = Value::String(String::from_utf8_lossy(trimmed).into_owned());
+            let preview = &trimmed[..trimmed.len().min(CONTENT_PREVIEW_BYTES)];
+            details["content"] = Value::String(String::from_utf8_lossy(preview).into_owned());
+            if preview.len() < trimmed.len() {
+                details["truncated"] = Value::Bool(true);
+                details["original_bytes"] = Value::from(trimmed.len() as u64);
+            }
         }
         self.write_envelope("child_output", details)
     }
@@ -105,5 +117,66 @@ impl Output {
             writer.flush().context("flush stdout")?;
         }
         Ok(())
+    }
+}
+
+fn summarize_large_payload(payload: &Value, original_bytes: usize) -> Value {
+    let mut summary = serde_json::Map::from_iter([
+        ("truncated".to_owned(), Value::Bool(true)),
+        (
+            "original_bytes".to_owned(),
+            Value::from(original_bytes as u64),
+        ),
+    ]);
+    for key in [
+        "type",
+        "role",
+        "toolName",
+        "stopReason",
+        "isError",
+        "timestamp",
+    ] {
+        if let Some(value) = payload
+            .get(key)
+            .filter(|value| !value.is_array() && !value.is_object())
+        {
+            summary.insert(key.to_owned(), value.clone());
+        }
+    }
+    if let Some(message) = payload.get("message") {
+        let mut message_summary = serde_json::Map::new();
+        for key in ["type", "role", "stopReason", "timestamp"] {
+            if let Some(value) = message
+                .get(key)
+                .filter(|value| !value.is_array() && !value.is_object())
+            {
+                message_summary.insert(key.to_owned(), value.clone());
+            }
+        }
+        if !message_summary.is_empty() {
+            summary.insert("message".to_owned(), Value::Object(message_summary));
+        }
+    }
+    Value::Object(summary)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn large_child_payload_is_bounded_but_keeps_event_metadata() {
+        let payload = serde_json::json!({
+            "type": "message_update",
+            "role": "assistant",
+            "message": {"type": "tool_call", "content": "x".repeat(100_000)},
+        });
+        let summary = summarize_large_payload(&payload, 100_100);
+        assert_eq!(summary["truncated"], true);
+        assert_eq!(summary["original_bytes"], 100_100);
+        assert_eq!(summary["type"], "message_update");
+        assert_eq!(summary["role"], "assistant");
+        assert_eq!(summary["message"]["type"], "tool_call");
+        assert!(serde_json::to_vec(&summary).unwrap().len() < 1024);
     }
 }

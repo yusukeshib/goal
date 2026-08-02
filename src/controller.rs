@@ -7,9 +7,10 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 
 use crate::{
+    cancel::Interrupted,
     config::LoadedConfig,
     human,
     model::{DeciderAction, WorkerCompletion},
@@ -64,7 +65,7 @@ impl Controller {
                     )?;
                     observation
                 }
-                Err((RunError::Cancelled, _)) => bail!("controller interrupted"),
+                Err((RunError::Cancelled, _)) => return Err(Interrupted.into()),
                 Err((error, artifacts)) => {
                     self.record_run_error(
                         "sense_failed",
@@ -117,7 +118,7 @@ impl Controller {
                             ))?;
                         }
                     },
-                    Err((RunError::Cancelled, _)) => bail!("controller interrupted"),
+                    Err((RunError::Cancelled, _)) => return Err(Interrupted.into()),
                     Err((error, artifacts)) => {
                         self.record_run_error(
                             "decider_failed",
@@ -178,7 +179,7 @@ impl Controller {
                                 self.collect_pending_answer()?;
                             }
                         }
-                        Err((RunError::Cancelled, _)) => bail!("controller interrupted"),
+                        Err((RunError::Cancelled, _)) => return Err(Interrupted.into()),
                         Err((error, artifacts)) => {
                             self.record_run_error(
                                 "worker_failed",
@@ -282,7 +283,7 @@ impl Controller {
 
     fn ensure_running(&self) -> Result<()> {
         if self.cancelled.load(Ordering::SeqCst) {
-            bail!("controller interrupted");
+            return Err(Interrupted.into());
         }
         Ok(())
     }

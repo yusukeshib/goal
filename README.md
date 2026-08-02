@@ -48,7 +48,7 @@ Use `--output json` for a machine-readable stream:
 goal --output json goal.toml | jq --unbuffered -C .
 ```
 
-Every stdout line has the same `timestamp`, `type`, and `details` envelope. Controller events such as waits, completions, questions, and errors are structured. Child JSON is nested under `details.payload`; non-JSON child diagnostics are represented by `details.content`. The default `--output plain` preserves human-readable terminal output.
+Every stdout line has the same `timestamp`, `type`, and `details` envelope. Controller events such as waits, completions, questions, and errors are structured. Child JSON is nested under `details.payload`; non-JSON child diagnostics are represented by `details.content`. Oversized child lines are replaced in the foreground stream by bounded metadata with `truncated` and `original_bytes`; exact output remains in each run's `stdout.log` or `stderr.log`. The default `--output plain` preserves human-readable terminal output. Intentional Ctrl-C/SIGTERM emits `stopped` in JSON mode and exits successfully.
 
 ## Read-only GitHub sensor example
 

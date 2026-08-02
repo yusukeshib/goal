@@ -411,7 +411,11 @@ fn ctrl_c_terminates_worker_and_does_not_start_another_cycle() {
         .status()
         .unwrap();
     assert!(status.success());
-    let _ = child.wait().unwrap();
+    let controller_status = child.wait().unwrap();
+    assert!(
+        controller_status.success(),
+        "intentional interruption should be a clean exit: {controller_status}"
+    );
     thread::sleep(Duration::from_millis(150));
     assert_eq!(fixture.count("sensor-count"), 1);
     assert_eq!(fixture.count("decider-count"), 1);

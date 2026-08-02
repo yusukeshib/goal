@@ -11,7 +11,7 @@ use std::{
 
 use anyhow::{Result, anyhow, bail};
 
-use crate::{output::Output, state::HumanQuestion};
+use crate::{cancel::Interrupted, output::Output, state::HumanQuestion};
 
 pub fn read_answer(
     question: &HumanQuestion,
@@ -36,7 +36,7 @@ pub fn read_answer(
     });
     loop {
         if cancelled.load(Ordering::SeqCst) {
-            bail!("interrupted while awaiting human input; question remains pending");
+            return Err(Interrupted.into());
         }
         match receiver.recv_timeout(Duration::from_millis(100)) {
             Ok(Ok((0, _))) => bail!("stdin reached EOF; question remains pending"),

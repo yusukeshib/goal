@@ -1,3 +1,4 @@
+mod cancel;
 mod config;
 mod controller;
 mod human;
@@ -125,7 +126,9 @@ OUTPUT
   --output plain (default) prints human-readable terminal output.
   --output json emits strict JSONL on stdout. Every line uses the envelope
   {"timestamp":...,"type":"...","details":{...}}. Child JSON is nested in
-  details.payload; non-JSON diagnostics use details.content.
+  details.payload; non-JSON diagnostics use details.content. Oversized child
+  lines are summarized in the foreground stream while stdout.log/stderr.log
+  retain the exact output.
 
 EXAMPLES
   goal                             Use ./goal.toml
@@ -160,6 +163,11 @@ fn main() {
     } = Cli::parse();
     let output = output::Output::new(output_mode);
     if let Err(error) = run(config, output.clone()) {
+        if error.downcast_ref::<cancel::Interrupted>().is_some() {
+            let _ = output.event("stopped", serde_json::json!({"reason": "interrupted"}));
+            let _ = output.plain_stderr("controller stopped\n");
+            return;
+        }
         if output_mode == output::OutputMode::Json {
             let _ = output.event(
                 "error",
