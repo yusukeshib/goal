@@ -58,6 +58,28 @@ const RUN_HELP: &str = r#"CONFIGURATION
   Commands are argv arrays and are never passed through an implicit shell. To
   use shell syntax, explicitly configure ["sh", "-c", "..."] instead.
 
+GOAL SEMANTICS
+  GOAL.md must define what success means and whether the goal is finite or
+  continuous.
+
+  For a finite goal, the decider may return `complete` after a fresh observation
+  proves the success conditions are satisfied.
+
+  For a continuous goal, explicitly say that temporary health is not completion:
+  the decider must return `wait` when no action is currently needed, then sense
+  again later. For example:
+
+    Continuously keep all authored open pull requests mergeable.
+    Mergeable means all required CI passes, all actionable review feedback is
+    resolved, and all merge conflicts are resolved.
+    Never return Complete merely because everything is currently healthy.
+    When no action is currently needed, return Wait and check again later.
+
+  A goal can only be enforced as completely as its sensor observes reality.
+  Define ambiguous terms such as "all feedback", include every relevant source,
+  and implement pagination when an API can truncate PRs, checks, comments, or
+  review threads. Missing sensor data must not be treated as a healthy world.
+
 SENSOR CONTRACT
   The sensor must be read-only and emit exactly one JSON value on stdout.
   Stderr is diagnostic. Non-zero exit, timeout, or invalid JSON prevents the
