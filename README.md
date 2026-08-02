@@ -18,7 +18,15 @@ cargo build
 cargo run -- .
 ```
 
-Pass either a `goal.toml` file or its containing directory; a directory resolves to `<directory>/goal.toml`. The config directory defines the project directory. Relative goal and command paths are resolved by running child processes there. See [`examples/fake`](examples/fake) for a runnable deterministic cycle:
+Select a goal with `-C/--goal-dir`, then `GOAL_DIR`, then the current directory. The legacy `goal CONFIG_OR_DIR` form remains available for controller runs; targets literally named `run` or `stats` must use `-C` because those names are subcommands. A directory resolves to `<directory>/goal.toml`; its directory is the child working directory. Relative goal and command paths resolve from there.
+
+```sh
+goal -C ~/goals/mergeable-prs
+goal -C ~/goals/mergeable-prs run
+GOAL_DIR=~/goals/mergeable-prs goal
+```
+
+See [`examples/fake`](examples/fake) for a runnable deterministic cycle:
 
 ```sh
 cargo build
@@ -39,11 +47,22 @@ Deciders and workers are ordinary argv commands, without an implicit shell or PT
 
 The process must atomically write one tagged JSON object to `GOAL_RESULT_PATH`. Stdout and stderr are diagnostics only. Decider action tags are `run_task`, `wait`, `complete`, and `failure`; worker completion tags are `done` and `failure`. Neither process may request human input, approval, or intervention.
 
-Runtime state, compact events, prompts, results, and logs are kept under `.goal/`. In plain output mode, sensor stdout is treated as protocol data and hidden from the terminal; it remains available in the run's `stdout.log` and is passed unchanged to the decider. Sensor stderr diagnostics are still displayed. Any sensor, decider, or worker process, timeout, or protocol failure—and any logical `failure`—is recorded with its reason and run ID, then terminates the controller with a non-zero status. Internal retries are not performed; an external scheduler may start a separate run. The retained artifacts support offline analysis of successful and failed runs. Improvements must not weaken success criteria or silently waive unmet requirements.
+Runtime state, compact events, prompts, results, logs, and per-run `metadata.json` files are kept under `.goal/`. In plain output mode, sensor stdout is treated as protocol data and hidden from the terminal; it remains available in the run's `stdout.log` and is passed unchanged to the decider. Sensor stderr diagnostics are still displayed. Any sensor, decider, or worker process, timeout, or protocol failure—and any logical `failure`—is recorded with its reason and run ID, then terminates the controller with a non-zero status. Internal retries are not performed; an external scheduler may start a separate run. The retained artifacts support offline analysis of successful and failed runs. Improvements must not weaken success criteria or silently waive unmet requirements.
 
-## JSONL output
+## Statistics
 
-Use `--output json` for a machine-readable stream:
+`stats` reads existing artifacts without starting a sensor, decider, or worker:
+
+```sh
+goal -C ~/goals/mergeable-prs stats --since 24h
+goal -C ~/goals/mergeable-prs stats --since 7d --output json
+```
+
+It reports outcome counts, worker success rate, failure kinds, and average/p50/p95 duration by role. Directories created before metadata support are counted separately across all time and excluded from filtered success and duration calculations rather than inferred.
+
+## Controller JSONL output
+
+Use `--output json` for a machine-readable controller stream:
 
 ```sh
 goal --output json goal.toml | jq --unbuffered -C .

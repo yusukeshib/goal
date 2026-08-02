@@ -1,3 +1,4 @@
+mod analytics;
 mod cancel;
 mod config;
 mod controller;
@@ -8,12 +9,13 @@ mod runner;
 mod state;
 
 use std::{
+    io::{self, Write},
     path::PathBuf,
     sync::{Arc, atomic::AtomicBool},
 };
 
-use anyhow::Result;
-use clap::Parser;
+use anyhow::{Result, bail};
+use clap::{Parser, Subcommand};
 
 const ABOUT: &str = "A foreground controller that continuously pursues one natural-language goal";
 
@@ -26,6 +28,17 @@ const ROOT_HELP: &str = r#"HOW IT WORKS
   One process controls exactly one goal. To run multiple goals, give each goal
   its own directory and goal.toml, then start a separate `goal` process for each.
   Processes that modify the same project are not coordinated.
+
+TARGET SELECTION
+  -C/--goal-dir takes precedence over GOAL_DIR. Without either, goal.toml in the
+  current directory is used. The legacy `goal CONFIG_OR_DIR` form remains valid
+  for running the controller, except targets named `run` or `stats`, which must
+  use -C because those names are subcommands.
+
+COMMANDS
+  With no subcommand, goal runs the controller. `goal run` is the explicit form.
+  `goal stats` summarizes recorded child outcomes and durations without starting
+  sensor, decider, or worker processes.
 
 FILES
   goal.toml   Commands, timeouts, and the path to the natural-language goal.
@@ -117,25 +130,30 @@ DECIDER AND WORKER CONTRACT
 
 FAILURE ANALYSIS
   Runtime data lives under .goal/ beside the config file. Successful and failed
-  invocations retain prompts, results, stdout, and stderr under .goal/runs/, and
-  compact outcomes are appended to .goal/events.jsonl. These artifacts are the
-  source of truth for offline analysis and goal improvement. Automation must
-  not improve apparent success by weakening success criteria or silently
-  waiving unmet requirements.
+  invocations retain prompts, results, stdout, stderr, and metadata under
+  .goal/runs/, and compact outcomes are appended to .goal/events.jsonl. Run
+  `goal -C DIR stats --since 24h` for outcome counts, worker success rate, and
+  role-specific average, p50, and p95 durations. Historical directories without
+  metadata are counted across all time and excluded from filtered duration and
+  success rates.
+  Automation must not improve apparent success by weakening success criteria or
+  silently waiving unmet requirements.
 
 OUTPUT
-  --output plain (default) prints human-readable terminal output.
-  --output json emits strict JSONL on stdout. Every line uses the envelope
-  {"timestamp":...,"type":"...","details":{...}}. Child JSON is nested in
-  details.payload; non-JSON diagnostics use details.content. Oversized child
-  lines are summarized in the foreground stream while stdout.log/stderr.log
-  retain the exact output.
+  --output plain (default) prints human-readable terminal output. For controller
+  runs, --output json emits strict JSONL envelopes on stdout. For stats, it emits
+  one JSON report. Child JSON is nested in details.payload; non-JSON diagnostics
+  use details.content. Oversized child lines are summarized in the foreground
+  stream while stdout.log/stderr.log retain the exact output.
 
 EXAMPLES
-  goal                             Use ./goal.toml
-  goal goals/ci/goal.toml          Use an explicit config file
-  goal goals/ci/                    Use goals/ci/goal.toml
-  goal --output json goal.toml | jq --unbuffered -C .
+  goal                                      Run ./goal.toml
+  goal goals/ci/                            Legacy explicit run target
+  goal -C goals/ci run                      Canonical explicit run target
+  GOAL_DIR=goals/ci goal                    Select a default target
+  goal -C goals/ci stats --since 24h        Human-readable statistics
+  goal -C goals/ci stats --since 7d --output json
+  goal -C goals/ci --output json | jq --unbuffered -C .
 
   See examples/fake for a deterministic full cycle and
   examples/mergeable-prs for a real read-only GitHub sensor."#;
@@ -149,22 +167,50 @@ EXAMPLES
     after_help = RUN_HELP
 )]
 struct Cli {
-    /// Emit human-readable terminal output or strict JSONL.
-    #[arg(long, value_enum, default_value_t = output::OutputMode::Plain)]
+    /// Goal directory used by every command (overrides GOAL_DIR).
+    #[arg(
+        short = 'C',
+        long = "goal-dir",
+        global = true,
+        env = "GOAL_DIR",
+        value_name = "DIR"
+    )]
+    goal_dir: Option<PathBuf>,
+
+    /// Emit human-readable output or machine-readable JSON.
+    #[arg(
+        long,
+        value_enum,
+        global = true,
+        default_value_t = output::OutputMode::Plain
+    )]
     output: output::OutputMode,
 
-    /// Repo-local goal.toml file or its containing directory.
-    #[arg(default_value = "goal.toml", value_name = "CONFIG_OR_DIR")]
-    config: PathBuf,
+    #[command(subcommand)]
+    command: Option<Commands>,
+
+    /// Legacy run target: repo-local goal.toml or its containing directory.
+    #[arg(value_name = "CONFIG_OR_DIR")]
+    config: Option<PathBuf>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Run the foreground controller.
+    Run,
+    /// Summarize recorded child run outcomes and durations.
+    Stats {
+        /// Include runs started within this duration, such as 24h or 7d.
+        #[arg(long, value_name = "DURATION")]
+        since: Option<String>,
+    },
 }
 
 fn main() {
-    let Cli {
-        config,
-        output: output_mode,
-    } = Cli::parse();
+    let cli = Cli::parse();
+    let output_mode = cli.output;
     let output = output::Output::new(output_mode);
-    if let Err(error) = run(config, output.clone()) {
+    if let Err(error) = dispatch(cli, output.clone()) {
         if error.downcast_ref::<cancel::Interrupted>().is_some() {
             let _ = output.event("stopped", serde_json::json!({"reason": "interrupted"}));
             let _ = output.plain_stderr("controller stopped\n");
@@ -188,7 +234,21 @@ fn main() {
     }
 }
 
-fn run(config: PathBuf, output: output::Output) -> Result<()> {
+fn dispatch(cli: Cli, output: output::Output) -> Result<()> {
+    if cli.command.is_some() && cli.config.is_some() {
+        bail!("CONFIG_OR_DIR cannot be combined with a subcommand; use -C/--goal-dir");
+    }
+    let target = cli
+        .config
+        .or(cli.goal_dir)
+        .unwrap_or_else(|| PathBuf::from("goal.toml"));
+    match cli.command {
+        None | Some(Commands::Run) => run_controller(target, output),
+        Some(Commands::Stats { since }) => run_stats(target, since.as_deref(), cli.output),
+    }
+}
+
+fn run_controller(config: PathBuf, output: output::Output) -> Result<()> {
     let loaded = config::LoadedConfig::load(&config)?;
     let cancelled = Arc::new(AtomicBool::new(false));
     let signal_flag = Arc::clone(&cancelled);
@@ -196,4 +256,25 @@ fn run(config: PathBuf, output: output::Output) -> Result<()> {
         signal_flag.store(true, std::sync::atomic::Ordering::SeqCst);
     })?;
     controller::Controller::new(loaded, cancelled, output)?.run()
+}
+
+fn run_stats(
+    config_or_dir: PathBuf,
+    since: Option<&str>,
+    output_mode: output::OutputMode,
+) -> Result<()> {
+    let project_dir = analytics::resolve_project_dir(&config_or_dir)?;
+    let report = analytics::stats(&project_dir, since)?;
+    let mut stdout = io::stdout().lock();
+    match output_mode {
+        output::OutputMode::Plain => {
+            stdout.write_all(analytics::render_plain(&report).as_bytes())?
+        }
+        output::OutputMode::Json => {
+            serde_json::to_writer(&mut stdout, &report)?;
+            stdout.write_all(b"\n")?;
+        }
+    }
+    stdout.flush()?;
+    Ok(())
 }

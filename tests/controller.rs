@@ -108,9 +108,13 @@ fn help_fully_describes_configuration_and_process_contracts() {
         "sense -> decide -> act -> sense",
         "multiple goals",
         ".goal/",
-        "goal goals/ci/goal.toml",
         "goal goals/ci/",
+        "goal -C goals/ci run",
+        "GOAL_DIR=goals/ci goal",
         "CONFIG_OR_DIR",
+        "--goal-dir <DIR>",
+        "GOAL_DIR",
+        "stats",
     ] {
         assert!(
             root.contains(expected),
@@ -280,6 +284,56 @@ fn sense_task_done_resense_complete() {
 }
 
 #[test]
+fn stats_reports_metadata_and_goal_dir_precedence() {
+    let fixture = Fixture::new(
+        COUNT_SENSOR,
+        r#"n=0; test ! -f decider-count || n=$(cat decider-count); n=$((n+1)); echo "$n" > decider-count; if test "$n" = 1; then r='{"type":"run_task","task":"do one thing"}'; else r='{"type":"complete","summary":"observed done"}'; fi; printf '%s' "$r" > "$GOAL_RESULT_PATH""#,
+        r#"printf '{"type":"done","summary":"changed and checked"}' > "$GOAL_RESULT_PATH""#,
+    );
+    assert!(fixture.run().status.success());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_goal"))
+        .arg("-C")
+        .arg(fixture.dir.path())
+        .args(["stats", "--since", "24h", "--output", "json"])
+        .env("GOAL_DIR", "/definitely/not/the/goal")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["recorded_runs"], 5);
+    assert_eq!(report["legacy_runs_without_metadata_all_time"], 0);
+    assert_eq!(report["outcomes"]["success"], 5);
+    assert_eq!(report["worker_success_rate"], 1.0);
+    assert_eq!(report["roles"]["worker"]["duration_ms"]["count"], 1);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_goal"))
+        .arg("stats")
+        .env("GOAL_DIR", fixture.dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("worker success rate: 100.0%"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_goal"))
+        .arg("stats")
+        .current_dir(fixture.dir.path())
+        .env_remove("GOAL_DIR")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("5 recorded"));
+}
+
+#[test]
 fn sensor_timeout_is_terminal_and_never_calls_decider() {
     let fixture = Fixture::new(
         r#"echo 1 > sensor-count; sleep 10"#,
@@ -343,6 +397,20 @@ fn worker_reported_failure_is_recorded_and_exits_without_another_cycle() {
         "deployment credentials are unavailable"
     );
     assert!(failure["details"]["run_id"].is_string());
+
+    let stats = Command::new(env!("CARGO_BIN_EXE_goal"))
+        .arg("-C")
+        .arg(fixture.dir.path())
+        .args(["stats", "--output", "json"])
+        .output()
+        .unwrap();
+    assert!(stats.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&stats.stdout).unwrap();
+    assert_eq!(report["recorded_runs"], 3);
+    assert_eq!(report["outcomes"]["success"], 2);
+    assert_eq!(report["outcomes"]["failure"], 1);
+    assert_eq!(report["worker_success_rate"], 0.0);
+    assert_eq!(report["failures_by_kind"]["logical"], 1);
 }
 
 #[test]

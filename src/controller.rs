@@ -11,12 +11,13 @@ use anyhow::Result;
 use serde_json::Value;
 
 use crate::{
+    analytics::RunOutcome,
     cancel::Interrupted,
     config::LoadedConfig,
     model::{DeciderAction, WorkerCompletion},
     output::Output,
     prompt,
-    runner::{RunError, Runner},
+    runner::{RunArtifacts, RunError, Runner},
     state::{ControllerLock, PersistentState, StateStore, unix_timestamp},
 };
 
@@ -90,14 +91,19 @@ impl Controller {
             self.begin_cycle()?;
             let observation = match self.runner.run_sensor(&self.loaded.config.sensor) {
                 Ok((observation, artifacts)) => {
+                    artifacts.finish(RunOutcome::Success, None, Some("observation"), None)?;
                     self.store.event(
                         "sense_succeeded",
                         serde_json::json!({"run_id": artifacts.id}),
                     )?;
                     observation
                 }
-                Err((RunError::Cancelled, _)) => return Err(Interrupted.into()),
+                Err((RunError::Cancelled, artifacts)) => {
+                    finish_run_error(artifacts.as_deref(), &RunError::Cancelled)?;
+                    return Err(Interrupted.into());
+                }
                 Err((error, artifacts)) => {
+                    finish_run_error(artifacts.as_deref(), &error)?;
                     let run_id = artifacts.as_ref().map(|artifact| artifact.id.clone());
                     let reason = error.to_string();
                     self.record_run_error("sense_failed", &error, run_id.as_deref())?;
@@ -117,8 +123,12 @@ impl Controller {
                 &decider_prompt,
             ) {
                 Ok(result) => result,
-                Err((RunError::Cancelled, _)) => return Err(Interrupted.into()),
+                Err((RunError::Cancelled, artifacts)) => {
+                    finish_run_error(artifacts.as_deref(), &RunError::Cancelled)?;
+                    return Err(Interrupted.into());
+                }
                 Err((error, artifacts)) => {
+                    finish_run_error(artifacts.as_deref(), &error)?;
                     let run_id = artifacts.as_ref().map(|artifact| artifact.id.clone());
                     let reason = error.to_string();
                     self.record_run_error("decider_failed", &error, run_id.as_deref())?;
@@ -131,6 +141,7 @@ impl Controller {
             };
             if let Err(error) = action.validate() {
                 let reason = format!("schema validation: {error:#}");
+                artifacts.finish(RunOutcome::Failure, Some("protocol"), None, Some(&reason))?;
                 let details = serde_json::json!({
                     "run_id": artifacts.id,
                     "error": reason,
@@ -139,6 +150,18 @@ impl Controller {
                 self.output.event("decider_failed", details)?;
                 return self.terminal_failure("decider", reason, Some(artifacts.id));
             }
+            let (outcome, failure_kind, result_type, failure_reason) = match &action {
+                DeciderAction::RunTask { .. } => (RunOutcome::Success, None, "run_task", None),
+                DeciderAction::Wait { .. } => (RunOutcome::Success, None, "wait", None),
+                DeciderAction::Complete { .. } => (RunOutcome::Success, None, "complete", None),
+                DeciderAction::Failure { reason } => (
+                    RunOutcome::Failure,
+                    Some("logical"),
+                    "failure",
+                    Some(reason.as_str()),
+                ),
+            };
+            artifacts.finish(outcome, failure_kind, Some(result_type), failure_reason)?;
             let decider_run_id = artifacts.id;
             let details = serde_json::json!({
                 "run_id": decider_run_id,
@@ -163,6 +186,12 @@ impl Controller {
                         Ok((completion, artifacts)) => {
                             if let Err(error) = completion.validate() {
                                 let reason = format!("schema validation: {error:#}");
+                                artifacts.finish(
+                                    RunOutcome::Failure,
+                                    Some("protocol"),
+                                    None,
+                                    Some(&reason),
+                                )?;
                                 let details = serde_json::json!({
                                     "run_id": artifacts.id,
                                     "error": reason,
@@ -171,6 +200,24 @@ impl Controller {
                                 self.output.event("worker_failed", details)?;
                                 return self.terminal_failure("worker", reason, Some(artifacts.id));
                             }
+                            let (outcome, failure_kind, result_type, failure_reason) =
+                                match &completion {
+                                    WorkerCompletion::Done { .. } => {
+                                        (RunOutcome::Success, None, "done", None)
+                                    }
+                                    WorkerCompletion::Failure { reason } => (
+                                        RunOutcome::Failure,
+                                        Some("logical"),
+                                        "failure",
+                                        Some(reason.as_str()),
+                                    ),
+                                };
+                            artifacts.finish(
+                                outcome,
+                                failure_kind,
+                                Some(result_type),
+                                failure_reason,
+                            )?;
                             let details = serde_json::json!({
                                 "run_id": artifacts.id,
                                 "completion": completion,
@@ -183,8 +230,12 @@ impl Controller {
                                 return self.terminal_failure("worker", reason, Some(artifacts.id));
                             }
                         }
-                        Err((RunError::Cancelled, _)) => return Err(Interrupted.into()),
+                        Err((RunError::Cancelled, artifacts)) => {
+                            finish_run_error(artifacts.as_deref(), &RunError::Cancelled)?;
+                            return Err(Interrupted.into());
+                        }
                         Err((error, artifacts)) => {
+                            finish_run_error(artifacts.as_deref(), &error)?;
                             let run_id = artifacts.as_ref().map(|artifact| artifact.id.clone());
                             let reason = error.to_string();
                             self.record_run_error("worker_failed", &error, run_id.as_deref())?;
@@ -269,6 +320,18 @@ impl Controller {
         }
         Ok(())
     }
+}
+
+fn finish_run_error(artifacts: Option<&RunArtifacts>, error: &RunError) -> Result<()> {
+    if let Some(artifacts) = artifacts {
+        let outcome = if matches!(error, RunError::Cancelled) {
+            RunOutcome::Cancelled
+        } else {
+            RunOutcome::Failure
+        };
+        artifacts.finish(outcome, Some(error.kind()), None, Some(&error.to_string()))?;
+    }
+    Ok(())
 }
 
 fn cap_wait(requested: u64, maximum: u64) -> u64 {

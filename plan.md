@@ -132,9 +132,11 @@ Persistence and analysis
 * latest cycle identifier and timestamp.
 
 `.goal/events.jsonl` contains compact structured lifecycle and outcome events.
-Exact prompts, results, stdout, and stderr stay in each run directory. Existing
-state files containing legacy human-question fields are migrated by discarding
-those fields on load.
+Exact prompts, results, stdout, stderr, and versioned `metadata.json` stay in
+individual run directories. Metadata records role, start/end timestamps,
+duration, outcome, failure kind, result type, and reason. Existing state files
+containing legacy human-question fields are migrated by discarding those fields
+on load.
 
 The artifacts must distinguish:
 
@@ -142,7 +144,15 @@ The artifacts must distinguish:
 * logical decider or worker `failure` and its reason;
 * worker process, timeout, and protocol failures;
 * finite goal `complete`;
-* retries of read-only sensor or decider infrastructure.
+* terminal sensor, decider, and worker infrastructure failures.
+
+Target selection is shared by run and analysis commands: `-C/--goal-dir` wins
+over `GOAL_DIR`, which wins over the current directory. The old positional run
+target remains supported. `goal stats --since 24h` scans metadata without
+starting child processes and reports role-specific outcomes, worker success
+rate, failure kinds, and average/p50/p95 durations. Legacy run directories
+without metadata are counted across all time but excluded from filtered rates
+and durations.
 
 Daily goal improvement
 ----------------------

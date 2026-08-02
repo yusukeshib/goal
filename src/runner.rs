@@ -15,7 +15,11 @@ use anyhow::{Context, Result, anyhow};
 use serde::de::DeserializeOwned;
 use wait_timeout::ChildExt;
 
-use crate::{config::CommandConfig, output::Output};
+use crate::{
+    analytics::{METADATA_FILE, RunMetadata, RunOutcome},
+    config::CommandConfig,
+    output::Output,
+};
 
 #[derive(Debug)]
 pub struct RunArtifacts {
@@ -23,6 +27,30 @@ pub struct RunArtifacts {
     pub dir: PathBuf,
     pub prompt_path: PathBuf,
     pub result_path: PathBuf,
+    role: String,
+    started_at_ms: u64,
+    metadata_path: PathBuf,
+}
+
+impl RunArtifacts {
+    pub fn finish(
+        &self,
+        outcome: RunOutcome,
+        failure_kind: Option<&str>,
+        result_type: Option<&str>,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        RunMetadata::finished(
+            &self.id,
+            &self.role,
+            self.started_at_ms,
+            outcome,
+            failure_kind,
+            result_type,
+            reason,
+        )
+        .save(&self.metadata_path)
+    }
 }
 
 #[derive(Debug)]
@@ -32,6 +60,21 @@ pub enum RunError {
     Timeout,
     Cancelled,
     Protocol(anyhow::Error),
+}
+
+pub type RunResult<T> =
+    std::result::Result<(T, RunArtifacts), (RunError, Option<Box<RunArtifacts>>)>;
+
+impl RunError {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Infrastructure(_) => "infrastructure",
+            Self::NonZero(_) => "process",
+            Self::Timeout => "timeout",
+            Self::Cancelled => "cancelled",
+            Self::Protocol(_) => "protocol",
+        }
+    }
 }
 
 impl std::fmt::Display for RunError {
@@ -65,12 +108,7 @@ impl Runner {
         })
     }
 
-    pub fn run_json<T>(
-        &self,
-        role: &str,
-        config: &CommandConfig,
-        prompt: &str,
-    ) -> std::result::Result<(T, RunArtifacts), (RunError, Option<RunArtifacts>)>
+    pub fn run_json<T>(&self, role: &str, config: &CommandConfig, prompt: &str) -> RunResult<T>
     where
         T: DeserializeOwned,
     {
@@ -80,7 +118,7 @@ impl Runner {
         };
         match self.run_child(role, config, &artifacts, Some(prompt)) {
             Ok(_) => {}
-            Err(error) => return Err((error, Some(artifacts))),
+            Err(error) => return Err((error, Some(Box::new(artifacts)))),
         }
         let bytes = match fs::read(&artifacts.result_path) {
             Ok(bytes) => bytes,
@@ -89,7 +127,7 @@ impl Runner {
                     RunError::Protocol(
                         anyhow!(error).context(format!("read {}", artifacts.result_path.display())),
                     ),
-                    Some(artifacts),
+                    Some(Box::new(artifacts)),
                 ));
             }
         };
@@ -100,34 +138,50 @@ impl Runner {
                     "parse {} as one JSON object",
                     artifacts.result_path.display()
                 ))),
-                Some(artifacts),
+                Some(Box::new(artifacts)),
             )),
         }
     }
 
     fn create_artifacts(&self, role: &str, prompt: &str) -> Result<RunArtifacts> {
-        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let started = SystemTime::now().duration_since(UNIX_EPOCH)?;
+        let nonce = started.as_nanos();
+        let started_at_ms = started.as_millis() as u64;
         let id = format!("{nonce}-{role}");
         let dir = self.runs_dir.join(&id);
-        fs::create_dir(&dir).with_context(|| format!("create run directory {}", dir.display()))?;
-        let prompt_path = dir.join("prompt.md");
-        let result_path = dir.join("result.json");
-        fs::write(&prompt_path, prompt).context("write prompt")?;
-        File::create(dir.join("stdout.log")).context("create stdout log")?;
-        File::create(dir.join("stderr.log")).context("create stderr log")?;
+        let temporary_dir = self
+            .runs_dir
+            .join(format!(".{id}.tmp-{}", std::process::id()));
+        fs::create_dir(&temporary_dir)
+            .with_context(|| format!("create run directory {}", temporary_dir.display()))?;
+        let setup = (|| -> Result<()> {
+            fs::write(temporary_dir.join("prompt.md"), prompt).context("write prompt")?;
+            File::create(temporary_dir.join("stdout.log")).context("create stdout log")?;
+            File::create(temporary_dir.join("stderr.log")).context("create stderr log")?;
+            RunMetadata::running(&id, role, started_at_ms)
+                .save(&temporary_dir.join(METADATA_FILE))?;
+            Ok(())
+        })();
+        if let Err(error) = setup {
+            let _ = fs::remove_dir_all(&temporary_dir);
+            return Err(error);
+        }
+        if let Err(error) = fs::rename(&temporary_dir, &dir) {
+            let _ = fs::remove_dir_all(&temporary_dir);
+            return Err(error).with_context(|| format!("publish run directory {}", dir.display()));
+        }
         Ok(RunArtifacts {
+            prompt_path: dir.join("prompt.md"),
+            result_path: dir.join("result.json"),
+            metadata_path: dir.join(METADATA_FILE),
             id,
             dir,
-            prompt_path,
-            result_path,
+            role: role.to_owned(),
+            started_at_ms,
         })
     }
 
-    pub fn run_sensor(
-        &self,
-        config: &CommandConfig,
-    ) -> std::result::Result<(serde_json::Value, RunArtifacts), (RunError, Option<RunArtifacts>)>
-    {
+    pub fn run_sensor(&self, config: &CommandConfig) -> RunResult<serde_json::Value> {
         let artifacts = match self.create_artifacts(
             "sensor",
             "Sensor invocation: stdout is the JSON observation.\n",
@@ -137,7 +191,7 @@ impl Runner {
         };
         let (stdout, _) = match self.run_child("sensor", config, &artifacts, None) {
             Ok(output) => output,
-            Err(error) => return Err((error, Some(artifacts))),
+            Err(error) => return Err((error, Some(Box::new(artifacts)))),
         };
         let value: serde_json::Value = match serde_json::from_slice(&stdout) {
             Ok(value) => value,
@@ -146,12 +200,12 @@ impl Runner {
                     RunError::Protocol(
                         anyhow!(error).context("parse sensor stdout as exactly one JSON value"),
                     ),
-                    Some(artifacts),
+                    Some(Box::new(artifacts)),
                 ));
             }
         };
         if let Err(error) = atomic_write(&artifacts.result_path, &stdout) {
-            return Err((RunError::Infrastructure(error), Some(artifacts)));
+            return Err((RunError::Infrastructure(error), Some(Box::new(artifacts))));
         }
         Ok((value, artifacts))
     }
