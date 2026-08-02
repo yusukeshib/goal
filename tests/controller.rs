@@ -75,7 +75,7 @@ timeout_seconds = 1
 
 fn command(config: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_goal"));
-    command.args(["run", "--config"]).arg(config);
+    command.arg(config);
     command
 }
 
@@ -89,6 +89,46 @@ fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
 }
 
 const COUNT_SENSOR: &str = r#"n=0; test ! -f sensor-count || n=$(cat sensor-count); n=$((n+1)); echo "$n" > sensor-count; printf '{"sense":%s}\n' "$n""#;
+
+#[test]
+fn help_fully_describes_configuration_and_process_contracts() {
+    let root = Command::new(env!("CARGO_BIN_EXE_goal"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(root.status.success());
+    let root = String::from_utf8(root.stdout).unwrap();
+    for expected in [
+        "sense -> decide -> act -> sense",
+        "multiple goals",
+        ".goal/",
+        "goal goals/ci/goal.toml",
+    ] {
+        assert!(
+            root.contains(expected),
+            "missing {expected:?} from root help"
+        );
+    }
+
+    let run = Command::new(env!("CARGO_BIN_EXE_goal"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(run.status.success());
+    let run = String::from_utf8(run.stdout).unwrap();
+    for expected in [
+        "goal_file = \"GOAL.md\"",
+        "SENSOR CONTRACT",
+        "GOAL_RESULT_PATH",
+        "{prompt}",
+        "run_task",
+        "needs_input",
+        "EOF or interruption",
+        "failed worker is not blindly rerun",
+    ] {
+        assert!(run.contains(expected), "missing {expected:?} from run help");
+    }
+}
 
 #[test]
 fn sense_task_done_resense_complete() {
