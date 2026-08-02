@@ -11,7 +11,6 @@ use serde::Deserialize;
 pub struct Config {
     pub goal_file: PathBuf,
     pub interval_seconds: u64,
-    pub retry_seconds: u64,
     #[serde(default = "default_max_wait")]
     pub max_wait_seconds: u64,
     pub sensor: CommandConfig,
@@ -107,7 +106,6 @@ mod tests {
     fn valid() -> &'static str {
         r#"goal_file = "GOAL.md"
 interval_seconds = 0
-retry_seconds = 0
 max_wait_seconds = 10
 [sensor]
 command = ["sensor"]

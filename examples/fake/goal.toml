@@ -1,6 +1,5 @@
 goal_file = "GOAL.md"
 interval_seconds = 0
-retry_seconds = 1
 max_wait_seconds = 60
 
 [sensor]

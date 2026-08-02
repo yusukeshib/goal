@@ -27,17 +27,16 @@ impl Fixture {
             format!(
                 r#"goal_file = "GOAL.md"
 interval_seconds = 0
-retry_seconds = 0
 max_wait_seconds = 1
 [sensor]
 command = ["{}"]
-timeout_seconds = 1
+timeout_seconds = 5
 [decider]
 command = ["{}", "{{prompt}}"]
-timeout_seconds = 1
+timeout_seconds = 5
 [worker]
 command = ["{}"]
-timeout_seconds = 1
+timeout_seconds = 5
 "#,
                 sensor.display(),
                 decider.display(),
@@ -52,14 +51,14 @@ timeout_seconds = 1
         command(&self.config).output().unwrap()
     }
 
-    fn set_worker_timeout(&self, seconds: u64) {
+    fn set_timeout(&self, section: &str, seconds: u64) {
         let mut config = fs::read_to_string(&self.config).unwrap();
-        let marker = "timeout_seconds = 1";
-        let offset = config.rfind(marker).unwrap();
-        config.replace_range(
-            offset..offset + marker.len(),
-            &format!("timeout_seconds = {seconds}"),
-        );
+        let section_offset = config.find(&format!("[{section}]")).unwrap();
+        let value_offset = section_offset
+            + config[section_offset..].find("timeout_seconds = ").unwrap()
+            + "timeout_seconds = ".len();
+        let value_end = value_offset + config[value_offset..].find('\n').unwrap();
+        config.replace_range(value_offset..value_end, &seconds.to_string());
         fs::write(&self.config, config).unwrap();
     }
 
@@ -281,38 +280,41 @@ fn sense_task_done_resense_complete() {
 }
 
 #[test]
-fn sensor_failures_never_call_decider_until_valid_observation() {
+fn sensor_timeout_is_terminal_and_never_calls_decider() {
     let fixture = Fixture::new(
-        r#"n=0; test ! -f sensor-count || n=$(cat sensor-count); n=$((n+1)); echo "$n" > sensor-count; case "$n" in 1) exit 3;; 2) printf 'not json';; 3) sleep 2;; *) printf '{"healthy":true}';; esac"#,
-        r#"echo 1 > decider-count; printf '{"type":"complete","summary":"valid observation"}' > "$GOAL_RESULT_PATH""#,
-        r#"exit 99"#,
+        r#"echo 1 > sensor-count; sleep 10"#,
+        r#"echo 1 > decider-count"#,
+        r#"echo 1 > worker-count"#,
     );
+    fixture.set_timeout("sensor", 3);
     let output = fixture.run();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(fixture.count("sensor-count"), 4);
-    assert_eq!(fixture.count("decider-count"), 1);
+    assert!(!output.status.success());
+    assert_eq!(fixture.count("sensor-count"), 1);
+    assert_eq!(fixture.count("decider-count"), 0);
+    assert_eq!(fixture.count("worker-count"), 0);
+    let failure = fixture.failure_event();
+    assert_eq!(failure["details"]["source"], "sensor");
+    assert_eq!(failure["details"]["reason"], "process timed out");
+    assert!(failure["details"]["run_id"].is_string());
 }
 
 #[test]
-fn decider_failure_retries_without_acting_or_resensing() {
+fn decider_timeout_is_terminal_and_never_calls_worker() {
     let fixture = Fixture::new(
         COUNT_SENSOR,
-        r#"n=0; test ! -f decider-count || n=$(cat decider-count); n=$((n+1)); echo "$n" > decider-count; if test "$n" = 1; then exit 4; fi; printf '{"type":"complete","summary":"retried safely"}' > "$GOAL_RESULT_PATH""#,
-        r#"echo 1 > worker-count; exit 0"#,
+        r#"echo 1 > decider-count; sleep 10"#,
+        r#"echo 1 > worker-count"#,
     );
+    fixture.set_timeout("decider", 3);
     let output = fixture.run();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert!(!output.status.success());
     assert_eq!(fixture.count("sensor-count"), 1);
-    assert_eq!(fixture.count("decider-count"), 2);
+    assert_eq!(fixture.count("decider-count"), 1);
     assert_eq!(fixture.count("worker-count"), 0);
+    let failure = fixture.failure_event();
+    assert_eq!(failure["details"]["source"], "decider");
+    assert_eq!(failure["details"]["reason"], "process timed out");
+    assert!(failure["details"]["run_id"].is_string());
 }
 
 #[test]
@@ -448,8 +450,9 @@ fn worker_timeout_is_terminal_and_is_not_retried() {
     let fixture = Fixture::new(
         COUNT_SENSOR,
         r#"echo 1 > decider-count; printf '{"type":"run_task","task":"times out"}' > "$GOAL_RESULT_PATH""#,
-        r#"echo 1 > worker-count; sleep 2"#,
+        r#"echo 1 > worker-count; sleep 10"#,
     );
+    fixture.set_timeout("worker", 3);
     let output = fixture.run();
     assert!(!output.status.success());
     assert_eq!(fixture.count("sensor-count"), 1);
@@ -502,7 +505,7 @@ fn ctrl_c_terminates_worker_and_does_not_start_another_cycle() {
         r#"echo 1 > decider-count; printf '{"type":"run_task","task":"long task"}' > "$GOAL_RESULT_PATH""#,
         r#"echo started > worker-started; sleep 10; printf '{"type":"done","summary":"late"}' > "$GOAL_RESULT_PATH""#,
     );
-    fixture.set_worker_timeout(10);
+    fixture.set_timeout("worker", 10);
     let mut child = command(&fixture.config)
         .stdin(Stdio::null())
         .stdout(Stdio::null())

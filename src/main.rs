@@ -42,7 +42,6 @@ const RUN_HELP: &str = r#"CONFIGURATION
 
     goal_file = "GOAL.md"
     interval_seconds = 60
-    retry_seconds = 30
     max_wait_seconds = 3600
 
     [sensor]
@@ -85,7 +84,7 @@ GOAL SEMANTICS
 SENSOR CONTRACT
   The sensor must be read-only and emit exactly one JSON value on stdout.
   Stderr is diagnostic. Non-zero exit, timeout, or invalid JSON prevents the
-  decider from running and causes a retry after retry_seconds.
+  decider from running, records a terminal failure, and exits non-zero.
 
 DECIDER AND WORKER CONTRACT
   Both are non-TUI child processes without a PTY. Every invocation receives:
@@ -112,9 +111,9 @@ DECIDER AND WORKER CONTRACT
 
   Neither process may request human input, approval, or intervention. The
   decider must not modify the project or external world. A worker performs only
-  its assigned task, writes one completion, and exits. A worker-reported,
-  process, timeout, or protocol failure is recorded with its run ID and causes
-  the controller to exit non-zero; it is never automatically rerun.
+  its assigned task, writes one completion, and exits. Any sensor, decider, or
+  worker process, timeout, or protocol failure is recorded with its run ID and
+  causes the controller to exit non-zero; it is never automatically retried.
 
 FAILURE ANALYSIS
   Runtime data lives under .goal/ beside the config file. Successful and failed

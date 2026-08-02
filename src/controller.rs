@@ -98,71 +98,54 @@ impl Controller {
                 }
                 Err((RunError::Cancelled, _)) => return Err(Interrupted.into()),
                 Err((error, artifacts)) => {
-                    self.record_run_error(
-                        "sense_failed",
-                        &error,
-                        artifacts.as_ref().map(|artifact| artifact.id.as_str()),
-                    )?;
+                    let run_id = artifacts.as_ref().map(|artifact| artifact.id.clone());
+                    let reason = error.to_string();
+                    self.record_run_error("sense_failed", &error, run_id.as_deref())?;
                     self.output.event(
                         "sense_failed",
-                        serde_json::json!({"error": error.to_string(), "retrying": true}),
+                        serde_json::json!({"run_id": run_id, "error": reason}),
                     )?;
-                    self.output
-                        .plain_stderr(&format!("sensor failed: {error}; retrying\n"))?;
-                    self.sleep(self.loaded.config.retry_seconds)?;
-                    continue;
+                    return self.terminal_failure("sensor", reason, run_id);
                 }
             };
 
-            let (action, decider_run_id) = loop {
-                let context = prompt::prior_context(self.state.latest_worker_completion.as_ref());
-                let decider_prompt =
-                    prompt::decider_prompt(&self.loaded.goal, &observation, &context);
-                match self.runner.run_json::<DeciderAction>(
-                    "decider",
-                    &self.loaded.config.decider,
-                    &decider_prompt,
-                ) {
-                    Ok((action, artifacts)) => match action.validate() {
-                        Ok(()) => {
-                            let details = serde_json::json!({
-                                "run_id": artifacts.id,
-                                "action": action,
-                            });
-                            self.store.event("decision", details.clone())?;
-                            self.output.event("decision", details)?;
-                            break (action, artifacts.id);
-                        }
-                        Err(error) => {
-                            let details = serde_json::json!({
-                                "run_id": artifacts.id,
-                                "error": format!("schema validation: {error:#}"),
-                                "retrying": true,
-                            });
-                            self.store.event("decider_failed", details.clone())?;
-                            self.output.event("decider_failed", details)?;
-                            self.output.plain_stderr(&format!(
-                                "decider protocol failed: {error:#}; retrying\n"
-                            ))?;
-                        }
-                    },
-                    Err((RunError::Cancelled, _)) => return Err(Interrupted.into()),
-                    Err((error, artifacts)) => {
-                        self.record_run_error(
-                            "decider_failed",
-                            &error,
-                            artifacts.as_ref().map(|artifact| artifact.id.as_str()),
-                        )?;
-                        self.output.event(
-                            "decider_failed",
-                            serde_json::json!({"error": error.to_string(), "retrying": true}),
-                        )?;
-                        self.output
-                            .plain_stderr(&format!("decider failed: {error}; retrying\n"))?;
-                    }
+            let context = prompt::prior_context(self.state.latest_worker_completion.as_ref());
+            let decider_prompt = prompt::decider_prompt(&self.loaded.goal, &observation, &context);
+            let (action, artifacts) = match self.runner.run_json::<DeciderAction>(
+                "decider",
+                &self.loaded.config.decider,
+                &decider_prompt,
+            ) {
+                Ok(result) => result,
+                Err((RunError::Cancelled, _)) => return Err(Interrupted.into()),
+                Err((error, artifacts)) => {
+                    let run_id = artifacts.as_ref().map(|artifact| artifact.id.clone());
+                    let reason = error.to_string();
+                    self.record_run_error("decider_failed", &error, run_id.as_deref())?;
+                    self.output.event(
+                        "decider_failed",
+                        serde_json::json!({"run_id": run_id, "error": reason}),
+                    )?;
+                    return self.terminal_failure("decider", reason, run_id);
                 }
-                self.sleep(self.loaded.config.retry_seconds)?;
             };
+            if let Err(error) = action.validate() {
+                let reason = format!("schema validation: {error:#}");
+                let details = serde_json::json!({
+                    "run_id": artifacts.id,
+                    "error": reason,
+                });
+                self.store.event("decider_failed", details.clone())?;
+                self.output.event("decider_failed", details)?;
+                return self.terminal_failure("decider", reason, Some(artifacts.id));
+            }
+            let decider_run_id = artifacts.id;
+            let details = serde_json::json!({
+                "run_id": decider_run_id,
+                "action": action,
+            });
+            self.store.event("decision", details.clone())?;
+            self.output.event("decision", details)?;
 
             match action {
                 DeciderAction::RunTask { task } => {

@@ -28,12 +28,10 @@ Confirmed design
    approvals, resumable conversations, or interactive terminal state.
 8. If the decider or worker determines that automatic progress is impossible,
    it returns `failure` with a concrete reason.
-9. A worker-reported, process, timeout, or protocol failure is terminal. The
-   controller records it and exits non-zero without starting another worker.
-10. Sensor and decider infrastructure failures may retry because neither is
-    authorized to modify the world. A worker failure may have partial effects
-    and is never retried automatically.
-11. No daemon, PTY, TUI, worker pool, parallel workers, scheduler, workflow DAG,
+9. Every sensor, decider, or worker process, timeout, or protocol failure is
+   terminal. The controller records it and exits non-zero without an internal
+   retry. A scheduler may start a separate run later.
+10. No daemon, PTY, TUI, worker pool, parallel workers, scheduler, workflow DAG,
     or persistent agent conversation is part of the controller.
 
 State machine
@@ -167,7 +165,6 @@ Configuration
 
     goal_file = "GOAL.md"
     interval_seconds = 60
-    retry_seconds = 30
     max_wait_seconds = 3600
 
     [sensor]
@@ -185,10 +182,11 @@ Configuration
 Failure policy
 --------------
 
-* Sensor failure: record, wait `retry_seconds`, and sense again. Never treat
-  missing or invalid sensor data as a healthy world.
-* Decider process/protocol failure: record and retry against the same
-  observation after `retry_seconds`; the decider is read-only.
+* Sensor process/protocol failure or timeout: preserve artifacts, record the
+  reason, and exit non-zero. Never treat missing or invalid sensor data as a
+  healthy world.
+* Decider process/protocol failure or timeout: preserve artifacts, record the
+  reason, and exit non-zero.
 * Decider `failure`: record the reason and exit non-zero.
 * Worker `failure`: record the result and reason, then exit non-zero.
 * Worker process/protocol failure or timeout: preserve artifacts, record the
@@ -203,8 +201,8 @@ Integration tests cover:
 
 * sense -> run task -> done -> re-sense -> complete;
 * finite completion and continuous waiting;
-* sensor failure retries without invoking the decider;
-* read-only decider process failure retries without acting or re-sensing;
+* sensor failure exits non-zero without invoking the decider;
+* decider process failure exits non-zero without acting or re-sensing;
 * decider `failure` exits non-zero without a worker;
 * worker `failure` exits non-zero after one worker;
 * worker non-zero, timeout, and missing/invalid result are terminal;
