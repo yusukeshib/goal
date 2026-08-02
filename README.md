@@ -60,15 +60,17 @@ GOAL_DIR=~/goals/mergeable-prs goal stats --since 7d --output json
 
 It reports outcome counts, worker success rate, failure kinds, and average/p50/p95 duration by role. Directories created before metadata support are counted separately across all time and excluded from filtered success and duration calculations rather than inferred.
 
-## Controller JSONL output
+## Output modes
+
+The default `--output plain` streams child diagnostics unchanged. Use `--output pretty` to indent JSON diagnostics in the terminal without omitting or summarizing any values. Pretty formatting affects only the foreground display; each run's `stdout.log` and `stderr.log` retain the original one-line output. Non-JSON diagnostics remain unchanged.
 
 Use `--output json` for a machine-readable controller stream:
 
 ```sh
-goal --output json goal.toml | jq --unbuffered -C .
+goal --output json | jq --unbuffered -C .
 ```
 
-Every stdout line has the same `timestamp`, `type`, and `details` envelope. Controller events such as waits, completions, failures, and errors are structured. Child JSON is nested under `details.payload`; non-JSON child diagnostics are represented by `details.content`. Oversized child lines are replaced in the foreground stream by bounded metadata with `truncated` and `original_bytes`; exact output remains in each run's `stdout.log` or `stderr.log`. The default `--output plain` preserves human-readable terminal output. Intentional Ctrl-C/SIGTERM emits `stopped` in JSON mode and exits successfully.
+Every stdout line has the same `timestamp`, `type`, and `details` envelope. Controller events such as waits, completions, failures, and errors are structured. Child JSON is nested under `details.payload`; non-JSON child diagnostics are represented by `details.content`. Oversized child lines are replaced in the JSON foreground stream by bounded metadata with `truncated` and `original_bytes`; exact output remains in each run's `stdout.log` or `stderr.log`. Intentional Ctrl-C/SIGTERM emits `stopped` in JSON mode and exits successfully.
 
 ## Read-only GitHub sensor example
 

@@ -139,11 +139,14 @@ FAILURE ANALYSIS
   silently waiving unmet requirements.
 
 OUTPUT
-  --output plain (default) prints human-readable terminal output. For controller
-  runs, --output json emits strict JSONL envelopes on stdout. For stats, it emits
-  one JSON report. Child JSON is nested in details.payload; non-JSON diagnostics
-  use details.content. Oversized child lines are summarized in the foreground
-  stream while stdout.log/stderr.log retain the exact output.
+  --output plain (default) prints human-readable terminal output unchanged.
+  --output pretty preserves every child JSON value but indents it for the
+  terminal; stdout.log/stderr.log retain the original one-line output. For
+  controller runs, --output json emits strict JSONL envelopes on stdout. For
+  stats, plain and pretty emit the human-readable report, while json emits one
+  JSON report. Child JSON is nested in details.payload; non-JSON diagnostics use
+  details.content. Oversized child lines are summarized only in the JSON
+  foreground stream while the run logs retain the exact output.
 
 EXAMPLES
   goal                                      Run ./goal.toml
@@ -165,7 +168,7 @@ EXAMPLES
     after_help = RUN_HELP
 )]
 struct Cli {
-    /// Emit human-readable output or machine-readable JSON.
+    /// Emit plain, pretty-printed, or machine-readable JSON output.
     #[arg(
         long,
         value_enum,
@@ -248,7 +251,7 @@ fn run_stats(
     let report = analytics::stats(&project_dir, since)?;
     let mut stdout = io::stdout().lock();
     match output_mode {
-        output::OutputMode::Plain => {
+        output::OutputMode::Plain | output::OutputMode::Pretty => {
             stdout.write_all(analytics::render_plain(&report).as_bytes())?
         }
         output::OutputMode::Json => {

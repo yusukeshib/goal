@@ -279,6 +279,48 @@ fn sensor_stdout_is_hidden_in_plain_mode_but_reaches_decider() {
 }
 
 #[test]
+fn pretty_output_formats_child_json_but_keeps_run_log_exact() {
+    let diagnostic =
+        r#"{"type":"diagnostic","nested":{"values":[1,true,null]},"text":"first\nsecond"}"#;
+    let fixture = Fixture::new(
+        r#"printf '{"healthy":true}'"#,
+        &format!(
+            "printf '%s\\n' '{diagnostic}'; printf '%s' '{{\"type\":\"complete\",\"summary\":\"pretty complete\"}}' > \"$GOAL_RESULT_PATH\""
+        ),
+        r#"exit 99"#,
+    );
+    let output = command(&fixture.config)
+        .args(["--output", "pretty"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("[decider] {"));
+    assert!(stdout.contains("[decider]   \"nested\": {"));
+    assert!(stdout.contains("[decider]     \"values\": ["));
+    assert!(!stdout.contains(&format!("[decider] {diagnostic}")));
+
+    let decider_dir = fs::read_dir(fixture.dir.path().join(".goal/runs"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("-decider")
+        })
+        .expect("missing decider run directory");
+    assert_eq!(
+        fs::read_to_string(decider_dir.join("stdout.log")).unwrap(),
+        format!("{diagnostic}\n")
+    );
+}
+
+#[test]
 fn sense_task_done_resense_complete() {
     let fixture = Fixture::new(
         COUNT_SENSOR,

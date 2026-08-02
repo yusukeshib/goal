@@ -17,6 +17,7 @@ const CONTENT_PREVIEW_BYTES: usize = 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum OutputMode {
     Plain,
+    Pretty,
     Json,
 }
 
@@ -50,28 +51,32 @@ impl Output {
     }
 
     pub fn plain_stdout(&self, message: &str) -> Result<()> {
-        if self.mode == OutputMode::Plain {
+        if self.mode != OutputMode::Json {
             self.write_plain(false, message.as_bytes())?;
         }
         Ok(())
     }
 
     pub fn plain_stderr(&self, message: &str) -> Result<()> {
-        if self.mode == OutputMode::Plain {
+        if self.mode != OutputMode::Json {
             self.write_plain(true, message.as_bytes())?;
         }
         Ok(())
     }
 
     pub fn child_line(&self, role: &str, stream: &str, run_id: &str, line: &[u8]) -> Result<()> {
-        if self.mode == OutputMode::Plain {
+        if self.mode != OutputMode::Json {
             // Sensor stdout is protocol data, not a diagnostic. It is still
             // captured in stdout.log and passed unchanged to the decider.
             if role == "sensor" && stream == "stdout" {
                 return Ok(());
             }
-            let mut tagged = format!("[{role}] ").into_bytes();
-            tagged.extend_from_slice(line);
+            let rendered = if self.mode == OutputMode::Pretty {
+                prettify_json_line(line)?
+            } else {
+                line.to_vec()
+            };
+            let tagged = prefix_lines(&rendered, format!("[{role}] ").as_bytes());
             return self.write_plain(stream == "stderr", &tagged);
         }
 
@@ -142,6 +147,22 @@ fn prefix_lines(bytes: &[u8], prefix: &[u8]) -> Vec<u8> {
     output
 }
 
+fn prettify_json_line(line: &[u8]) -> Result<Vec<u8>> {
+    let (trimmed, ending): (&[u8], &[u8]) = if let Some(trimmed) = line.strip_suffix(b"\r\n") {
+        (trimmed, b"\r\n")
+    } else if let Some(trimmed) = line.strip_suffix(b"\n") {
+        (trimmed, b"\n")
+    } else {
+        (line, b"")
+    };
+    let Ok(payload) = serde_json::from_slice::<Value>(trimmed) else {
+        return Ok(line.to_vec());
+    };
+    let mut rendered = serde_json::to_vec_pretty(&payload)?;
+    rendered.extend_from_slice(ending);
+    Ok(rendered)
+}
+
 fn summarize_large_payload(payload: &Value, original_bytes: usize) -> Value {
     let mut summary = serde_json::Map::from_iter([
         ("truncated".to_owned(), Value::Bool(true)),
@@ -191,6 +212,41 @@ mod tests {
         assert_eq!(
             prefix_lines(b"first\nsecond\n", b"[timestamp] "),
             b"[timestamp] first\n[timestamp] second\n"
+        );
+    }
+
+    #[test]
+    fn pretty_json_preserves_all_values_and_line_ending() {
+        let original = concat!(
+            r#"{"type":"tool_execution_end","nested":{"values":[1,true,null]},"text":"first\nsecond"}"#,
+            "\r\n"
+        )
+        .as_bytes();
+        let rendered = prettify_json_line(original).unwrap();
+        assert!(rendered.ends_with(b"\r\n"));
+        assert!(
+            rendered
+                .windows(b"  \"nested\"".len())
+                .any(|window| window == b"  \"nested\"")
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&rendered).unwrap(),
+            serde_json::from_slice::<Value>(original).unwrap()
+        );
+    }
+
+    #[test]
+    fn pretty_json_leaves_non_json_unchanged() {
+        let original = b"plain diagnostic\n";
+        assert_eq!(prettify_json_line(original).unwrap(), original);
+    }
+
+    #[test]
+    fn pretty_child_output_prefixes_every_rendered_line() {
+        let rendered = prettify_json_line(b"{\"outer\":{\"inner\":1}}\n").unwrap();
+        assert_eq!(
+            prefix_lines(&rendered, b"[worker] "),
+            b"[worker] {\n[worker]   \"outer\": {\n[worker]     \"inner\": 1\n[worker]   }\n[worker] }\n"
         );
     }
 
