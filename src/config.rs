@@ -52,7 +52,10 @@ impl LoadedConfig {
             toml::from_str(&text).with_context(|| format!("parse config {}", path.display()))?;
         config.validate()?;
 
-        let parent = requested_path.parent().unwrap_or_else(|| Path::new("."));
+        let parent = requested_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
         let project_dir = fs::canonicalize(parent)
             .with_context(|| format!("resolve project directory {}", parent.display()))?;
         let goal_path = if config.goal_file.is_absolute() {

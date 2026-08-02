@@ -18,12 +18,12 @@ cargo build
 cargo run -- .
 ```
 
-Select a goal with `-C/--goal-dir`, then `GOAL_DIR`, then the current directory. The legacy `goal CONFIG_OR_DIR` form remains available for controller runs; targets literally named `run` or `stats` must use `-C` because those names are subcommands. A directory resolves to `<directory>/goal.toml`; its directory is the child working directory. Relative goal and command paths resolve from there.
+`goal` uses `GOAL_DIR`, or the current directory when it is unset. That directory must contain `goal.toml` and is also the child working directory. Relative goal and command paths resolve from there.
 
 ```sh
-goal -C ~/goals/mergeable-prs
-goal -C ~/goals/mergeable-prs run
+cd ~/goals/mergeable-prs && goal
 GOAL_DIR=~/goals/mergeable-prs goal
+GOAL_DIR=~/goals/mergeable-prs goal run
 ```
 
 See [`examples/fake`](examples/fake) for a runnable deterministic cycle:
@@ -54,8 +54,8 @@ Runtime state, compact events, prompts, results, logs, and per-run `metadata.jso
 `stats` reads existing artifacts without starting a sensor, decider, or worker:
 
 ```sh
-goal -C ~/goals/mergeable-prs stats --since 24h
-goal -C ~/goals/mergeable-prs stats --since 7d --output json
+goal stats --since 24h
+GOAL_DIR=~/goals/mergeable-prs goal stats --since 7d --output json
 ```
 
 It reports outcome counts, worker success rate, failure kinds, and average/p50/p95 duration by role. Directories created before metadata support are counted separately across all time and excluded from filtered success and duration calculations rather than inferred.

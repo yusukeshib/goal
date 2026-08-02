@@ -146,13 +146,12 @@ The artifacts must distinguish:
 * finite goal `complete`;
 * terminal sensor, decider, and worker infrastructure failures.
 
-Target selection is shared by run and analysis commands: `-C/--goal-dir` wins
-over `GOAL_DIR`, which wins over the current directory. The old positional run
-target remains supported. `goal stats --since 24h` scans metadata without
-starting child processes and reports role-specific outcomes, worker success
-rate, failure kinds, and average/p50/p95 durations. Legacy run directories
-without metadata are counted across all time but excluded from filtered rates
-and durations.
+Target selection is shared by run and analysis commands: `GOAL_DIR` selects the
+goal directory, otherwise the current directory is used. `goal stats --since
+24h` scans metadata without starting child processes and reports role-specific
+outcomes, worker success rate, failure kinds, and average/p50/p95 durations.
+Legacy run directories without metadata are counted across all time but excluded
+from filtered rates and durations.
 
 Daily goal improvement
 ----------------------

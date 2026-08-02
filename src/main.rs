@@ -14,7 +14,7 @@ use std::{
     sync::{Arc, atomic::AtomicBool},
 };
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 const ABOUT: &str = "A foreground controller that continuously pursues one natural-language goal";
@@ -30,10 +30,9 @@ const ROOT_HELP: &str = r#"HOW IT WORKS
   Processes that modify the same project are not coordinated.
 
 TARGET SELECTION
-  -C/--goal-dir takes precedence over GOAL_DIR. Without either, goal.toml in the
-  current directory is used. The legacy `goal CONFIG_OR_DIR` form remains valid
-  for running the controller, except targets named `run` or `stats`, which must
-  use -C because those names are subcommands.
+  GOAL_DIR selects a goal directory for every command. Without it, goal.toml in
+  the current directory is used. Change directory or set GOAL_DIR to work with a
+  different goal.
 
 COMMANDS
   With no subcommand, goal runs the controller. `goal run` is the explicit form.
@@ -47,9 +46,9 @@ FILES
 "#;
 
 const RUN_HELP: &str = r#"CONFIGURATION
-  Pass either a goal.toml file or its containing directory. A directory resolves
-  to <directory>/goal.toml. The config's directory is the project directory and
-  child working directory. Relative goal and command paths resolve from there.
+  goal.toml is loaded from GOAL_DIR, or from the current directory when GOAL_DIR
+  is unset. That directory is the project and child working directory. Relative
+  goal and command paths resolve from there.
 
   Required goal.toml shape:
 
@@ -132,7 +131,7 @@ FAILURE ANALYSIS
   Runtime data lives under .goal/ beside the config file. Successful and failed
   invocations retain prompts, results, stdout, stderr, and metadata under
   .goal/runs/, and compact outcomes are appended to .goal/events.jsonl. Run
-  `goal -C DIR stats --since 24h` for outcome counts, worker success rate, and
+  `goal stats --since 24h` for outcome counts, worker success rate, and
   role-specific average, p50, and p95 durations. Historical directories without
   metadata are counted across all time and excluded from filtered duration and
   success rates.
@@ -148,12 +147,11 @@ OUTPUT
 
 EXAMPLES
   goal                                      Run ./goal.toml
-  goal goals/ci/                            Legacy explicit run target
-  goal -C goals/ci run                      Canonical explicit run target
-  GOAL_DIR=goals/ci goal                    Select a default target
-  goal -C goals/ci stats --since 24h        Human-readable statistics
-  goal -C goals/ci stats --since 7d --output json
-  goal -C goals/ci --output json | jq --unbuffered -C .
+  goal run                                  Explicitly run ./goal.toml
+  GOAL_DIR=goals/ci goal                    Run another goal
+  GOAL_DIR=goals/ci goal stats --since 24h  Human-readable statistics
+  goal stats --since 7d --output json
+  goal --output json | jq --unbuffered -C .
 
   See examples/fake for a deterministic full cycle and
   examples/mergeable-prs for a real read-only GitHub sensor."#;
@@ -167,16 +165,6 @@ EXAMPLES
     after_help = RUN_HELP
 )]
 struct Cli {
-    /// Goal directory used by every command (overrides GOAL_DIR).
-    #[arg(
-        short = 'C',
-        long = "goal-dir",
-        global = true,
-        env = "GOAL_DIR",
-        value_name = "DIR"
-    )]
-    goal_dir: Option<PathBuf>,
-
     /// Emit human-readable output or machine-readable JSON.
     #[arg(
         long,
@@ -188,10 +176,6 @@ struct Cli {
 
     #[command(subcommand)]
     command: Option<Commands>,
-
-    /// Legacy run target: repo-local goal.toml or its containing directory.
-    #[arg(value_name = "CONFIG_OR_DIR")]
-    config: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -235,12 +219,9 @@ fn main() {
 }
 
 fn dispatch(cli: Cli, output: output::Output) -> Result<()> {
-    if cli.command.is_some() && cli.config.is_some() {
-        bail!("CONFIG_OR_DIR cannot be combined with a subcommand; use -C/--goal-dir");
-    }
-    let target = cli
-        .config
-        .or(cli.goal_dir)
+    let target = std::env::var_os("GOAL_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("goal.toml"));
     match cli.command {
         None | Some(Commands::Run) => run_controller(target, output),

@@ -81,7 +81,9 @@ timeout_seconds = 5
 
 fn command(config: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_goal"));
-    command.arg(config);
+    command
+        .current_dir(config.parent().unwrap())
+        .env_remove("GOAL_DIR");
     command
 }
 
@@ -108,11 +110,8 @@ fn help_fully_describes_configuration_and_process_contracts() {
         "sense -> decide -> act -> sense",
         "multiple goals",
         ".goal/",
-        "goal goals/ci/",
-        "goal -C goals/ci run",
+        "goal run",
         "GOAL_DIR=goals/ci goal",
-        "CONFIG_OR_DIR",
-        "--goal-dir <DIR>",
         "GOAL_DIR",
         "stats",
     ] {
@@ -121,6 +120,8 @@ fn help_fully_describes_configuration_and_process_contracts() {
             "missing {expected:?} from root help"
         );
     }
+    assert!(!root.contains("--goal-dir"));
+    assert!(!root.contains("CONFIG_OR_DIR"));
 
     let run = Command::new(env!("CARGO_BIN_EXE_goal"))
         .arg("--help")
@@ -150,6 +151,18 @@ fn help_fully_describes_configuration_and_process_contracts() {
 }
 
 #[test]
+fn removed_explicit_goal_selectors_are_rejected() {
+    for args in [["some-goal", ""], ["-C", "some-goal"]] {
+        let args = args.into_iter().filter(|arg| !arg.is_empty());
+        let output = Command::new(env!("CARGO_BIN_EXE_goal"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+    }
+}
+
+#[test]
 fn json_output_is_strict_jsonl_with_one_common_envelope() {
     let fixture = Fixture::new(
         r#"echo sensor-diagnostic >&2; printf '{"healthy":true}'"#,
@@ -158,7 +171,8 @@ fn json_output_is_strict_jsonl_with_one_common_envelope() {
     );
     let output = Command::new(env!("CARGO_BIN_EXE_goal"))
         .args(["--output", "json"])
-        .arg(&fixture.config)
+        .current_dir(fixture.dir.path())
+        .env_remove("GOAL_DIR")
         .output()
         .unwrap();
     assert!(
@@ -225,7 +239,7 @@ fn rejects_a_second_controller_for_the_same_config_and_releases_after_exit() {
     }
     assert!(lock_ready.exists(), "first controller did not start");
 
-    let second = command(fixture.dir.path()).output().unwrap();
+    let second = command(&fixture.config).output().unwrap();
     assert!(!second.status.success());
     assert!(
         String::from_utf8_lossy(&second.stderr).contains("already running"),
@@ -235,7 +249,7 @@ fn rejects_a_second_controller_for_the_same_config_and_releases_after_exit() {
 
     first.kill().unwrap();
     first.wait().unwrap();
-    let mut after_exit = command(fixture.dir.path())
+    let mut after_exit = command(&fixture.config)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -284,7 +298,7 @@ fn sense_task_done_resense_complete() {
 }
 
 #[test]
-fn stats_reports_metadata_and_goal_dir_precedence() {
+fn stats_reports_metadata_from_goal_dir_or_current_directory() {
     let fixture = Fixture::new(
         COUNT_SENSOR,
         r#"n=0; test ! -f decider-count || n=$(cat decider-count); n=$((n+1)); echo "$n" > decider-count; if test "$n" = 1; then r='{"type":"run_task","task":"do one thing"}'; else r='{"type":"complete","summary":"observed done"}'; fi; printf '%s' "$r" > "$GOAL_RESULT_PATH""#,
@@ -293,10 +307,8 @@ fn stats_reports_metadata_and_goal_dir_precedence() {
     assert!(fixture.run().status.success());
 
     let output = Command::new(env!("CARGO_BIN_EXE_goal"))
-        .arg("-C")
-        .arg(fixture.dir.path())
         .args(["stats", "--since", "24h", "--output", "json"])
-        .env("GOAL_DIR", "/definitely/not/the/goal")
+        .env("GOAL_DIR", fixture.dir.path())
         .output()
         .unwrap();
     assert!(
@@ -399,9 +411,9 @@ fn worker_reported_failure_is_recorded_and_exits_without_another_cycle() {
     assert!(failure["details"]["run_id"].is_string());
 
     let stats = Command::new(env!("CARGO_BIN_EXE_goal"))
-        .arg("-C")
-        .arg(fixture.dir.path())
         .args(["stats", "--output", "json"])
+        .current_dir(fixture.dir.path())
+        .env_remove("GOAL_DIR")
         .output()
         .unwrap();
     assert!(stats.status.success());
@@ -542,7 +554,8 @@ fn json_failure_output_is_structured_and_keeps_the_reason() {
     );
     let output = Command::new(env!("CARGO_BIN_EXE_goal"))
         .args(["--output", "json"])
-        .arg(&fixture.config)
+        .current_dir(fixture.dir.path())
+        .env_remove("GOAL_DIR")
         .output()
         .unwrap();
     assert!(!output.status.success());
