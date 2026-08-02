@@ -308,6 +308,28 @@ fn decider_prompt_human_then_fresh_decision() {
 }
 
 #[test]
+fn empty_human_answer_prompts_again() {
+    let fixture = Fixture::new(
+        COUNT_SENSOR,
+        r#"n=0; test ! -f decider-count || n=$(cat decider-count); n=$((n+1)); echo "$n" > decider-count; if test "$n" = 1; then r='{"type":"prompt_human","question":"Proceed?","context":null}'; else grep -q 'Human answer: yes' "$GOAL_PROMPT_PATH"; r='{"type":"complete","summary":"approved"}'; fi; printf '%s' "$r" > "$GOAL_RESULT_PATH""#,
+        r#"exit 99"#,
+    );
+    let output = fixture.run("\n  \nyes\n");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fixture.count("decider-count"), 2);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr)
+            .matches("empty human answer; question remains pending")
+            .count(),
+        2
+    );
+}
+
+#[test]
 fn japanese_human_answer_is_preserved() {
     let fixture = Fixture::new(
         COUNT_SENSOR,

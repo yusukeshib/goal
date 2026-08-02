@@ -41,49 +41,65 @@ impl HumanInput {
                 "\n\n[Enter: send | Shift+Enter / Alt+Enter: newline | Ctrl+C: cancel | Ctrl+R: history]\n",
             );
             output.plain_stdout(&prompt)?;
-            self.read_interactive()
+            self.read_interactive(output)
         } else {
             prompt.push_str("\n\n> ");
             output.plain_stdout(&prompt)?;
-            self.read_stream()
+            self.read_stream(output)
         }
     }
 
-    fn read_interactive(&mut self) -> Result<String> {
+    fn read_interactive(&mut self, output: &Output) -> Result<String> {
         let prompt = DefaultPrompt::new(DefaultPromptSegment::Empty, DefaultPromptSegment::Empty);
-        match self
-            .editor
-            .read_line(&prompt)
-            .context("read human answer from terminal")?
-        {
-            Signal::Success(answer) => finish_answer(answer),
-            Signal::CtrlC | Signal::ExternalBreak(_) => Err(Interrupted.into()),
-            Signal::CtrlD => bail!("stdin reached EOF; question remains pending"),
-            Signal::HostCommand(_) => bail!("human input editor returned an unexpected command"),
-            _ => bail!("human input editor returned an unexpected signal"),
+        loop {
+            match self
+                .editor
+                .read_line(&prompt)
+                .context("read human answer from terminal")?
+            {
+                Signal::Success(answer) => match finish_answer(answer) {
+                    Ok(answer) => return Ok(answer),
+                    Err(error) => output.plain_stderr(&format!("{error}\n"))?,
+                },
+                Signal::CtrlC | Signal::ExternalBreak(_) => return Err(Interrupted.into()),
+                Signal::CtrlD => bail!("stdin reached EOF; question remains pending"),
+                Signal::HostCommand(_) => {
+                    bail!("human input editor returned an unexpected command")
+                }
+                _ => bail!("human input editor returned an unexpected signal"),
+            }
         }
     }
 
-    fn read_stream(&self) -> Result<String> {
-        let (sender, receiver) = mpsc::channel();
-        thread::spawn(move || {
-            let mut answer = String::new();
-            let result = io::stdin()
-                .read_line(&mut answer)
-                .map(|read| (read, answer));
-            let _ = sender.send(result);
-        });
+    fn read_stream(&self, output: &Output) -> Result<String> {
         loop {
-            if self.cancelled.load(Ordering::SeqCst) {
-                return Err(Interrupted.into());
-            }
-            match receiver.recv_timeout(Duration::from_millis(100)) {
-                Ok(Ok((0, _))) => bail!("stdin reached EOF; question remains pending"),
-                Ok(Ok((_, answer))) => return finish_answer(answer),
-                Ok(Err(error)) => return Err(anyhow!(error).context("read human answer")),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    bail!("human input reader stopped")
+            let (sender, receiver) = mpsc::channel();
+            thread::spawn(move || {
+                let mut answer = String::new();
+                let result = io::stdin()
+                    .read_line(&mut answer)
+                    .map(|read| (read, answer));
+                let _ = sender.send(result);
+            });
+            loop {
+                if self.cancelled.load(Ordering::SeqCst) {
+                    return Err(Interrupted.into());
+                }
+                match receiver.recv_timeout(Duration::from_millis(100)) {
+                    Ok(Ok((0, _))) => bail!("stdin reached EOF; question remains pending"),
+                    Ok(Ok((_, answer))) => match finish_answer(answer) {
+                        Ok(answer) => return Ok(answer),
+                        Err(error) => {
+                            output.plain_stderr(&format!("{error}\n"))?;
+                            output.plain_stdout("> ")?;
+                            break;
+                        }
+                    },
+                    Ok(Err(error)) => return Err(anyhow!(error).context("read human answer")),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        bail!("human input reader stopped")
+                    }
                 }
             }
         }
