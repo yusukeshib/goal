@@ -210,7 +210,7 @@ impl Controller {
                     let seconds =
                         cap_wait(retry_after_seconds, self.loaded.config.max_wait_seconds);
                     self.output
-                        .plain_stdout(&format!("waiting {seconds}s: {reason}\n"))?;
+                        .plain_stdout(&format!("[decision] waiting {seconds}s: {reason}\n"))?;
                     let details = serde_json::json!({"reason": reason, "requested_seconds": retry_after_seconds, "actual_seconds": seconds});
                     self.store.event("wait", details.clone())?;
                     self.output.event("wait", details)?;

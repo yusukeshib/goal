@@ -4,6 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use chrono::Local;
 use clap::ValueEnum;
 use serde::Serialize;
 use serde_json::Value;
@@ -54,21 +55,28 @@ impl Output {
 
     pub fn plain_stdout(&self, message: &str) -> Result<()> {
         if self.mode == OutputMode::Plain {
-            self.write_bytes(false, message.as_bytes())?;
+            self.write_plain(false, message.as_bytes())?;
         }
         Ok(())
     }
 
     pub fn plain_stderr(&self, message: &str) -> Result<()> {
         if self.mode == OutputMode::Plain {
-            self.write_bytes(true, message.as_bytes())?;
+            self.write_plain(true, message.as_bytes())?;
         }
         Ok(())
     }
 
     pub fn child_line(&self, role: &str, stream: &str, run_id: &str, line: &[u8]) -> Result<()> {
         if self.mode == OutputMode::Plain {
-            return self.write_bytes(stream == "stderr", line);
+            // Sensor stdout is protocol data, not a diagnostic. It is still
+            // captured in stdout.log and passed unchanged to the decider.
+            if role == "sensor" && stream == "stdout" {
+                return Ok(());
+            }
+            let mut tagged = format!("[{role}] ").into_bytes();
+            tagged.extend_from_slice(line);
+            return self.write_plain(stream == "stderr", &tagged);
         }
 
         let trimmed = line.strip_suffix(b"\n").unwrap_or(line);
@@ -106,6 +114,11 @@ impl Output {
         self.write_bytes(false, &bytes)
     }
 
+    fn write_plain(&self, stderr: bool, bytes: &[u8]) -> Result<()> {
+        let prefix = format!("[{}] ", Local::now().format("%Y-%m-%d %H:%M:%S"));
+        self.write_bytes(stderr, &prefix_lines(bytes, prefix.as_bytes()))
+    }
+
     fn write_bytes(&self, stderr: bool, bytes: &[u8]) -> Result<()> {
         let _guard = self
             .write_lock
@@ -122,6 +135,15 @@ impl Output {
         }
         Ok(())
     }
+}
+
+fn prefix_lines(bytes: &[u8], prefix: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(bytes.len() + prefix.len());
+    for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        output.extend_from_slice(prefix);
+        output.extend_from_slice(line);
+    }
+    output
 }
 
 fn summarize_large_payload(payload: &Value, original_bytes: usize) -> Value {
@@ -167,6 +189,14 @@ fn summarize_large_payload(payload: &Value, original_bytes: usize) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_output_prefixes_every_line() {
+        assert_eq!(
+            prefix_lines(b"first\nsecond\n", b"[timestamp] "),
+            b"[timestamp] first\n[timestamp] second\n"
+        );
+    }
 
     #[test]
     fn large_child_payload_is_bounded_but_keeps_event_metadata() {

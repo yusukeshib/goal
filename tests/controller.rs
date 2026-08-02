@@ -240,6 +240,20 @@ fn rejects_a_second_controller_for_the_same_config_and_releases_after_exit() {
 }
 
 #[test]
+fn sensor_stdout_is_hidden_in_plain_mode_but_reaches_decider() {
+    let fixture = Fixture::new(
+        r#"printf '{\"private_observation\":\"sensor-payload\"}'"#,
+        r#"grep -q 'sensor-payload' "$GOAL_PROMPT_PATH"; printf '{\"type\":\"complete\",\"summary\":\"observation received\"}' > "$GOAL_RESULT_PATH""#,
+        r#"exit 99"#,
+    );
+    let output = fixture.run("");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("goal complete: observation received"));
+    assert!(!stdout.contains("sensor-payload"));
+}
+
+#[test]
 fn sense_task_done_resense_complete() {
     let fixture = Fixture::new(
         COUNT_SENSOR,
@@ -255,6 +269,7 @@ fn sense_task_done_resense_complete() {
     assert_eq!(fixture.count("sensor-count"), 2);
     assert_eq!(fixture.count("decider-count"), 2);
     assert_eq!(fixture.count("worker-count"), 1);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("{\"sense\":"));
 }
 
 #[test]

@@ -40,7 +40,7 @@ Deciders and workers are ordinary argv commands, without an implicit shell or PT
 
 The process must atomically write one tagged JSON object to `GOAL_RESULT_PATH`. Stdout and stderr are diagnostics only. Decider action tags are `run_task`, `prompt_human`, `wait`, and `complete`; worker completion tags are `done`, `needs_input`, and `blocked`.
 
-Runtime state, compact events, prompts, results, and logs are kept under `.goal/`. A worker process or protocol failure is never blindly retried: the controller senses current reality and asks a fresh decider.
+Runtime state, compact events, prompts, results, and logs are kept under `.goal/`. In plain output mode, sensor stdout is treated as protocol data and hidden from the terminal; it remains available in the run's `stdout.log` and is passed unchanged to the decider. Sensor stderr diagnostics are still displayed. A worker process or protocol failure is never blindly retried: the controller senses current reality and asks a fresh decider.
 
 ## JSONL output
 
