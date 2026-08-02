@@ -5,7 +5,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -34,6 +35,27 @@ pub struct HumanAnswer {
     pub question: String,
     pub context: Option<String>,
     pub answer: String,
+}
+
+#[derive(Debug)]
+pub struct ControllerLock {
+    _file: fs::File,
+}
+
+impl ControllerLock {
+    pub fn acquire(config_path: &Path) -> Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .open(config_path)
+            .with_context(|| format!("open config lock {}", config_path.display()))?;
+        if let Err(error) = file.try_lock_exclusive() {
+            bail!(
+                "another goal controller is already running for {}: {error}",
+                config_path.display()
+            );
+        }
+        Ok(Self { _file: file })
+    }
 }
 
 pub struct StateStore {
@@ -104,6 +126,19 @@ pub fn unix_timestamp() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn controller_lock_is_exclusive_and_released_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("goal.toml");
+        fs::write(&config, "goal_file = 'GOAL.md'").unwrap();
+
+        let first = ControllerLock::acquire(&config).unwrap();
+        let error = ControllerLock::acquire(&config).unwrap_err();
+        assert!(error.to_string().contains("already running"));
+        drop(first);
+        ControllerLock::acquire(&config).unwrap();
+    }
 
     #[test]
     fn atomic_state_round_trip_and_events() {

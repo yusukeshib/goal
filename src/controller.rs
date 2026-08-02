@@ -15,11 +15,14 @@ use crate::{
     model::{DeciderAction, WorkerCompletion},
     prompt,
     runner::{RunError, Runner},
-    state::{HumanAnswer, HumanQuestion, PersistentState, StateStore, unix_timestamp},
+    state::{
+        ControllerLock, HumanAnswer, HumanQuestion, PersistentState, StateStore, unix_timestamp,
+    },
 };
 
 pub struct Controller {
     loaded: LoadedConfig,
+    _lock: ControllerLock,
     runner: Runner,
     store: StateStore,
     state: PersistentState,
@@ -28,11 +31,13 @@ pub struct Controller {
 
 impl Controller {
     pub fn new(loaded: LoadedConfig, cancelled: Arc<AtomicBool>) -> Result<Self> {
+        let controller_lock = ControllerLock::acquire(&loaded.config_path)?;
         let store = StateStore::new(&loaded.project_dir)?;
         let state = store.load()?;
         let runner = Runner::new(&loaded.project_dir, Arc::clone(&cancelled))?;
         Ok(Self {
             loaded,
+            _lock: controller_lock,
             runner,
             store,
             state,

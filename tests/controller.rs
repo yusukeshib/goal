@@ -135,6 +135,51 @@ fn help_fully_describes_configuration_and_process_contracts() {
 }
 
 #[test]
+fn rejects_a_second_controller_for_the_same_config_and_releases_after_exit() {
+    let fixture = Fixture::new(
+        COUNT_SENSOR,
+        r#"printf '{\"type\":\"wait\",\"reason\":\"hold lock\",\"retry_after_seconds\":1}' > \"$GOAL_RESULT_PATH\""#,
+        r#"exit 99"#,
+    );
+    let mut first = command(&fixture.config)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let lock_ready = fixture.dir.path().join(".goal/state.json");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !lock_ready.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(lock_ready.exists(), "first controller did not start");
+
+    let second = command(&fixture.config).output().unwrap();
+    assert!(!second.status.success());
+    assert!(
+        String::from_utf8_lossy(&second.stderr).contains("already running"),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    first.kill().unwrap();
+    first.wait().unwrap();
+    let mut after_exit = command(&fixture.config)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(150));
+    assert!(
+        after_exit.try_wait().unwrap().is_none(),
+        "lock was not released"
+    );
+    after_exit.kill().unwrap();
+    after_exit.wait().unwrap();
+}
+
+#[test]
 fn sense_task_done_resense_complete() {
     let fixture = Fixture::new(
         COUNT_SENSOR,
