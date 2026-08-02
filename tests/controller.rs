@@ -293,6 +293,22 @@ fn decider_prompt_human_then_fresh_decision() {
 }
 
 #[test]
+fn japanese_human_answer_is_preserved() {
+    let fixture = Fixture::new(
+        COUNT_SENSOR,
+        r#"n=0; test ! -f decider-count || n=$(cat decider-count); n=$((n+1)); echo "$n" > decider-count; if test "$n" = 1; then r='{"type":"prompt_human","question":"続行しますか？","context":null}'; else grep -q 'Human answer: はい、続行してください' "$GOAL_PROMPT_PATH"; r='{"type":"complete","summary":"回答を確認"}'; fi; printf '%s' "$r" > "$GOAL_RESULT_PATH""#,
+        r#"exit 99"#,
+    );
+    let output = fixture.run("はい、続行してください\n");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fixture.count("decider-count"), 2);
+}
+
+#[test]
 fn sensor_failures_never_call_decider_until_valid_observation() {
     let fixture = Fixture::new(
         r#"n=0; test ! -f sensor-count || n=$(cat sensor-count); n=$((n+1)); echo "$n" > sensor-count; case "$n" in 1) exit 3;; 2) printf 'not json';; 3) sleep 2;; *) printf '{"healthy":true}';; esac"#,

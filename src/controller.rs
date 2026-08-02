@@ -29,6 +29,7 @@ pub struct Controller {
     store: StateStore,
     state: PersistentState,
     cancelled: Arc<AtomicBool>,
+    human_input: human::HumanInput,
     output: Output,
 }
 
@@ -38,6 +39,7 @@ impl Controller {
         let store = StateStore::new(&loaded.project_dir)?;
         let state = store.load()?;
         let runner = Runner::new(&loaded.project_dir, Arc::clone(&cancelled), output.clone())?;
+        let human_input = human::HumanInput::new(Arc::clone(&cancelled));
         Ok(Self {
             loaded,
             _lock: controller_lock,
@@ -45,6 +47,7 @@ impl Controller {
             store,
             state,
             cancelled,
+            human_input,
             output,
         })
     }
@@ -249,8 +252,7 @@ impl Controller {
             .pending_human_question
             .clone()
             .context("no pending human question")?;
-        let answer =
-            human::read_answer(&question, Arc::clone(&self.cancelled), self.output.clone())?;
+        let answer = self.human_input.read_answer(&question, &self.output)?;
         self.state.latest_human_answer = Some(HumanAnswer {
             question: question.question.clone(),
             context: question.context.clone(),

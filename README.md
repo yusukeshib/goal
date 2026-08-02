@@ -27,6 +27,8 @@ cd examples/fake
 
 The example asks one question. If stdin reaches EOF, rerun the same command; the pending question is presented before sensing or deciding.
 
+When answering a question in an interactive terminal, `goal` uses a Unicode-aware multiline editor. Press Enter to send, Shift+Enter or Alt+Enter to insert a newline, Ctrl+R to search answers entered during the current run, and Ctrl+C to stop while leaving the question pending. Standard Emacs-style cursor, word, deletion, and undo shortcuts are available. Redirected stdin keeps the simple one-answer-per-line behavior for scripts.
+
 ## Agent protocol
 
 Deciders and workers are ordinary argv commands, without an implicit shell or PTY. `{prompt}` in any argv element is replaced with the generated prompt path. Without it, the prompt is piped to stdin and then closed. Every invocation receives:
