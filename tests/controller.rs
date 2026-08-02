@@ -103,6 +103,8 @@ fn help_fully_describes_configuration_and_process_contracts() {
         "multiple goals",
         ".goal/",
         "goal goals/ci/goal.toml",
+        "goal goals/ci/",
+        "CONFIG_OR_DIR",
     ] {
         assert!(
             root.contains(expected),
@@ -212,7 +214,7 @@ fn rejects_a_second_controller_for_the_same_config_and_releases_after_exit() {
     }
     assert!(lock_ready.exists(), "first controller did not start");
 
-    let second = command(&fixture.config).output().unwrap();
+    let second = command(fixture.dir.path()).output().unwrap();
     assert!(!second.status.success());
     assert!(
         String::from_utf8_lossy(&second.stderr).contains("already running"),
@@ -222,7 +224,7 @@ fn rejects_a_second_controller_for_the_same_config_and_releases_after_exit() {
 
     first.kill().unwrap();
     first.wait().unwrap();
-    let mut after_exit = command(&fixture.config)
+    let mut after_exit = command(fixture.dir.path())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

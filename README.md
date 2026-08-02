@@ -14,15 +14,15 @@ Stable Rust 1.85 or newer is required.
 
 ```sh
 cargo build
-cargo run -- goal.toml
+cargo run -- .
 ```
 
-The config path defines the project directory. Relative goal and command paths are resolved by running child processes in that directory. See [`examples/fake`](examples/fake) for a runnable deterministic cycle:
+Pass either a `goal.toml` file or its containing directory; a directory resolves to `<directory>/goal.toml`. The config directory defines the project directory. Relative goal and command paths are resolved by running child processes there. See [`examples/fake`](examples/fake) for a runnable deterministic cycle:
 
 ```sh
 cargo build
 cd examples/fake
-../../target/debug/goal goal.toml
+../../target/debug/goal .
 ```
 
 The example asks one question. If stdin reaches EOF, rerun the same command; the pending question is presented before sensing or deciding.

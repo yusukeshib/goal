@@ -40,15 +40,20 @@ pub struct LoadedConfig {
 
 impl LoadedConfig {
     pub fn load(path: &Path) -> Result<Self> {
-        let config_path =
-            fs::canonicalize(path).with_context(|| format!("resolve config {}", path.display()))?;
+        let requested_path = if path.is_dir() {
+            path.join("goal.toml")
+        } else {
+            path.to_owned()
+        };
+        let config_path = fs::canonicalize(&requested_path)
+            .with_context(|| format!("resolve config {}", requested_path.display()))?;
         let text = fs::read_to_string(&config_path)
             .with_context(|| format!("read config {}", config_path.display()))?;
         let config: Config =
             toml::from_str(&text).with_context(|| format!("parse config {}", path.display()))?;
         config.validate()?;
 
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let parent = requested_path.parent().unwrap_or_else(|| Path::new("."));
         let project_dir = fs::canonicalize(parent)
             .with_context(|| format!("resolve project directory {}", parent.display()))?;
         let goal_path = if config.goal_file.is_absolute() {
@@ -117,17 +122,24 @@ timeout_seconds = 1
     }
 
     #[test]
-    fn loads_relative_goal_file() {
+    fn loads_file_or_directory_with_relative_goal_file() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("goal.toml"), valid()).unwrap();
         fs::write(dir.path().join("GOAL.md"), "Ship the feature").unwrap();
-        let loaded = LoadedConfig::load(&dir.path().join("goal.toml")).unwrap();
-        assert_eq!(loaded.goal, "Ship the feature");
-        assert_eq!(
-            loaded.config_path,
-            fs::canonicalize(dir.path().join("goal.toml")).unwrap()
-        );
-        assert_eq!(loaded.project_dir, fs::canonicalize(dir.path()).unwrap());
+        let expected_config = fs::canonicalize(dir.path().join("goal.toml")).unwrap();
+        for path in [dir.path(), &dir.path().join("goal.toml")] {
+            let loaded = LoadedConfig::load(path).unwrap();
+            assert_eq!(loaded.goal, "Ship the feature");
+            assert_eq!(loaded.config_path, expected_config);
+            assert_eq!(loaded.project_dir, fs::canonicalize(dir.path()).unwrap());
+        }
+    }
+
+    #[test]
+    fn directory_without_goal_toml_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = LoadedConfig::load(dir.path()).unwrap_err();
+        assert!(error.to_string().contains("goal.toml"));
     }
 
     #[test]

@@ -35,8 +35,9 @@ FILES
 "#;
 
 const RUN_HELP: &str = r#"CONFIGURATION
-  The config file's directory is the project directory and child working
-  directory. Relative goal paths and command paths are resolved from there.
+  Pass either a goal.toml file or its containing directory. A directory resolves
+  to <directory>/goal.toml. The config's directory is the project directory and
+  child working directory. Relative goal and command paths resolve from there.
 
   Required goal.toml shape:
 
@@ -132,7 +133,8 @@ OUTPUT
 
 EXAMPLES
   goal                             Use ./goal.toml
-  goal goals/ci/goal.toml          Use an explicit config path
+  goal goals/ci/goal.toml          Use an explicit config file
+  goal goals/ci/                    Use goals/ci/goal.toml
   goal --output json goal.toml | jq --unbuffered -C .
 
   See examples/fake for a deterministic full cycle and
@@ -151,8 +153,8 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = output::OutputMode::Plain)]
     output: output::OutputMode,
 
-    /// Repo-local TOML configuration file.
-    #[arg(default_value = "goal.toml", value_name = "CONFIG")]
+    /// Repo-local goal.toml file or its containing directory.
+    #[arg(default_value = "goal.toml", value_name = "CONFIG_OR_DIR")]
     config: PathBuf,
 }
 
