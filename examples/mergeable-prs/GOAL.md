@@ -1,0 +1,1 @@
+Continuously keep my authored open pull requests mergeable. Address failing CI, merge conflicts, and unresolved review feedback safely. Ask before any irreversible action or decision that requires human judgment. When nothing currently needs action, wait and check again later.

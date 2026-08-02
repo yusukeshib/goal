@@ -1,0 +1,16 @@
+goal_file = "GOAL.md"
+interval_seconds = 0
+retry_seconds = 1
+max_wait_seconds = 60
+
+[sensor]
+command = ["./sensor.sh"]
+timeout_seconds = 5
+
+[decider]
+command = ["./decider.sh", "{prompt}"]
+timeout_seconds = 5
+
+[worker]
+command = ["./worker.sh"]
+timeout_seconds = 5

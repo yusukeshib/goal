@@ -1,0 +1,18 @@
+goal_file = "GOAL.md"
+interval_seconds = 60
+retry_seconds = 30
+max_wait_seconds = 3600
+
+[sensor]
+command = ["./sensor.sh"]
+timeout_seconds = 60
+
+# Replace agent-cli and its flags with a non-TUI command available locally.
+# Configure the decider with the least authority that CLI supports.
+[decider]
+command = ["agent-cli", "--read-only", "--non-interactive", "{prompt}"]
+timeout_seconds = 300
+
+[worker]
+command = ["agent-cli", "--non-interactive", "{prompt}"]
+timeout_seconds = 1800
