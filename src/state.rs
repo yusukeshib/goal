@@ -16,25 +16,8 @@ use crate::model::WorkerCompletion;
 #[serde(default, deny_unknown_fields)]
 pub struct PersistentState {
     pub latest_worker_completion: Option<WorkerCompletion>,
-    pub pending_human_question: Option<HumanQuestion>,
-    pub latest_human_answer: Option<HumanAnswer>,
     pub latest_cycle_id: Option<String>,
     pub latest_cycle_timestamp: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HumanQuestion {
-    pub question: String,
-    pub context: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HumanAnswer {
-    pub question: String,
-    pub context: Option<String>,
-    pub answer: String,
 }
 
 #[derive(Debug)]
@@ -77,7 +60,24 @@ impl StateStore {
 
     pub fn load(&self) -> Result<PersistentState> {
         match fs::read(&self.state_path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).context("parse .goal/state.json"),
+            Ok(bytes) => {
+                let mut value: Value =
+                    serde_json::from_slice(&bytes).context("parse .goal/state.json")?;
+                if let Some(object) = value.as_object_mut() {
+                    object.remove("pending_human_question");
+                    object.remove("latest_human_answer");
+                    let legacy_completion = object
+                        .get("latest_worker_completion")
+                        .and_then(Value::as_object)
+                        .and_then(|completion| completion.get("type"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|kind| matches!(kind, "needs_input" | "blocked"));
+                    if legacy_completion {
+                        object.insert("latest_worker_completion".to_owned(), Value::Null);
+                    }
+                }
+                serde_json::from_value(value).context("parse .goal/state.json")
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 Ok(PersistentState::default())
             }
@@ -145,9 +145,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::new(dir.path()).unwrap();
         let state = PersistentState {
-            pending_human_question: Some(HumanQuestion {
-                question: "Deploy?".into(),
-                context: Some("CI passed".into()),
+            latest_worker_completion: Some(WorkerCompletion::Done {
+                summary: "verified".into(),
             }),
             latest_cycle_id: Some("cycle-1".into()),
             ..PersistentState::default()
@@ -160,5 +159,36 @@ mod tests {
         let line = fs::read_to_string(dir.path().join(".goal/events.jsonl")).unwrap();
         assert_eq!(line.lines().count(), 1);
         serde_json::from_str::<Value>(line.trim()).unwrap();
+    }
+
+    #[test]
+    fn load_discards_legacy_human_state_and_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::new(dir.path()).unwrap();
+        fs::create_dir_all(dir.path().join(".goal")).unwrap();
+        fs::write(
+            dir.path().join(".goal/state.json"),
+            r#"{
+                "latest_worker_completion": {
+                    "type":"needs_input",
+                    "question":"Continue?",
+                    "context":"Legacy context",
+                    "resume_hint":null
+                },
+                "pending_human_question": {"question":"Continue?","context":null},
+                "latest_human_answer": {"question":"Old?","context":null,"answer":"yes"},
+                "latest_cycle_id": "cycle-old",
+                "latest_cycle_timestamp": 1
+            }"#,
+        )
+        .unwrap();
+
+        let state = store.load().unwrap();
+        assert_eq!(state.latest_cycle_id.as_deref(), Some("cycle-old"));
+        assert!(state.latest_worker_completion.is_none());
+        store.save(&state).unwrap();
+        let saved = fs::read_to_string(dir.path().join(".goal/state.json")).unwrap();
+        assert!(!saved.contains("human"));
+        assert!(!saved.contains("question"));
     }
 }

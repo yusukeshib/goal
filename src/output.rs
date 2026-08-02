@@ -49,10 +49,6 @@ impl Output {
         Ok(())
     }
 
-    pub fn is_plain(&self) -> bool {
-        self.mode == OutputMode::Plain
-    }
-
     pub fn plain_stdout(&self, message: &str) -> Result<()> {
         if self.mode == OutputMode::Plain {
             self.write_plain(false, message.as_bytes())?;

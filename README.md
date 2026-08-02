@@ -3,10 +3,11 @@
 `goal` is a small foreground controller that repeatedly senses the world, asks a one-shot read-only decider for one typed action, and runs at most one disposable worker.
 
 ```text
-sense -> decide -> run task / prompt human / wait / complete -> sense
+sense -> decide -> run task / wait / complete -> sense
+                  failure -> record reason -> exit 1
 ```
 
-It has no daemon, PTY, TUI, worker pool, or persistent agent conversation.
+It has no daemon, PTY, TUI, interactive input, worker pool, or persistent agent conversation.
 
 ## Build and run
 
@@ -25,9 +26,7 @@ cd examples/fake
 ../../target/debug/goal .
 ```
 
-The example asks one question. If stdin reaches EOF, rerun the same command; the pending question is presented before sensing or deciding.
-
-When answering a question in an interactive terminal, `goal` uses a Unicode-aware multiline editor. Press Enter to send, Shift+Enter or Alt+Enter to insert a newline, Ctrl+R to search answers entered during the current run, and Ctrl+C to stop while leaving the question pending. Empty or whitespace-only answers are rejected and prompted for again without exiting. Standard Emacs-style cursor, word, deletion, and undo shortcuts are available. Redirected stdin keeps the simple one-answer-per-line behavior for scripts.
+The example completes without interactive input.
 
 ## Agent protocol
 
@@ -38,9 +37,9 @@ Deciders and workers are ordinary argv commands, without an implicit shell or PT
 - `GOAL_RESULT_PATH`
 - `GOAL_PROJECT_DIR`
 
-The process must atomically write one tagged JSON object to `GOAL_RESULT_PATH`. Stdout and stderr are diagnostics only. Decider action tags are `run_task`, `prompt_human`, `wait`, and `complete`; worker completion tags are `done`, `needs_input`, and `blocked`.
+The process must atomically write one tagged JSON object to `GOAL_RESULT_PATH`. Stdout and stderr are diagnostics only. Decider action tags are `run_task`, `wait`, `complete`, and `failure`; worker completion tags are `done` and `failure`. Neither process may request human input, approval, or intervention.
 
-Runtime state, compact events, prompts, results, and logs are kept under `.goal/`. In plain output mode, sensor stdout is treated as protocol data and hidden from the terminal; it remains available in the run's `stdout.log` and is passed unchanged to the decider. Sensor stderr diagnostics are still displayed. A worker process or protocol failure is never blindly retried: the controller senses current reality and asks a fresh decider.
+Runtime state, compact events, prompts, results, and logs are kept under `.goal/`. In plain output mode, sensor stdout is treated as protocol data and hidden from the terminal; it remains available in the run's `stdout.log` and is passed unchanged to the decider. Sensor stderr diagnostics are still displayed. A worker-reported, process, timeout, or protocol failure is recorded with its reason and run ID, then terminates the controller with a non-zero status; it is never automatically retried. The retained artifacts support offline analysis of successful and failed runs. Improvements must not weaken success criteria or silently waive unmet requirements.
 
 ## JSONL output
 
@@ -50,7 +49,7 @@ Use `--output json` for a machine-readable stream:
 goal --output json goal.toml | jq --unbuffered -C .
 ```
 
-Every stdout line has the same `timestamp`, `type`, and `details` envelope. Controller events such as waits, completions, questions, and errors are structured. Child JSON is nested under `details.payload`; non-JSON child diagnostics are represented by `details.content`. Oversized child lines are replaced in the foreground stream by bounded metadata with `truncated` and `original_bytes`; exact output remains in each run's `stdout.log` or `stderr.log`. The default `--output plain` preserves human-readable terminal output. Intentional Ctrl-C/SIGTERM emits `stopped` in JSON mode and exits successfully.
+Every stdout line has the same `timestamp`, `type`, and `details` envelope. Controller events such as waits, completions, failures, and errors are structured. Child JSON is nested under `details.payload`; non-JSON child diagnostics are represented by `details.content`. Oversized child lines are replaced in the foreground stream by bounded metadata with `truncated` and `original_bytes`; exact output remains in each run's `stdout.log` or `stderr.log`. The default `--output plain` preserves human-readable terminal output. Intentional Ctrl-C/SIGTERM emits `stopped` in JSON mode and exits successfully.
 
 ## Read-only GitHub sensor example
 

@@ -1,7 +1,6 @@
 mod cancel;
 mod config;
 mod controller;
-mod human;
 mod model;
 mod output;
 mod prompt;
@@ -22,7 +21,7 @@ const ROOT_HELP: &str = r#"HOW IT WORKS
   Each cycle is: sense -> decide -> act -> sense.
   The sensor observes the world, a read-only one-shot decider selects one typed
   action, and at most one disposable worker performs one task. The controller
-  runs in the foreground and asks human questions on its terminal.
+  runs in the foreground without interactive input or human approval gates.
 
   One process controls exactly one goal. To run multiple goals, give each goal
   its own directory and goal.toml, then start a separate `goal` process for each.
@@ -103,25 +102,27 @@ DECIDER AND WORKER CONTRACT
 
   Decider actions (`type` field):
     run_task      {"type":"run_task","task":"one bounded task"}
-    prompt_human  {"type":"prompt_human","question":"...","context":null}
     wait          {"type":"wait","reason":"...","retry_after_seconds":60}
     complete      {"type":"complete","summary":"..."}
+    failure       {"type":"failure","reason":"why automatic progress is impossible"}
 
   Worker completions (`type` field):
     done          {"type":"done","summary":"actual work and verification"}
-    needs_input   {"type":"needs_input","question":"...","context":"...",
-                   "resume_hint":null}
-    blocked       {"type":"blocked","reason":"..."}
+    failure       {"type":"failure","reason":"why automatic completion is impossible"}
 
-  The decider must not modify the project or external world. A worker performs
-  only its assigned task, never reads interactive input, writes one completion,
-  and exits. A failed worker is not blindly rerun: current reality is sensed
-  before a fresh decision.
+  Neither process may request human input, approval, or intervention. The
+  decider must not modify the project or external world. A worker performs only
+  its assigned task, writes one completion, and exits. A worker-reported,
+  process, timeout, or protocol failure is recorded with its run ID and causes
+  the controller to exit non-zero; it is never automatically rerun.
 
-HUMAN INPUT AND RESTARTS
-  Questions are persisted before being printed. EOF or interruption leaves the
-  question pending; the next invocation asks it before sensing or deciding.
-  Runtime data lives under .goal/ beside the config file.
+FAILURE ANALYSIS
+  Runtime data lives under .goal/ beside the config file. Successful and failed
+  invocations retain prompts, results, stdout, and stderr under .goal/runs/, and
+  compact outcomes are appended to .goal/events.jsonl. These artifacts are the
+  source of truth for offline analysis and goal improvement. Automation must
+  not improve apparent success by weakening success criteria or silently
+  waiving unmet requirements.
 
 OUTPUT
   --output plain (default) prints human-readable terminal output.
@@ -170,7 +171,13 @@ fn main() {
             let _ = output.plain_stderr("controller stopped\n");
             return;
         }
-        if output_mode == output::OutputMode::Json {
+        if let Some(failure) = error.downcast_ref::<controller::GoalFailure>() {
+            if output_mode == output::OutputMode::Json {
+                let _ = output.event("failure", failure.details());
+            } else {
+                let _ = output.plain_stderr(&format!("goal failed: {failure}\n"));
+            }
+        } else if output_mode == output::OutputMode::Json {
             let _ = output.event(
                 "error",
                 serde_json::json!({"message": format!("{error:#}")}),
