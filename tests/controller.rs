@@ -120,6 +120,8 @@ fn help_fully_describes_configuration_and_process_contracts() {
         "goal_file = \"GOAL.md\"",
         "SENSOR CONTRACT",
         "GOAL_RESULT_PATH",
+        "--output <OUTPUT>",
+        "strict JSONL",
         "GOAL SEMANTICS",
         "temporary health is not completion",
         "Never return Complete",
@@ -132,6 +134,62 @@ fn help_fully_describes_configuration_and_process_contracts() {
     ] {
         assert!(run.contains(expected), "missing {expected:?} from run help");
     }
+}
+
+#[test]
+fn json_output_is_strict_jsonl_with_one_common_envelope() {
+    let fixture = Fixture::new(
+        r#"echo sensor-diagnostic >&2; printf '{"healthy":true}'"#,
+        r#"echo '{"pi_event":"diagnostic"}'; echo plain-diagnostic >&2; if test -f decider-once; then r='{"type":"complete","summary":"JSON complete"}'; else touch decider-once; r='{"type":"wait","reason":"observe JSON wait","retry_after_seconds":0}'; fi; printf '%s' "$r" > "$GOAL_RESULT_PATH""#,
+        r#"exit 99"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_goal"))
+        .args(["--output", "json"])
+        .arg(&fixture.config)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "JSON mode leaked stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let lines: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            serde_json::from_str(line)
+                .unwrap_or_else(|error| panic!("invalid JSONL {line:?}: {error}"))
+        })
+        .collect();
+    assert!(!lines.is_empty());
+    for line in &lines {
+        assert!(line["timestamp"].is_u64());
+        assert!(line["type"].is_string());
+        assert!(line["details"].is_object());
+    }
+    assert!(lines.iter().any(|line| line["type"] == "wait"));
+    assert!(lines.iter().any(|line| line["type"] == "complete"));
+    assert!(
+        lines
+            .iter()
+            .any(|line| line["details"]["payload"]["pi_event"] == "diagnostic")
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line["details"]["content"] == "plain-diagnostic")
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line["details"]["content"] == "sensor-diagnostic")
+    );
 }
 
 #[test]

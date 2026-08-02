@@ -40,6 +40,16 @@ The process must atomically write one tagged JSON object to `GOAL_RESULT_PATH`. 
 
 Runtime state, compact events, prompts, results, and logs are kept under `.goal/`. A worker process or protocol failure is never blindly retried: the controller senses current reality and asks a fresh decider.
 
+## JSONL output
+
+Use `--output json` for a machine-readable stream:
+
+```sh
+goal --output json goal.toml | jq --unbuffered -C .
+```
+
+Every stdout line has the same `timestamp`, `type`, and `details` envelope. Controller events such as waits, completions, questions, and errors are structured. Child JSON is nested under `details.payload`; non-JSON child diagnostics are represented by `details.content`. The default `--output plain` preserves human-readable terminal output.
+
 ## Read-only GitHub sensor example
 
 [`examples/mergeable-prs`](examples/mergeable-prs) contains a read-only `gh api graphql` sensor for authored open pull requests. It reports CI checks, merge state, and unresolved review threads. Replace the placeholder agent commands in its `goal.toml` with locally available non-TUI decider and worker commands.

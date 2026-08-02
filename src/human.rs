@@ -11,16 +11,20 @@ use std::{
 
 use anyhow::{Result, anyhow, bail};
 
-use crate::state::HumanQuestion;
+use crate::{output::Output, state::HumanQuestion};
 
-pub fn read_answer(question: &HumanQuestion, cancelled: Arc<AtomicBool>) -> Result<String> {
-    println!("\n{}", question.question);
+pub fn read_answer(
+    question: &HumanQuestion,
+    cancelled: Arc<AtomicBool>,
+    output: Output,
+) -> Result<String> {
+    output.event("human_question", serde_json::to_value(question)?)?;
+    let mut prompt = format!("\n{}", question.question);
     if let Some(context) = &question.context {
-        println!("\nContext:\n{context}");
+        prompt.push_str(&format!("\n\nContext:\n{context}"));
     }
-    print!("\n> ");
-    use io::Write;
-    io::stdout().flush()?;
+    prompt.push_str("\n\n> ");
+    output.plain_stdout(&prompt)?;
 
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {

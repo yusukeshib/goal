@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File},
-    io::{self, Read, Write},
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
@@ -15,7 +15,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::de::DeserializeOwned;
 use wait_timeout::ChildExt;
 
-use crate::config::CommandConfig;
+use crate::{config::CommandConfig, output::Output};
 
 #[derive(Debug)]
 pub struct RunArtifacts {
@@ -50,16 +50,18 @@ pub struct Runner {
     project_dir: PathBuf,
     runs_dir: PathBuf,
     cancelled: Arc<AtomicBool>,
+    output: Output,
 }
 
 impl Runner {
-    pub fn new(project_dir: &Path, cancelled: Arc<AtomicBool>) -> Result<Self> {
+    pub fn new(project_dir: &Path, cancelled: Arc<AtomicBool>, output: Output) -> Result<Self> {
         let runs_dir = project_dir.join(".goal/runs");
         fs::create_dir_all(&runs_dir).context("create runs directory")?;
         Ok(Self {
             project_dir: project_dir.to_owned(),
             runs_dir,
             cancelled,
+            output,
         })
     }
 
@@ -76,7 +78,7 @@ impl Runner {
             Ok(value) => value,
             Err(error) => return Err((RunError::Infrastructure(error), None)),
         };
-        match self.run_child(config, &artifacts, Some(prompt)) {
+        match self.run_child(role, config, &artifacts, Some(prompt)) {
             Ok(_) => {}
             Err(error) => return Err((error, Some(artifacts))),
         }
@@ -133,7 +135,7 @@ impl Runner {
             Ok(value) => value,
             Err(error) => return Err((RunError::Infrastructure(error), None)),
         };
-        let (stdout, _) = match self.run_child(config, &artifacts, None) {
+        let (stdout, _) = match self.run_child("sensor", config, &artifacts, None) {
             Ok(output) => output,
             Err(error) => return Err((error, Some(artifacts))),
         };
@@ -156,6 +158,7 @@ impl Runner {
 
     fn run_child(
         &self,
+        role: &str,
         config: &CommandConfig,
         artifacts: &RunArtifacts,
         prompt: Option<&str>,
@@ -215,8 +218,32 @@ impl Runner {
             .ok_or_else(|| RunError::Infrastructure(anyhow!("child stderr unavailable")))?;
         let stdout_log = artifacts.dir.join("stdout.log");
         let stderr_log = artifacts.dir.join("stderr.log");
-        let out_thread = thread::spawn(move || tee(stdout, stdout_log, false));
-        let err_thread = thread::spawn(move || tee(stderr, stderr_log, true));
+        let stdout_output = self.output.clone();
+        let stderr_output = self.output.clone();
+        let stdout_role = role.to_owned();
+        let stderr_role = role.to_owned();
+        let stdout_run_id = artifacts.id.clone();
+        let stderr_run_id = artifacts.id.clone();
+        let out_thread = thread::spawn(move || {
+            tee(
+                stdout,
+                stdout_log,
+                stdout_output,
+                stdout_role,
+                "stdout",
+                stdout_run_id,
+            )
+        });
+        let err_thread = thread::spawn(move || {
+            tee(
+                stderr,
+                stderr_log,
+                stderr_output,
+                stderr_role,
+                "stderr",
+                stderr_run_id,
+            )
+        });
 
         let result = wait_for_child(
             &mut child,
@@ -270,27 +297,28 @@ fn terminate(child: &mut Child) {
     let _ = child.wait();
 }
 
-fn tee(mut reader: impl Read, path: PathBuf, stderr: bool) -> Result<Vec<u8>> {
+fn tee(
+    reader: impl Read,
+    path: PathBuf,
+    output: Output,
+    role: String,
+    stream: &'static str,
+    run_id: String,
+) -> Result<Vec<u8>> {
     let mut captured = Vec::new();
     let mut log = File::create(&path).with_context(|| format!("open {}", path.display()))?;
-    let mut buffer = [0_u8; 8192];
+    let mut reader = BufReader::new(reader);
+    let mut line = Vec::new();
     loop {
-        let read = reader.read(&mut buffer)?;
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line)?;
         if read == 0 {
             break;
         }
-        log.write_all(&buffer[..read])?;
-        captured.extend_from_slice(&buffer[..read]);
+        log.write_all(&line)?;
+        captured.extend_from_slice(&line);
         log.flush()?;
-        if stderr {
-            let mut terminal = io::stderr().lock();
-            terminal.write_all(&buffer[..read])?;
-            terminal.flush()?;
-        } else {
-            let mut terminal = io::stdout().lock();
-            terminal.write_all(&buffer[..read])?;
-            terminal.flush()?;
-        }
+        output.child_line(&role, stream, &run_id, &line)?;
     }
     Ok(captured)
 }
@@ -320,7 +348,12 @@ mod tests {
     use super::*;
 
     fn runner(dir: &Path) -> Runner {
-        Runner::new(dir, Arc::new(AtomicBool::new(false))).unwrap()
+        Runner::new(
+            dir,
+            Arc::new(AtomicBool::new(false)),
+            Output::new(crate::output::OutputMode::Plain),
+        )
+        .unwrap()
     }
 
     fn command(script: &str) -> CommandConfig {

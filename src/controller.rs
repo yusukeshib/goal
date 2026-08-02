@@ -13,6 +13,7 @@ use crate::{
     config::LoadedConfig,
     human,
     model::{DeciderAction, WorkerCompletion},
+    output::Output,
     prompt,
     runner::{RunError, Runner},
     state::{
@@ -27,14 +28,15 @@ pub struct Controller {
     store: StateStore,
     state: PersistentState,
     cancelled: Arc<AtomicBool>,
+    output: Output,
 }
 
 impl Controller {
-    pub fn new(loaded: LoadedConfig, cancelled: Arc<AtomicBool>) -> Result<Self> {
+    pub fn new(loaded: LoadedConfig, cancelled: Arc<AtomicBool>, output: Output) -> Result<Self> {
         let controller_lock = ControllerLock::acquire(&loaded.config_path)?;
         let store = StateStore::new(&loaded.project_dir)?;
         let state = store.load()?;
-        let runner = Runner::new(&loaded.project_dir, Arc::clone(&cancelled))?;
+        let runner = Runner::new(&loaded.project_dir, Arc::clone(&cancelled), output.clone())?;
         Ok(Self {
             loaded,
             _lock: controller_lock,
@@ -42,6 +44,7 @@ impl Controller {
             store,
             state,
             cancelled,
+            output,
         })
     }
 
@@ -68,7 +71,12 @@ impl Controller {
                         &error,
                         artifacts.as_ref().map(|a| a.id.as_str()),
                     )?;
-                    eprintln!("sensor failed: {error}; retrying");
+                    self.output.event(
+                        "sense_failed",
+                        serde_json::json!({"error": error.to_string(), "retrying": true}),
+                    )?;
+                    self.output
+                        .plain_stderr(&format!("sensor failed: {error}; retrying\n"))?;
                     self.sleep(self.loaded.config.retry_seconds)?;
                     continue;
                 }
@@ -94,15 +102,19 @@ impl Controller {
                 ) {
                     Ok((action, artifacts)) => match action.validate() {
                         Ok(()) => {
-                            self.store.event(
-                                "decision",
-                                serde_json::json!({"run_id": artifacts.id, "action": action}),
-                            )?;
+                            let details =
+                                serde_json::json!({"run_id": artifacts.id, "action": action});
+                            self.store.event("decision", details.clone())?;
+                            self.output.event("decision", details)?;
                             break action;
                         }
                         Err(error) => {
-                            self.store.event("decider_failed", serde_json::json!({"run_id": artifacts.id, "error": format!("schema validation: {error:#}")}))?;
-                            eprintln!("decider protocol failed: {error:#}; retrying");
+                            let details = serde_json::json!({"run_id": artifacts.id, "error": format!("schema validation: {error:#}"), "retrying": true});
+                            self.store.event("decider_failed", details.clone())?;
+                            self.output.event("decider_failed", details)?;
+                            self.output.plain_stderr(&format!(
+                                "decider protocol failed: {error:#}; retrying\n"
+                            ))?;
                         }
                     },
                     Err((RunError::Cancelled, _)) => bail!("controller interrupted"),
@@ -112,7 +124,12 @@ impl Controller {
                             &error,
                             artifacts.as_ref().map(|a| a.id.as_str()),
                         )?;
-                        eprintln!("decider failed: {error}; retrying");
+                        self.output.event(
+                            "decider_failed",
+                            serde_json::json!({"error": error.to_string(), "retrying": true}),
+                        )?;
+                        self.output
+                            .plain_stderr(&format!("decider failed: {error}; retrying\n"))?;
                     }
                 }
                 self.sleep(self.loaded.config.retry_seconds)?;
@@ -134,13 +151,17 @@ impl Controller {
                     ) {
                         Ok((completion, artifacts)) => {
                             if let Err(error) = completion.validate() {
-                                self.store.event("worker_failed", serde_json::json!({"run_id": artifacts.id, "error": format!("schema validation: {error:#}")}))?;
-                                eprintln!(
-                                    "worker protocol failed: {error:#}; sensing current reality"
-                                );
+                                let details = serde_json::json!({"run_id": artifacts.id, "error": format!("schema validation: {error:#}")});
+                                self.store.event("worker_failed", details.clone())?;
+                                self.output.event("worker_failed", details)?;
+                                self.output.plain_stderr(&format!(
+                                    "worker protocol failed: {error:#}; sensing current reality\n"
+                                ))?;
                                 continue;
                             }
-                            self.store.event("worker_completed", serde_json::json!({"run_id": artifacts.id, "completion": completion}))?;
+                            let details = serde_json::json!({"run_id": artifacts.id, "completion": completion});
+                            self.store.event("worker_completed", details.clone())?;
+                            self.output.event("worker_completed", details)?;
                             self.state.latest_worker_completion = Some(completion.clone());
                             self.store.save(&self.state)?;
                             if let WorkerCompletion::NeedsInput {
@@ -164,9 +185,13 @@ impl Controller {
                                 &error,
                                 artifacts.as_ref().map(|a| a.id.as_str()),
                             )?;
-                            eprintln!(
-                                "worker failed: {error}; sensing current reality without rerunning it"
-                            );
+                            self.output.event(
+                                "worker_failed",
+                                serde_json::json!({"error": error.to_string()}),
+                            )?;
+                            self.output.plain_stderr(&format!(
+                                "worker failed: {error}; sensing current reality without rerunning it\n"
+                            ))?;
                         }
                     }
                 }
@@ -180,14 +205,19 @@ impl Controller {
                 } => {
                     let seconds =
                         cap_wait(retry_after_seconds, self.loaded.config.max_wait_seconds);
-                    println!("waiting {seconds}s: {reason}");
-                    self.store.event("wait", serde_json::json!({"reason": reason, "requested_seconds": retry_after_seconds, "actual_seconds": seconds}))?;
+                    self.output
+                        .plain_stdout(&format!("waiting {seconds}s: {reason}\n"))?;
+                    let details = serde_json::json!({"reason": reason, "requested_seconds": retry_after_seconds, "actual_seconds": seconds});
+                    self.store.event("wait", details.clone())?;
+                    self.output.event("wait", details)?;
                     self.sleep(seconds)?;
                 }
                 DeciderAction::Complete { summary } => {
-                    self.store
-                        .event("complete", serde_json::json!({"summary": summary}))?;
-                    println!("goal complete: {summary}");
+                    let details = serde_json::json!({"summary": summary});
+                    self.store.event("complete", details.clone())?;
+                    self.output.event("complete", details)?;
+                    self.output
+                        .plain_stdout(&format!("goal complete: {summary}\n"))?;
                     return Ok(());
                 }
             }
@@ -218,7 +248,8 @@ impl Controller {
             .pending_human_question
             .clone()
             .context("no pending human question")?;
-        let answer = human::read_answer(&question, Arc::clone(&self.cancelled))?;
+        let answer =
+            human::read_answer(&question, Arc::clone(&self.cancelled), self.output.clone())?;
         self.state.latest_human_answer = Some(HumanAnswer {
             question: question.question.clone(),
             context: question.context.clone(),
@@ -226,10 +257,9 @@ impl Controller {
         });
         self.state.pending_human_question = None;
         self.store.save(&self.state)?;
-        self.store.event(
-            "human_answer",
-            serde_json::json!({"question": question.question, "answer": answer}),
-        )
+        let details = serde_json::json!({"question": question.question, "answer": answer});
+        self.store.event("human_answer", details.clone())?;
+        self.output.event("human_answer", details)
     }
 
     fn record_run_error(&self, kind: &str, error: &RunError, run_id: Option<&str>) -> Result<()> {

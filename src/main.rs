@@ -2,6 +2,7 @@ mod config;
 mod controller;
 mod human;
 mod model;
+mod output;
 mod prompt;
 mod runner;
 mod state;
@@ -120,9 +121,16 @@ HUMAN INPUT AND RESTARTS
   question pending; the next invocation asks it before sensing or deciding.
   Runtime data lives under .goal/ beside the config file.
 
+OUTPUT
+  --output plain (default) prints human-readable terminal output.
+  --output json emits strict JSONL on stdout. Every line uses the envelope
+  {"timestamp":...,"type":"...","details":{...}}. Child JSON is nested in
+  details.payload; non-JSON diagnostics use details.content.
+
 EXAMPLES
   goal                             Use ./goal.toml
   goal goals/ci/goal.toml          Use an explicit config path
+  goal --output json goal.toml | jq --unbuffered -C .
 
   See examples/fake for a deterministic full cycle and
   examples/mergeable-prs for a real read-only GitHub sensor."#;
@@ -136,18 +144,40 @@ EXAMPLES
     after_help = RUN_HELP
 )]
 struct Cli {
+    /// Emit human-readable terminal output or strict JSONL.
+    #[arg(long, value_enum, default_value_t = output::OutputMode::Plain)]
+    output: output::OutputMode,
+
     /// Repo-local TOML configuration file.
     #[arg(default_value = "goal.toml", value_name = "CONFIG")]
     config: PathBuf,
 }
 
-fn main() -> Result<()> {
-    let Cli { config } = Cli::parse();
+fn main() {
+    let Cli {
+        config,
+        output: output_mode,
+    } = Cli::parse();
+    let output = output::Output::new(output_mode);
+    if let Err(error) = run(config, output.clone()) {
+        if output_mode == output::OutputMode::Json {
+            let _ = output.event(
+                "error",
+                serde_json::json!({"message": format!("{error:#}")}),
+            );
+        } else {
+            let _ = output.plain_stderr(&format!("Error: {error:#}\n"));
+        }
+        std::process::exit(1);
+    }
+}
+
+fn run(config: PathBuf, output: output::Output) -> Result<()> {
     let loaded = config::LoadedConfig::load(&config)?;
     let cancelled = Arc::new(AtomicBool::new(false));
     let signal_flag = Arc::clone(&cancelled);
     ctrlc::set_handler(move || {
         signal_flag.store(true, std::sync::atomic::Ordering::SeqCst);
     })?;
-    controller::Controller::new(loaded, cancelled)?.run()
+    controller::Controller::new(loaded, cancelled, output)?.run()
 }
