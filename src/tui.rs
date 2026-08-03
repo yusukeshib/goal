@@ -765,7 +765,10 @@ fn render(frame: &mut Frame<'_>, state: &mut UiState) {
             for detail_line in expanded.detail.lines() {
                 for segment in wrap_line(detail_line, content.width.saturating_sub(4) as usize) {
                     if visual_row >= start {
-                        lines.push(Line::from(format!("    {segment}")));
+                        lines.push(Line::from(Span::styled(
+                            format!("    {segment}"),
+                            Style::default().fg(Color::DarkGray),
+                        )));
                         if lines.len() >= content.height as usize {
                             break 'cards;
                         }
@@ -1317,6 +1320,19 @@ mod tests {
         state.push(notice("one"));
         state.push(notice("two"));
         terminal.draw(|frame| render(frame, &mut state)).unwrap();
+    }
+
+    #[test]
+    fn expanded_details_render_in_dark_gray() {
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = UiState::new();
+        state.push(notice("detail body"));
+        state.toggle().unwrap();
+
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+
+        assert_eq!(terminal.backend().buffer()[(4, 4)].fg, Color::DarkGray);
     }
 
     #[test]
