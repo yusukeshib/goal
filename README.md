@@ -33,10 +33,10 @@ See [`examples/fake`](examples/fake) for a runnable deterministic cycle:
 ```sh
 cargo build
 cd examples/fake
-../../target/debug/goal
+./run.sh
 ```
 
-The example completes without interactive input.
+The example resets its fake progress, performs 20 deterministic worker cycles, and completes without interactive input in roughly one minute. This produces enough activity to exercise the TUI scrollbar. Set `GOAL_FAKE_STEPS` or `GOAL_FAKE_DELAY_SECONDS` to adjust its length, for example `GOAL_FAKE_STEPS=40 ./run.sh`.
 
 ## Agent protocol
 
@@ -64,7 +64,7 @@ It reports outcome counts, worker success rate, failure kinds, and average/p50/p
 
 ## Output modes
 
-The default `--output tui` opens a fullscreen streaming activity feed when stdin and stdout are terminals. Each newline-delimited child diagnostic is one card. A scrollbar at the right shows the visible position when the activity buffer overflows. Use Up/Down or `j`/`k` to select, Enter/Space or a mouse click to expand, the mouse wheel or PageUp/PageDown to scroll, End or `a` to resume following new activity, and `q` or Ctrl-C to stop. Scrolling away from the end pauses automatic following.
+The default `--output tui` opens a fullscreen streaming activity feed when stdin and stdout are terminals. Each newline-delimited child diagnostic is one card. A scrollbar at the right shows the visible position when the activity buffer overflows; drag its thumb or click its track to move through the feed. Use Up/Down or `j`/`k` to select, Enter/Space or a card click to expand, the mouse wheel or PageUp/PageDown to scroll, End or `a` to resume following new activity, and `q` or Ctrl-C to stop. Scrolling away from the end pauses automatic following, while reaching the end resumes it so new activity remains pinned to the pane's last row.
 
 TUI mode falls back silently to plain output when redirected or run without an interactive terminal. `goal stats` always prints its report instead of opening the fullscreen viewer.
 

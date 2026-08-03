@@ -4,12 +4,12 @@ max_wait_seconds = 60
 
 [sensor]
 command = ["./sensor.sh"]
-timeout_seconds = 5
+timeout_seconds = 30
 
 [decider]
 command = ["./decider.sh", "{prompt}"]
-timeout_seconds = 5
+timeout_seconds = 30
 
 [worker]
 command = ["./worker.sh"]
-timeout_seconds = 5
+timeout_seconds = 30

@@ -1,10 +1,13 @@
 #!/bin/sh
 set -eu
-sleep "${GOAL_FAKE_DELAY_SECONDS:-2}"
+
+sleep "${GOAL_FAKE_DELAY_SECONDS:-1}"
 if grep -q '"completed": true' "$GOAL_PROMPT_PATH"; then
-  result='{"type":"complete","summary":"The fresh observation reports completion."}'
+  printf '{"kind":"fake_decider","decision":"complete"}\n'
+  result='{"type":"complete","summary":"The configured fake progress target was reached."}'
 else
-  result='{"type":"run_task","task":"Record blue in the completion marker."}'
+  printf '{"kind":"fake_decider","decision":"run_task"}\n'
+  result='{"type":"run_task","task":"Advance fake progress by exactly one step."}'
 fi
 temporary="$GOAL_RESULT_PATH.tmp"
 printf '%s' "$result" > "$temporary"

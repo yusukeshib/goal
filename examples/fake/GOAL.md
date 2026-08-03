@@ -1,1 +1,1 @@
-Complete one fake task by recording blue, and finish only after the sensor reports completion.
+Advance deterministic fake progress one step at a time, and finish only after the sensor reports that the configured target was reached.
