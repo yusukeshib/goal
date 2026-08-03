@@ -30,7 +30,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
 use serde_json::Value;
 
@@ -130,15 +130,22 @@ fn truncate(text: &str, cap: usize) -> String {
 #[derive(Debug)]
 struct Card {
     activity: Activity,
-    expanded: bool,
-    detail: Option<String>,
+}
+
+#[derive(Debug)]
+struct ExpandedCard {
+    index: usize,
+    detail: String,
 }
 
 #[derive(Debug, Default)]
 struct UiState {
     cards: VecDeque<Card>,
     selected: Option<usize>,
+    expanded: Option<ExpandedCard>,
     top: usize,
+    content_width: u16,
+    viewport_height: u16,
     auto_follow: bool,
     unseen: usize,
     evicted: u64,
@@ -185,22 +192,44 @@ impl UiState {
             }
         }
         let was_empty = self.cards.is_empty();
-        self.cards.push_back(Card {
-            activity,
-            expanded: false,
-            detail: None,
-        });
+        self.cards.push_back(Card { activity });
         if self.auto_follow || was_empty {
             self.selected = Some(self.cards.len() - 1);
         } else {
             self.unseen += 1;
         }
         while self.cards.len() > MAX_CARDS {
+            let removed_height = card_height(0, self.expanded.as_ref(), self.content_width.max(1));
             self.cards.pop_front();
             self.evicted += 1;
             self.selected = self.selected.map(|i| i.saturating_sub(1));
-            self.top = self.top.saturating_sub(1);
+            self.expanded = self.expanded.take().and_then(|mut expanded| {
+                if expanded.index == 0 {
+                    None
+                } else {
+                    expanded.index -= 1;
+                    Some(expanded)
+                }
+            });
+            self.top = self.top.saturating_sub(removed_height);
         }
+    }
+
+    fn visual_start(&self, index: usize) -> usize {
+        (0..index.min(self.cards.len()))
+            .map(|index| card_height(index, self.expanded.as_ref(), self.content_width.max(1)))
+            .sum()
+    }
+
+    fn visual_height(&self) -> usize {
+        (0..self.cards.len())
+            .map(|index| card_height(index, self.expanded.as_ref(), self.content_width.max(1)))
+            .sum()
+    }
+
+    fn max_top(&self) -> usize {
+        self.visual_height()
+            .saturating_sub(self.viewport_height as usize)
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -211,7 +240,9 @@ impl UiState {
         self.selected = Some((old + delta).clamp(0, self.cards.len() as isize - 1) as usize);
         self.auto_follow = self.selected == Some(self.cards.len() - 1);
         if !self.auto_follow {
-            self.top = self.selected.unwrap_or(0).saturating_sub(5);
+            self.top = self
+                .visual_start(self.selected.unwrap_or(0))
+                .saturating_sub(5);
         } else {
             self.unseen = 0;
         }
@@ -232,34 +263,39 @@ impl UiState {
         self.top = 0;
         self.auto_follow = false;
     }
+
     fn scroll(&mut self, amount: isize) {
         self.auto_follow = false;
-        self.top = (self.top as isize + amount)
-            .clamp(0, self.cards.len().saturating_sub(1) as isize) as usize;
+        self.top = (self.top as isize + amount).clamp(0, self.max_top() as isize) as usize;
     }
+
     fn toggle(&mut self) -> Result<()> {
         let Some(index) = self.selected else {
             return Ok(());
         };
-        let expanding = !self.cards[index].expanded;
-        for (card_index, card) in self.cards.iter_mut().enumerate() {
-            if card_index != index || !expanding {
-                card.expanded = false;
-                card.detail = None;
-            }
+        if self
+            .expanded
+            .as_ref()
+            .is_some_and(|card| card.index == index)
+        {
+            self.top = self.visual_start(index);
+            self.expanded = None;
+        } else {
+            self.expanded = Some(ExpandedCard {
+                index,
+                detail: load_detail(&self.cards[index].activity)?,
+            });
+            self.top = self.visual_start(index);
         }
-        let card = &mut self.cards[index];
-        card.expanded = expanding;
-        if expanding {
-            card.detail = Some(load_detail(&card.activity)?);
-        }
+        self.auto_follow = false;
         Ok(())
     }
+
     fn collapse(&mut self) {
-        if let Some(i) = self.selected {
-            self.cards[i].expanded = false;
-            self.cards[i].detail = None;
+        if let Some(index) = self.expanded.as_ref().map(|expanded| expanded.index) {
+            self.top = self.visual_start(index);
         }
+        self.expanded = None;
     }
 }
 
@@ -488,8 +524,8 @@ fn handle_event(event: Event, state: &mut UiState, cancelled: &AtomicBool) -> Re
             ..
         }) => state.scroll(10),
         Event::Mouse(mouse) => match mouse.kind {
-            MouseEventKind::ScrollUp => state.scroll(-3),
-            MouseEventKind::ScrollDown => state.scroll(3),
+            MouseEventKind::ScrollUp => state.scroll(-1),
+            MouseEventKind::ScrollDown => state.scroll(1),
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some((_, index)) =
                     state.hit_regions.iter().find(|(row, _)| *row == mouse.row)
@@ -536,47 +572,84 @@ fn render(frame: &mut Frame<'_>, state: &mut UiState) {
     );
 
     let body = areas[1];
+    let body_columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(body);
+    let content = body_columns[0];
+    let scrollbar_area = body_columns[1];
     state.hit_regions.clear();
-    let start = if state.auto_follow {
-        visible_start_from_end(&state.cards, body.width, body.height)
+    state.content_width = content.width;
+    state.viewport_height = content.height;
+    let content_height = state.visual_height();
+    state.top = if state.auto_follow {
+        content_height.saturating_sub(content.height as usize)
     } else {
-        state.top.min(state.cards.len())
+        state
+            .top
+            .min(content_height.saturating_sub(content.height as usize))
     };
+    let start = state.top;
     let mut lines = Vec::new();
-    let mut row = body.y;
-    for (index, card) in state.cards.iter().enumerate().skip(start) {
-        if lines.len() >= body.height as usize {
-            break;
+    let mut visual_row = 0_usize;
+    'cards: for (index, card) in state.cards.iter().enumerate() {
+        let height = card_height(index, state.expanded.as_ref(), content.width);
+        if visual_row + height <= start {
+            visual_row += height;
+            continue;
         }
-        state.hit_regions.push((row, index));
-        let selected = state.selected == Some(index);
-        let (timestamp, label, summary, color) = card_parts(&card.activity);
-        let style = Style::default().fg(color).add_modifier(if selected {
-            Modifier::REVERSED
-        } else {
-            Modifier::empty()
-        });
-        let header = format!("{} {label:<10} {summary}", clock(timestamp));
-        lines.push(Line::from(vec![Span::styled(
-            truncate(&header, body.width as usize),
-            style,
-        )]));
-        row += 1;
-        if card.expanded {
-            if let Some(detail) = &card.detail {
-                for detail_line in detail.lines() {
-                    for segment in wrap_line(detail_line, body.width.saturating_sub(4) as usize) {
-                        if lines.len() >= body.height as usize {
-                            break;
-                        }
+
+        if visual_row >= start {
+            let row = content.y + lines.len() as u16;
+            state.hit_regions.push((row, index));
+            let selected = state.selected == Some(index);
+            let (timestamp, label, summary, color) = card_parts(&card.activity);
+            let style = Style::default().fg(color).add_modifier(if selected {
+                Modifier::REVERSED
+            } else {
+                Modifier::empty()
+            });
+            let header = format!("{} {label:<10} {summary}", clock(timestamp));
+            lines.push(Line::from(vec![Span::styled(
+                truncate(&header, content.width as usize),
+                style,
+            )]));
+            if lines.len() >= content.height as usize {
+                break;
+            }
+        }
+        visual_row += 1;
+
+        if let Some(expanded) = state
+            .expanded
+            .as_ref()
+            .filter(|expanded| expanded.index == index)
+        {
+            for detail_line in expanded.detail.lines() {
+                for segment in wrap_line(detail_line, content.width.saturating_sub(4) as usize) {
+                    if visual_row >= start {
                         lines.push(Line::from(format!("    {segment}")));
-                        row += 1;
+                        if lines.len() >= content.height as usize {
+                            break 'cards;
+                        }
                     }
+                    visual_row += 1;
                 }
             }
         }
     }
-    frame.render_widget(Paragraph::new(Text::from(lines)), body);
+    frame.render_widget(Paragraph::new(Text::from(lines)), content);
+
+    if content_height > content.height as usize {
+        let mut scrollbar_state = ScrollbarState::new(content_height)
+            .position(start)
+            .viewport_content_length(content.height as usize);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            scrollbar_area,
+            &mut scrollbar_state,
+        );
+    }
     let evicted = if state.evicted == 0 {
         String::new()
     } else {
@@ -591,27 +664,17 @@ fn render(frame: &mut Frame<'_>, state: &mut UiState) {
     );
 }
 
-fn visible_start_from_end(cards: &VecDeque<Card>, width: u16, height: u16) -> usize {
-    let mut used = 0_usize;
-    for (index, card) in cards.iter().enumerate().rev() {
-        let detail_rows = card
-            .detail
-            .as_deref()
-            .filter(|_| card.expanded)
-            .map(|detail| {
-                detail
-                    .lines()
-                    .map(|line| wrap_line(line, width.saturating_sub(4) as usize).len())
-                    .sum::<usize>()
-            })
-            .unwrap_or(0);
-        let rows = 1 + detail_rows;
-        if used + rows > height as usize && used > 0 {
-            return index + 1;
-        }
-        used += rows;
-    }
-    0
+fn card_height(index: usize, expanded: Option<&ExpandedCard>, width: u16) -> usize {
+    1 + expanded
+        .filter(|expanded| expanded.index == index)
+        .map(|expanded| {
+            expanded
+                .detail
+                .lines()
+                .map(|line| wrap_line(line, width.saturating_sub(4) as usize).len())
+                .sum::<usize>()
+        })
+        .unwrap_or(0)
 }
 
 fn wrap_line(text: &str, width: usize) -> Vec<String> {
@@ -650,7 +713,10 @@ fn card_parts(activity: &Activity) -> (u64, String, String, Color) {
         } => (
             *timestamp,
             role.to_uppercase(),
-            format!("[{stream}] {summary} · {original_bytes} B"),
+            format!(
+                "{}{summary} · {original_bytes} B",
+                if stream == "stderr" { "[stderr] " } else { "" }
+            ),
             if stream == "stderr" {
                 Color::Yellow
             } else {
@@ -713,6 +779,27 @@ mod tests {
     }
 
     #[test]
+    fn child_cards_only_label_stderr() {
+        let child = |stream: &str| Activity::Child {
+            timestamp: 1,
+            role: "worker".into(),
+            stream: stream.into(),
+            run_id: "run".into(),
+            artifact: ArtifactRange {
+                path: PathBuf::new(),
+                offset: 0,
+                length: 0,
+            },
+            summary: "diagnostic".into(),
+            original_bytes: 10,
+        };
+        let (_, _, stdout_summary, _) = card_parts(&child("stdout"));
+        let (_, _, stderr_summary, _) = card_parts(&child("stderr"));
+        assert_eq!(stdout_summary, "diagnostic · 10 B");
+        assert_eq!(stderr_summary, "[stderr] diagnostic · 10 B");
+    }
+
+    #[test]
     fn reducer_pauses_and_resumes_follow() {
         let mut state = UiState::new();
         state.push(notice("one"));
@@ -727,29 +814,21 @@ mod tests {
     }
 
     #[test]
-    fn toggle_only_changes_selected_card() {
+    fn toggle_tracks_one_expanded_card_globally() {
         let mut state = UiState::new();
         state.push(notice("one"));
         state.push(notice("two"));
         state.selected = Some(0);
         state.toggle().unwrap();
-        assert!(state.cards[0].expanded);
-        assert!(!state.cards[1].expanded);
-    }
+        assert_eq!(state.expanded.as_ref().map(|card| card.index), Some(0));
 
-    #[test]
-    fn expanding_another_card_releases_the_previous_detail() {
-        let mut state = UiState::new();
-        state.push(notice("one"));
-        state.push(notice("two"));
-        state.selected = Some(0);
-        state.toggle().unwrap();
-        assert!(state.cards[0].detail.is_some());
         state.selected = Some(1);
         state.toggle().unwrap();
-        assert!(!state.cards[0].expanded);
-        assert!(state.cards[0].detail.is_none());
-        assert!(state.cards[1].expanded);
+        assert_eq!(state.expanded.as_ref().map(|card| card.index), Some(1));
+
+        state.move_selection(-1);
+        state.collapse();
+        assert!(state.expanded.is_none());
     }
 
     #[test]
@@ -774,7 +853,7 @@ mod tests {
             &cancelled,
         )
         .unwrap();
-        assert!(state.cards[0].expanded);
+        assert_eq!(state.expanded.as_ref().map(|card| card.index), Some(0));
 
         state.hit_regions = vec![(4, 0)];
         handle_event(
@@ -788,7 +867,54 @@ mod tests {
             &cancelled,
         )
         .unwrap();
-        assert!(!state.cards[0].expanded);
+        assert!(state.expanded.is_none());
+    }
+
+    #[test]
+    fn expanded_card_scrolls_by_wrapped_display_line() {
+        let backend = TestBackend::new(30, 9);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = UiState::new();
+        state.push(notice("details"));
+        state.toggle().unwrap();
+        state.expanded.as_mut().unwrap().detail =
+            "abcdefghijklmnopqrstuvwxyz\none\ntwo\nthree".into();
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+
+        let body_line = |terminal: &Terminal<TestBackend>, row| {
+            (0..29)
+                .map(|column| {
+                    terminal
+                        .backend()
+                        .buffer()
+                        .cell((column, row))
+                        .unwrap()
+                        .symbol()
+                })
+                .collect::<String>()
+        };
+        assert!(body_line(&terminal, 3).contains("details"));
+
+        let cancelled = AtomicBool::new(false);
+        handle_event(
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 0,
+                row: 3,
+                modifiers: KeyModifiers::NONE,
+            }),
+            &mut state,
+            &cancelled,
+        )
+        .unwrap();
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        assert_eq!(state.top, 1);
+        assert!(body_line(&terminal, 3).contains("abcdefghijklmnopqrstuvwxy"));
+
+        state.scroll(1);
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        assert_eq!(state.top, 2);
+        assert_eq!(body_line(&terminal, 3).trim(), "z");
     }
 
     #[test]
@@ -811,6 +937,64 @@ mod tests {
         let detail = load_detail(&activity).unwrap();
         assert!(detail.contains("run: r"));
         assert!(detail.ends_with("{\n  \"a\": 1\n}"));
+    }
+
+    #[test]
+    fn scrollbar_tracks_visual_position() {
+        let backend = TestBackend::new(30, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = UiState::new();
+        for index in 0..30 {
+            state.push(notice(&index.to_string()));
+        }
+        state.home();
+
+        let thumb_row = |terminal: &Terminal<TestBackend>| {
+            let buffer = terminal.backend().buffer();
+            (3..9)
+                .find(|row| {
+                    buffer
+                        .cell((29, *row))
+                        .is_some_and(|cell| cell.symbol() == "█")
+                })
+                .expect("missing scrollbar thumb")
+        };
+
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        let top = thumb_row(&terminal);
+        state.scroll(12);
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        let middle = thumb_row(&terminal);
+        state.scroll(100);
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        let bottom = thumb_row(&terminal);
+        assert!(top < middle, "top={top}, middle={middle}");
+        assert!(middle < bottom, "middle={middle}, bottom={bottom}");
+    }
+
+    #[test]
+    fn scrollbar_handles_no_overflow_and_narrow_terminals() {
+        let backend = TestBackend::new(20, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = UiState::new();
+        state.push(notice("one"));
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        for row in 3..7 {
+            let symbol = terminal
+                .backend()
+                .buffer()
+                .cell((19, row))
+                .unwrap()
+                .symbol();
+            assert!(!matches!(symbol, "▲" | "█" | "║" | "▼"));
+        }
+
+        let backend = TestBackend::new(1, 7);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = UiState::new();
+        state.push(notice("one"));
+        state.push(notice("two"));
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
     }
 
     #[test]

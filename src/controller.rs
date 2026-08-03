@@ -147,6 +147,10 @@ impl Controller {
                         "decider_failed",
                         serde_json::json!({"run_id": run_id, "error": reason}),
                     )?;
+                    if matches!(error, RunError::Protocol(_)) {
+                        self.sleep(self.loaded.config.interval_seconds.max(1))?;
+                        continue;
+                    }
                     return self.terminal_failure("decider", reason, run_id);
                 }
             };
@@ -159,7 +163,8 @@ impl Controller {
                 });
                 self.store.event("decider_failed", details.clone())?;
                 self.output.event("decider_failed", details)?;
-                return self.terminal_failure("decider", reason, Some(artifacts.id));
+                self.sleep(self.loaded.config.interval_seconds.max(1))?;
+                continue;
             }
             let (outcome, failure_kind, result_type, failure_reason) = match &action {
                 DeciderAction::RunTask { .. } => (RunOutcome::Success, None, "run_task", None),
@@ -258,11 +263,8 @@ impl Controller {
                             });
                             self.store.event("worker_completed", details.clone())?;
                             self.output.event("worker_completed", details)?;
-                            self.state.latest_worker_completion = Some(completion.clone());
+                            self.state.latest_worker_completion = Some(completion);
                             self.store.save(&self.state)?;
-                            if let WorkerCompletion::Failure { reason } = completion {
-                                return self.terminal_failure("worker", reason, Some(artifacts.id));
-                            }
                         }
                         Err((RunError::Cancelled, artifacts)) => {
                             finish_run_error(artifacts.as_deref(), &RunError::Cancelled)?;

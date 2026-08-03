@@ -124,9 +124,14 @@ DECIDER AND WORKER CONTRACT
 
   Neither process may request human input, approval, or intervention. The
   decider must not modify the project or external world. A worker performs only
-  its assigned task, writes one completion, and exits. Any sensor, decider, or
-  worker process, timeout, or protocol failure is recorded with its run ID and
-  causes the controller to exit non-zero; it is never automatically retried.
+  its assigned task, writes one completion, and exits. A worker's logical
+  failure is task-local: it is recorded, followed by a fresh observation, and
+  passed to the next decider so other work can continue. A decider's logical
+  failure is goal-wide and terminal. A decider protocol failure is recorded,
+  followed by a short backoff and a fresh observation because the decider is
+  read-only. Sensor failures and decider process failures cause the controller
+  to exit non-zero. Worker process, timeout, and protocol failures are also
+  terminal because the worker may have modified external state.
 
 FAILURE ANALYSIS
   Runtime data lives under .goal/ beside the config file. Successful and failed
@@ -142,7 +147,8 @@ FAILURE ANALYSIS
 OUTPUT
   --output tui (default) opens a fullscreen streaming activity feed on an
   interactive terminal. Each child diagnostic is one collapsible card; click or
-  press Enter to expand it. TUI mode falls back to plain output when redirected.
+  press Enter to expand it. Overflowing activity shows a right-side scrollbar.
+  TUI mode falls back to plain output when redirected.
   --output plain prints timestamped text. --output pretty preserves every child
   JSON value but indents it as one terminal block. stdout.log/stderr.log always
   retain the original one-line output. For controller runs, --output json emits

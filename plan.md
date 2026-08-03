@@ -27,11 +27,14 @@ Confirmed design
 7. Human input is not part of the controller workflow. There are no questions,
    pending approvals, or resumable conversations. The default fullscreen TUI is
    observational only and cannot steer child work.
-8. If the decider or worker determines that automatic progress is impossible,
-   it returns `failure` with a concrete reason.
-9. Every sensor, decider, or worker process, timeout, or protocol failure is
-   terminal. The controller records it and exits non-zero without an internal
-   retry. A scheduler may start a separate run later.
+8. If the decider determines that the goal as a whole cannot progress, or a
+   worker cannot complete its assigned task, it returns `failure` with a
+   concrete reason.
+9. A decider protocol failure is recorded and retried after a short backoff and
+   fresh observation because the decider is read-only. Sensor failures, decider
+   process failures, and worker process, timeout, or protocol failures are
+   terminal. A logical worker `failure` is task-local instead: the controller
+   records it, senses again, and lets the next decider select other work.
 10. No daemon, child PTY, worker pool, parallel workers, scheduler, workflow DAG,
     or persistent agent conversation is part of the controller. A bounded,
     observational TUI may render controller and child activity.
@@ -46,7 +49,7 @@ State machine
       |
       +-- run_task --> RUN WORKER -- done ----> SENSE
       |                          |
-      |                          +-- failure --> RECORD --> EXIT 1
+      |                          +-- failure --> RECORD --> SENSE
       |
       +-- wait -------------------------------> SLEEP --> SENSE
       |
@@ -74,8 +77,9 @@ Every text field must be non-empty. Unknown and extra fields are rejected.
 and improving future goals or automation.
 
 `wait` is only for a temporary world condition that can resolve automatically.
-A human-only decision, unavailable authority, missing credential, or unsafe
-operation is `failure`, not `wait`.
+A decider uses `failure` only when the goal as a whole cannot be pursued. A
+worker uses `failure` when its bounded task cannot be completed; that task-local
+outcome becomes context for the next decider rather than terminating the goal.
 
 Runner contract
 ---------------
@@ -105,7 +109,8 @@ Process and logical outcomes are distinct:
 
 * exit 0 plus a valid result: valid outcome;
 * non-zero exit: process failure;
-* exit 0 without a valid result: protocol failure;
+* exit 0 without a valid result: protocol failure (a decider is retried after a
+  short backoff and fresh observation; a worker failure is terminal);
 * timeout: process failure terminated by the controller.
 
 Worker contract
@@ -121,9 +126,10 @@ Every worker prompt requires the worker to:
 * write exactly one completion and exit;
 * report what changed and what was actually verified.
 
-A worker process/protocol failure and a logical worker `failure` both terminate
-the controller. This prevents a scheduler or decider loop inside one invocation
-from repeatedly launching the same unsafe or impossible task.
+A worker process/protocol failure terminates the controller. A valid logical
+worker `failure` is recorded, followed by a fresh observation and decision. The
+next decider is instructed not to repeat the same task unless reality materially
+changed, preventing a blind loop while allowing independent work to continue.
 
 Persistence and analysis
 ------------------------
@@ -146,7 +152,8 @@ The artifacts must distinguish:
 * logical decider or worker `failure` and its reason;
 * worker process, timeout, and protocol failures;
 * finite goal `complete`;
-* terminal sensor, decider, and worker infrastructure failures.
+* terminal sensor, decider-process, and worker infrastructure failures;
+* recoverable decider protocol failures.
 
 Target selection is shared by run and analysis commands: `GOAL_DIR` selects the
 goal directory, otherwise the current directory is used. `goal stats --since
@@ -199,7 +206,8 @@ Failure policy
 * Decider process/protocol failure or timeout: preserve artifacts, record the
   reason, and exit non-zero.
 * Decider `failure`: record the reason and exit non-zero.
-* Worker `failure`: record the result and reason, then exit non-zero.
+* Worker `failure`: record the result and reason, re-sense, and pass the
+  task-local failure to the next decider so other work can continue.
 * Worker process/protocol failure or timeout: preserve artifacts, record the
   reason, and exit non-zero without re-sensing or launching another worker.
 * Ctrl-C/SIGTERM: terminate the active child and exit cleanly without starting
@@ -215,7 +223,7 @@ Integration tests cover:
 * sensor failure exits non-zero without invoking the decider;
 * decider process failure exits non-zero without acting or re-sensing;
 * decider `failure` exits non-zero without a worker;
-* worker `failure` exits non-zero after one worker;
+* worker `failure` is recorded and a later cycle can complete the goal;
 * worker non-zero, timeout, and missing/invalid result are terminal;
 * full failure reason and run ID are retained in events;
 * legacy human state loads without restoring an interaction path;

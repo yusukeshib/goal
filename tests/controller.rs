@@ -438,31 +438,74 @@ fn decider_timeout_is_terminal_and_never_calls_worker() {
 }
 
 #[test]
-fn worker_reported_failure_is_recorded_and_exits_without_another_cycle() {
+fn malformed_decider_result_is_recorded_and_retried_after_resensing() {
     let fixture = Fixture::new(
         COUNT_SENSOR,
-        r#"echo 1 > decider-count; printf '{"type":"run_task","task":"requires unavailable access"}' > "$GOAL_RESULT_PATH""#,
+        r#"n=0; test ! -f decider-count || n=$(cat decider-count); n=$((n+1)); echo "$n" > decider-count; if test "$n" = 1; then r='{"type":"run_task","task":"unterminated"'; else r='{"type":"complete","summary":"recovered after malformed decision"}'; fi; printf '%s' "$r" > "$GOAL_RESULT_PATH""#,
+        r#"echo 1 > worker-count"#,
+    );
+    let output = fixture.run();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fixture.count("sensor-count"), 2);
+    assert_eq!(fixture.count("decider-count"), 2);
+    assert_eq!(fixture.count("worker-count"), 0);
+
+    let events = fs::read_to_string(fixture.dir.path().join(".goal/events.jsonl")).unwrap();
+    let events = events
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let failure = events
+        .iter()
+        .find(|event| event["type"] == "decider_failed")
+        .expect("missing decider failure event");
+    assert!(
+        failure["details"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("protocol failure")
+    );
+    assert!(!events.iter().any(|event| event["type"] == "failure"));
+    assert!(events.iter().any(|event| event["type"] == "complete"));
+}
+
+#[test]
+fn worker_reported_failure_is_recorded_and_the_next_cycle_can_complete() {
+    let fixture = Fixture::new(
+        COUNT_SENSOR,
+        r#"n=0; test ! -f decider-count || n=$(cat decider-count); n=$((n+1)); echo "$n" > decider-count; if test "$n" = 1; then r='{"type":"run_task","task":"requires unavailable access"}'; else r='{"type":"complete","summary":"continued after task failure"}'; fi; printf '%s' "$r" > "$GOAL_RESULT_PATH""#,
         r#"echo 1 > worker-count; printf '{"type":"failure","reason":"deployment credentials are unavailable"}' > "$GOAL_RESULT_PATH""#,
     );
     let output = fixture.run();
-    assert!(!output.status.success());
-    assert_eq!(fixture.count("sensor-count"), 1);
-    assert_eq!(fixture.count("decider-count"), 1);
-    assert_eq!(fixture.count("worker-count"), 1);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("worker reported failure"), "{stderr}");
     assert!(
-        stderr.contains("deployment credentials are unavailable"),
-        "{stderr}"
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
+    assert_eq!(fixture.count("sensor-count"), 2);
+    assert_eq!(fixture.count("decider-count"), 2);
+    assert_eq!(fixture.count("worker-count"), 1);
 
-    let failure = fixture.failure_event();
-    assert_eq!(failure["details"]["source"], "worker");
+    let events = fs::read_to_string(fixture.dir.path().join(".goal/events.jsonl")).unwrap();
+    let events = events
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(!events.iter().any(|event| event["type"] == "failure"));
+    let completion = events
+        .iter()
+        .find(|event| event["type"] == "worker_completed")
+        .expect("missing worker completion event");
+    assert_eq!(completion["details"]["completion"]["type"], "failure");
     assert_eq!(
-        failure["details"]["reason"],
+        completion["details"]["completion"]["reason"],
         "deployment credentials are unavailable"
     );
-    assert!(failure["details"]["run_id"].is_string());
+    assert!(events.iter().any(|event| event["type"] == "complete"));
 
     let stats = Command::new(env!("CARGO_BIN_EXE_goal"))
         .args(["stats", "--output", "json"])
@@ -472,8 +515,8 @@ fn worker_reported_failure_is_recorded_and_exits_without_another_cycle() {
         .unwrap();
     assert!(stats.status.success());
     let report: serde_json::Value = serde_json::from_slice(&stats.stdout).unwrap();
-    assert_eq!(report["recorded_runs"], 3);
-    assert_eq!(report["outcomes"]["success"], 2);
+    assert_eq!(report["recorded_runs"], 5);
+    assert_eq!(report["outcomes"]["success"], 4);
     assert_eq!(report["outcomes"]["failure"], 1);
     assert_eq!(report["worker_success_rate"], 0.0);
     assert_eq!(report["failures_by_kind"]["logical"], 1);
