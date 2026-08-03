@@ -7,11 +7,12 @@ mod output;
 mod prompt;
 mod runner;
 mod state;
+mod tui;
 
 use std::{
-    io::{self, Write},
+    io::{self, IsTerminal, Write},
     path::PathBuf,
-    sync::{Arc, atomic::AtomicBool},
+    sync::{Arc, atomic::AtomicBool, mpsc},
 };
 
 use anyhow::Result;
@@ -139,14 +140,15 @@ FAILURE ANALYSIS
   silently waiving unmet requirements.
 
 OUTPUT
-  --output plain (default) prints human-readable terminal output unchanged.
-  --output pretty preserves every child JSON value but indents it for the
-  terminal; stdout.log/stderr.log retain the original one-line output. For
-  controller runs, --output json emits strict JSONL envelopes on stdout. For
-  stats, plain and pretty emit the human-readable report, while json emits one
-  JSON report. Child JSON is nested in details.payload; non-JSON diagnostics use
-  details.content. Oversized child lines are summarized only in the JSON
-  foreground stream while the run logs retain the exact output.
+  --output tui (default) opens a fullscreen streaming activity feed on an
+  interactive terminal. Each child diagnostic is one collapsible card; click or
+  press Enter to expand it. TUI mode falls back to plain output when redirected.
+  --output plain prints timestamped text. --output pretty preserves every child
+  JSON value but indents it as one terminal block. stdout.log/stderr.log always
+  retain the original one-line output. For controller runs, --output json emits
+  strict JSONL envelopes on stdout. For stats, tui, plain, and pretty emit the
+  human-readable report, while json emits one JSON report. Oversized child lines
+  are summarized only in foreground displays; run logs retain exact output.
 
 EXAMPLES
   goal                                      Run ./goal.toml
@@ -168,12 +170,12 @@ EXAMPLES
     after_help = RUN_HELP
 )]
 struct Cli {
-    /// Emit plain, pretty-printed, or machine-readable JSON output.
+    /// Select fullscreen TUI, plain, pretty-printed, or machine-readable JSON output.
     #[arg(
         long,
         value_enum,
         global = true,
-        default_value_t = output::OutputMode::Plain
+        default_value_t = output::OutputMode::Tui
     )]
     output: output::OutputMode,
 
@@ -195,21 +197,28 @@ enum Commands {
 
 fn main() {
     let cli = Cli::parse();
-    let output_mode = cli.output;
-    let output = output::Output::new(output_mode);
-    if let Err(error) = dispatch(cli, output.clone()) {
+    let output_mode = effective_output_mode(cli.output);
+    if let Err(error) = dispatch(cli, output_mode) {
+        // The fullscreen session has already restored the terminal here. Use a
+        // fresh stream backend for final diagnostics rather than its closed channel.
+        let report_mode = if output_mode == output::OutputMode::Tui {
+            output::OutputMode::Plain
+        } else {
+            output_mode
+        };
+        let output = output::Output::new(report_mode);
         if error.downcast_ref::<cancel::Interrupted>().is_some() {
             let _ = output.event("stopped", serde_json::json!({"reason": "interrupted"}));
             let _ = output.plain_stderr("controller stopped\n");
             return;
         }
         if let Some(failure) = error.downcast_ref::<controller::GoalFailure>() {
-            if output_mode == output::OutputMode::Json {
+            if report_mode == output::OutputMode::Json {
                 let _ = output.event("failure", failure.details());
             } else {
                 let _ = output.plain_stderr(&format!("goal failed: {failure}\n"));
             }
-        } else if output_mode == output::OutputMode::Json {
+        } else if report_mode == output::OutputMode::Json {
             let _ = output.event(
                 "error",
                 serde_json::json!({"message": format!("{error:#}")}),
@@ -221,25 +230,44 @@ fn main() {
     }
 }
 
-fn dispatch(cli: Cli, output: output::Output) -> Result<()> {
+fn effective_output_mode(requested: output::OutputMode) -> output::OutputMode {
+    if requested == output::OutputMode::Tui
+        && !(io::stdin().is_terminal() && io::stdout().is_terminal())
+    {
+        output::OutputMode::Plain
+    } else {
+        requested
+    }
+}
+
+fn dispatch(cli: Cli, output_mode: output::OutputMode) -> Result<()> {
     let target = std::env::var_os("GOAL_DIR")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("goal.toml"));
     match cli.command {
-        None | Some(Commands::Run) => run_controller(target, output),
-        Some(Commands::Stats { since }) => run_stats(target, since.as_deref(), cli.output),
+        None | Some(Commands::Run) => run_controller(target, output_mode),
+        Some(Commands::Stats { since }) => run_stats(target, since.as_deref(), output_mode),
     }
 }
 
-fn run_controller(config: PathBuf, output: output::Output) -> Result<()> {
+fn run_controller(config: PathBuf, output_mode: output::OutputMode) -> Result<()> {
     let loaded = config::LoadedConfig::load(&config)?;
     let cancelled = Arc::new(AtomicBool::new(false));
     let signal_flag = Arc::clone(&cancelled);
     ctrlc::set_handler(move || {
         signal_flag.store(true, std::sync::atomic::Ordering::SeqCst);
     })?;
-    controller::Controller::new(loaded, cancelled, output)?.run()
+    if output_mode == output::OutputMode::Tui {
+        let (sender, receiver) = mpsc::sync_channel(1_024);
+        let project = loaded.project_dir.display().to_string();
+        let output = output::Output::tui(sender);
+        let controller = controller::Controller::new(loaded, Arc::clone(&cancelled), output)?;
+        tui::run(controller, project, cancelled, receiver)
+    } else {
+        let output = output::Output::new(output_mode);
+        controller::Controller::new(loaded, cancelled, output)?.run()
+    }
 }
 
 fn run_stats(
@@ -251,7 +279,7 @@ fn run_stats(
     let report = analytics::stats(&project_dir, since)?;
     let mut stdout = io::stdout().lock();
     match output_mode {
-        output::OutputMode::Plain | output::OutputMode::Pretty => {
+        output::OutputMode::Tui | output::OutputMode::Plain | output::OutputMode::Pretty => {
             stdout.write_all(analytics::render_plain(&report).as_bytes())?
         }
         output::OutputMode::Json => {

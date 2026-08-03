@@ -7,7 +7,7 @@ sense -> decide -> run task / wait / complete -> sense
                   failure -> record reason -> exit 1
 ```
 
-It has no daemon, PTY, TUI, interactive input, worker pool, or persistent agent conversation.
+It has no daemon, child PTY, interactive workflow, worker pool, or persistent agent conversation. Its optional terminal interaction is an observational activity viewer only.
 
 ## Build and run
 
@@ -31,7 +31,7 @@ See [`examples/fake`](examples/fake) for a runnable deterministic cycle:
 ```sh
 cargo build
 cd examples/fake
-../../target/debug/goal .
+../../target/debug/goal
 ```
 
 The example completes without interactive input.
@@ -47,7 +47,7 @@ Deciders and workers are ordinary argv commands, without an implicit shell or PT
 
 The process must atomically write one tagged JSON object to `GOAL_RESULT_PATH`. Stdout and stderr are diagnostics only. Decider action tags are `run_task`, `wait`, `complete`, and `failure`; worker completion tags are `done` and `failure`. Neither process may request human input, approval, or intervention.
 
-Runtime state, compact events, prompts, results, logs, and per-run `metadata.json` files are kept under `.goal/`. In plain output mode, sensor stdout is treated as protocol data and hidden from the terminal; it remains available in the run's `stdout.log` and is passed unchanged to the decider. Sensor stderr diagnostics are still displayed. Any sensor, decider, or worker process, timeout, or protocol failure—and any logical `failure`—is recorded with its reason and run ID, then terminates the controller with a non-zero status. Internal retries are not performed; an external scheduler may start a separate run. The retained artifacts support offline analysis of successful and failed runs. Improvements must not weaken success criteria or silently waive unmet requirements.
+Runtime state, compact events, prompts, results, logs, and per-run `metadata.json` files are kept under `.goal/`. In human output modes, sensor stdout is treated as protocol data and hidden from the terminal; it remains available in the run's `stdout.log` and is passed unchanged to the decider. Sensor stderr diagnostics are still displayed. Any sensor, decider, or worker process, timeout, or protocol failure—and any logical `failure`—is recorded with its reason and run ID, then terminates the controller with a non-zero status. Internal retries are not performed; an external scheduler may start a separate run. The retained artifacts support offline analysis of successful and failed runs. Improvements must not weaken success criteria or silently waive unmet requirements.
 
 ## Statistics
 
@@ -62,7 +62,11 @@ It reports outcome counts, worker success rate, failure kinds, and average/p50/p
 
 ## Output modes
 
-The default `--output plain` streams child diagnostics unchanged. Use `--output pretty` to indent JSON diagnostics in the terminal without omitting or summarizing any values. Pretty formatting affects only the foreground display; each run's `stdout.log` and `stderr.log` retain the original one-line output. Non-JSON diagnostics remain unchanged.
+The default `--output tui` opens a fullscreen streaming activity feed when stdin and stdout are terminals. Each newline-delimited child diagnostic is one card. Use Up/Down or `j`/`k` to select, Enter/Space or a mouse click to expand, the mouse wheel or PageUp/PageDown to scroll, End or `a` to resume following new activity, and `q` or Ctrl-C to stop. Scrolling away from the end pauses automatic following.
+
+TUI mode falls back silently to plain output when redirected or run without an interactive terminal. `goal stats` always prints its report instead of opening the fullscreen viewer.
+
+Use `--output plain` for timestamped streaming text. Use `--output pretty` to indent JSON diagnostics as one prefixed terminal block without omitting any values. Display formatting affects only the foreground; each run's `stdout.log` and `stderr.log` retains the original bytes. Non-JSON diagnostics remain unchanged.
 
 Use `--output json` for a machine-readable controller stream:
 

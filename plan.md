@@ -24,15 +24,17 @@ Confirmed design
    exits.
 6. Worker claims do not prove convergence. After `done`, the controller senses
    reality again.
-7. Human input is not part of the runtime. There are no questions, pending
-   approvals, resumable conversations, or interactive terminal state.
+7. Human input is not part of the controller workflow. There are no questions,
+   pending approvals, or resumable conversations. The default fullscreen TUI is
+   observational only and cannot steer child work.
 8. If the decider or worker determines that automatic progress is impossible,
    it returns `failure` with a concrete reason.
 9. Every sensor, decider, or worker process, timeout, or protocol failure is
    terminal. The controller records it and exits non-zero without an internal
    retry. A scheduler may start a separate run later.
-10. No daemon, PTY, TUI, worker pool, parallel workers, scheduler, workflow DAG,
-    or persistent agent conversation is part of the controller.
+10. No daemon, child PTY, worker pool, parallel workers, scheduler, workflow DAG,
+    or persistent agent conversation is part of the controller. A bounded,
+    observational TUI may render controller and child activity.
 
 State machine
 -------------

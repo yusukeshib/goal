@@ -4,7 +4,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Result;
@@ -88,14 +88,22 @@ impl Controller {
     pub fn run(mut self) -> Result<()> {
         loop {
             self.ensure_running()?;
-            self.begin_cycle()?;
+            let cycle_id = self.begin_cycle()?;
+            self.output
+                .event("cycle_started", serde_json::json!({"cycle_id": cycle_id}))?;
+            self.output
+                .event("phase_started", serde_json::json!({"phase": "sensor"}))?;
+            let phase_started = Instant::now();
             let observation = match self.runner.run_sensor(&self.loaded.config.sensor) {
                 Ok((observation, artifacts)) => {
                     artifacts.finish(RunOutcome::Success, None, Some("observation"), None)?;
-                    self.store.event(
-                        "sense_succeeded",
-                        serde_json::json!({"run_id": artifacts.id}),
-                    )?;
+                    let details = serde_json::json!({
+                        "run_id": artifacts.id,
+                        "phase": "sensor",
+                        "duration_ms": phase_started.elapsed().as_millis() as u64,
+                    });
+                    self.store.event("sense_succeeded", details.clone())?;
+                    self.output.event("phase_finished", details)?;
                     observation
                 }
                 Err((RunError::Cancelled, artifacts)) => {
@@ -117,6 +125,9 @@ impl Controller {
 
             let context = prompt::prior_context(self.state.latest_worker_completion.as_ref());
             let decider_prompt = prompt::decider_prompt(&self.loaded.goal, &observation, &context);
+            self.output
+                .event("phase_started", serde_json::json!({"phase": "decider"}))?;
+            let phase_started = Instant::now();
             let (action, artifacts) = match self.runner.run_json::<DeciderAction>(
                 "decider",
                 &self.loaded.config.decider,
@@ -162,6 +173,15 @@ impl Controller {
                 ),
             };
             artifacts.finish(outcome, failure_kind, Some(result_type), failure_reason)?;
+            self.output.event(
+                "phase_finished",
+                serde_json::json!({
+                    "phase": "decider",
+                    "run_id": artifacts.id,
+                    "duration_ms": phase_started.elapsed().as_millis() as u64,
+                    "outcome": outcome,
+                }),
+            )?;
             let decider_run_id = artifacts.id;
             let details = serde_json::json!({
                 "run_id": decider_run_id,
@@ -178,6 +198,11 @@ impl Controller {
                         &task,
                         "$GOAL_RESULT_PATH",
                     );
+                    self.output.event(
+                        "phase_started",
+                        serde_json::json!({"phase": "worker", "task": task}),
+                    )?;
+                    let phase_started = Instant::now();
                     match self.runner.run_json::<WorkerCompletion>(
                         "worker",
                         &self.loaded.config.worker,
@@ -217,6 +242,15 @@ impl Controller {
                                 failure_kind,
                                 Some(result_type),
                                 failure_reason,
+                            )?;
+                            self.output.event(
+                                "phase_finished",
+                                serde_json::json!({
+                                    "phase": "worker",
+                                    "run_id": artifacts.id,
+                                    "duration_ms": phase_started.elapsed().as_millis() as u64,
+                                    "outcome": outcome,
+                                }),
                             )?;
                             let details = serde_json::json!({
                                 "run_id": artifacts.id,
@@ -283,11 +317,13 @@ impl Controller {
         }
     }
 
-    fn begin_cycle(&mut self) -> Result<()> {
+    fn begin_cycle(&mut self) -> Result<String> {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        self.state.latest_cycle_id = Some(format!("cycle-{nonce}"));
+        let cycle_id = format!("cycle-{nonce}");
+        self.state.latest_cycle_id = Some(cycle_id.clone());
         self.state.latest_cycle_timestamp = Some(unix_timestamp());
-        self.store.save(&self.state)
+        self.store.save(&self.state)?;
+        Ok(cycle_id)
     }
 
     fn terminal_failure(&self, source: &str, reason: String, run_id: Option<String>) -> Result<()> {

@@ -265,7 +265,7 @@ fn rejects_a_second_controller_for_the_same_config_and_releases_after_exit() {
 }
 
 #[test]
-fn sensor_stdout_is_hidden_in_plain_mode_but_reaches_decider() {
+fn default_non_tty_output_falls_back_to_plain_and_hides_sensor_protocol() {
     let fixture = Fixture::new(
         r#"printf '{\"private_observation\":\"sensor-payload\"}'"#,
         r#"grep -q 'sensor-payload' "$GOAL_PROMPT_PATH"; printf '{\"type\":\"complete\",\"summary\":\"observation received\"}' > "$GOAL_RESULT_PATH""#,
@@ -276,6 +276,10 @@ fn sensor_stdout_is_hidden_in_plain_mode_but_reaches_decider() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("goal complete: observation received"));
     assert!(!stdout.contains("sensor-payload"));
+    assert!(
+        !stdout.contains("\u{1b}["),
+        "non-TTY output contained terminal escapes"
+    );
 }
 
 #[test]
@@ -300,8 +304,16 @@ fn pretty_output_formats_child_json_but_keeps_run_log_exact() {
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("[decider] {"));
-    assert!(stdout.contains("[decider]   \"nested\": {"));
-    assert!(stdout.contains("[decider]     \"values\": ["));
+    let nested = stdout
+        .lines()
+        .find(|line| line.contains("\"nested\": {"))
+        .expect("missing pretty nested object");
+    let values = stdout
+        .lines()
+        .find(|line| line.contains("\"values\": ["))
+        .expect("missing pretty nested array");
+    assert!(!nested.contains("[decider]"));
+    assert!(!values.contains("[decider]"));
     assert!(!stdout.contains(&format!("[decider] {diagnostic}")));
 
     let decider_dir = fs::read_dir(fixture.dir.path().join(".goal/runs"))

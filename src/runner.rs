@@ -19,6 +19,7 @@ use crate::{
     analytics::{METADATA_FILE, RunMetadata, RunOutcome},
     config::CommandConfig,
     output::Output,
+    tui::ArtifactRange,
 };
 
 #[derive(Debug)]
@@ -363,6 +364,7 @@ fn tee(
     let mut log = File::create(&path).with_context(|| format!("open {}", path.display()))?;
     let mut reader = BufReader::new(reader);
     let mut line = Vec::new();
+    let mut offset = 0_u64;
     loop {
         line.clear();
         let read = reader.read_until(b'\n', &mut line)?;
@@ -370,9 +372,20 @@ fn tee(
             break;
         }
         log.write_all(&line)?;
-        captured.extend_from_slice(&line);
         log.flush()?;
-        output.child_line(&role, stream, &run_id, &line)?;
+        captured.extend_from_slice(&line);
+        output.child_line(
+            &role,
+            stream,
+            &run_id,
+            ArtifactRange {
+                path: path.clone(),
+                offset,
+                length: read as u64,
+            },
+            &line,
+        )?;
+        offset += read as u64;
     }
     Ok(captured)
 }
@@ -457,6 +470,38 @@ mod tests {
             fs::read_to_string(artifacts.dir.join("stderr.log")).unwrap(),
             "err\n"
         );
+    }
+
+    #[test]
+    fn tui_notifications_reference_exact_logged_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stdout.log");
+        let input = b"first\n{\"second\":true}\n";
+        let (sender, receiver) = std::sync::mpsc::sync_channel(4);
+        let captured = tee(
+            std::io::Cursor::new(input),
+            path.clone(),
+            Output::tui(sender),
+            "decider".to_owned(),
+            "stdout",
+            "run".to_owned(),
+        )
+        .unwrap();
+        assert_eq!(captured, input);
+        assert_eq!(fs::read(&path).unwrap(), input);
+
+        let first = receiver.recv().unwrap();
+        let second = receiver.recv().unwrap();
+        assert!(matches!(
+            first,
+            crate::tui::Activity::Child { artifact, .. }
+                if artifact.offset == 0 && artifact.length == 6 && artifact.path == path
+        ));
+        assert!(matches!(
+            second,
+            crate::tui::Activity::Child { artifact, .. }
+                if artifact.offset == 6 && artifact.length == 16 && artifact.path == path
+        ));
     }
 
     #[test]
