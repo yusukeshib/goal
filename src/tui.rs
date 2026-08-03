@@ -550,14 +550,13 @@ fn render(frame: &mut Frame<'_>, state: &mut UiState) {
         }
         state.hit_regions.push((row, index));
         let selected = state.selected == Some(index);
-        let marker = if card.expanded { '▼' } else { '▶' };
         let (timestamp, label, summary, color) = card_parts(&card.activity);
         let style = Style::default().fg(color).add_modifier(if selected {
             Modifier::REVERSED
         } else {
             Modifier::empty()
         });
-        let header = format!("{marker} {} {label:<10} {summary}", clock(timestamp));
+        let header = format!("{} {label:<10} {summary}", clock(timestamp));
         lines.push(Line::from(vec![Span::styled(
             truncate(&header, body.width as usize),
             style,
@@ -639,7 +638,7 @@ fn card_parts(activity: &Activity) -> (u64, String, String, Color) {
             *timestamp,
             "GOAL".into(),
             format!("{kind} {}", summarize_line(details.to_string().as_bytes())),
-            Color::Cyan,
+            Color::White,
         ),
         Activity::Child {
             timestamp,

@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+sleep "${GOAL_FAKE_DELAY_SECONDS:-2}"
 if grep -q 'Record blue' "$GOAL_PROMPT_PATH"; then
   printf '%s\n' blue > completed
   result='{"type":"done","summary":"Recorded blue and verified the completion marker exists."}'

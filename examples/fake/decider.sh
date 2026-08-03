@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+sleep "${GOAL_FAKE_DELAY_SECONDS:-2}"
 if grep -q '"completed": true' "$GOAL_PROMPT_PATH"; then
   result='{"type":"complete","summary":"The fresh observation reports completion."}'
 else
