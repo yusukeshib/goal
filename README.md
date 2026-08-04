@@ -51,22 +51,27 @@ The process must atomically write one tagged JSON object to `GOAL_RESULT_PATH`. 
 
 Runtime state, compact events, prompts, results, logs, and per-run `metadata.json` files are kept under `.goal/`. In human output modes, sensor stdout is treated as protocol data and hidden from the terminal; it remains available in the run's `stdout.log` and is passed unchanged to the decider. Sensor stderr diagnostics are still displayed. A decider protocol failure is recorded with its reason and run ID, followed by a short backoff and a fresh observation; retrying is safe because the decider is read-only. Sensor failures, decider process failures, and worker process, timeout, or protocol failures terminate the controller with a non-zero status. A decider `failure` is also terminal because it describes the goal as a whole. A worker `failure` is task-local: it is recorded and passed to the next decider after a fresh observation, allowing other safe work to continue without retrying the failed task blindly. The retained artifacts support offline analysis of successful and failed runs. Improvements must not weaken success criteria or silently waive unmet requirements.
 
-## Statistics
+## Statistics and analysis
 
-`stats` reads existing artifacts without starting a sensor, decider, or worker:
+`stats` and `analysis` read existing artifacts without starting a sensor, decider, or worker:
 
 ```sh
 goal stats --since 24h
+goal analysis                              # current local calendar day
+goal analysis --date 2026-08-03
+goal analysis --since 24h --output json
 GOAL_DIR=~/goals/mergeable-prs goal stats --since 7d --output json
 ```
 
-It reports outcome counts, worker success rate, failure kinds, and average/p50/p95 duration by role. Directories created before metadata support are counted separately across all time and excluded from filtered success and duration calculations rather than inferred.
+`stats` reports outcome counts, worker success rate, failure kinds, and average/p50/p95 duration by role. `analysis` adds sense/decision/worker activity, requested versus actual wait time, and a chronological list of every failed, cancelled, or still-running child with its exact run ID, recorded reason, and artifact path. `--date` uses the machine's local calendar day, while `--since` selects a rolling duration; without either, `analysis` selects today locally.
+
+Both commands report process and protocol outcomes, not independent proof that successful work was semantically correct. Audit the retained prompt, result, and logs before using the report to change automation or success criteria. Directories created before metadata support are counted separately across all time and excluded from filtered calculations rather than inferred.
 
 ## Output modes
 
 The default `--output tui` opens a fullscreen streaming activity feed when stdin and stdout are terminals. Each newline-delimited child diagnostic is one card. A scrollbar at the right shows the visible position when the activity buffer overflows; drag its thumb or click its track to move through the feed. Use Up/Down or `j`/`k` to select, Enter/Space or a card click to expand, the mouse wheel or PageUp/PageDown to scroll, End or `a` to resume following new activity, and `q` or Ctrl-C to stop. Scrolling away from the end pauses automatic following, while reaching the end resumes it so new activity remains pinned to the pane's last row.
 
-TUI mode falls back silently to plain output when redirected or run without an interactive terminal. `goal stats` always prints its report instead of opening the fullscreen viewer.
+TUI mode falls back silently to plain output when redirected or run without an interactive terminal. `goal stats` and `goal analysis` always print their reports instead of opening the fullscreen viewer.
 
 Use `--output plain` for timestamped streaming text. Use `--output pretty` to indent JSON diagnostics as one prefixed terminal block without omitting any values. Display formatting affects only the foreground; each run's `stdout.log` and `stderr.log` retains the original bytes. Non-JSON diagnostics remain unchanged.
 

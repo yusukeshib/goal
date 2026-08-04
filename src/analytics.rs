@@ -285,7 +285,7 @@ fn render_duration(stats: &DurationStats) -> String {
     }
 }
 
-fn summarize_durations(mut values: Vec<u64>) -> DurationStats {
+pub(crate) fn summarize_durations(mut values: Vec<u64>) -> DurationStats {
     if values.is_empty() {
         return DurationStats::default();
     }
@@ -304,7 +304,7 @@ fn percentile(values: &[u64], percentile: usize) -> u64 {
     values[rank.saturating_sub(1).min(values.len() - 1)]
 }
 
-fn parse_duration(value: &str) -> Result<u64> {
+pub(crate) fn parse_duration(value: &str) -> Result<u64> {
     let split = value
         .find(|character: char| !character.is_ascii_digit())
         .unwrap_or(value.len());

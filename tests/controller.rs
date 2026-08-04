@@ -114,6 +114,7 @@ fn help_fully_describes_configuration_and_process_contracts() {
         "GOAL_DIR=goals/ci goal",
         "GOAL_DIR",
         "stats",
+        "analysis",
     ] {
         assert!(
             root.contains(expected),
@@ -397,6 +398,33 @@ fn stats_reports_metadata_from_goal_dir_or_current_directory() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("5 recorded"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_goal"))
+        .args(["analysis", "--output", "json"])
+        .env("GOAL_DIR", fixture.dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["window"]["label"],
+        format!("local date {}", chrono::Local::now().date_naive())
+    );
+    assert_eq!(report["recorded_runs"], 5);
+    assert_eq!(report["activity"]["senses_succeeded"], 2);
+    assert_eq!(report["activity"]["decisions"]["run_task"], 1);
+    assert_eq!(report["activity"]["decisions"]["complete"], 1);
+    assert_eq!(report["issues"].as_array().unwrap().len(), 0);
+    assert!(
+        report["quality_caveat"]
+            .as_str()
+            .unwrap()
+            .contains("not independent proof")
+    );
 }
 
 #[test]

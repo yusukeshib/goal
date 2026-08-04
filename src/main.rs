@@ -1,3 +1,4 @@
+mod analysis;
 mod analytics;
 mod cancel;
 mod config;
@@ -37,8 +38,10 @@ TARGET SELECTION
 
 COMMANDS
   With no subcommand, goal runs the controller. `goal run` is the explicit form.
-  `goal stats` summarizes recorded child outcomes and durations without starting
-  sensor, decider, or worker processes.
+  `goal stats` summarizes recorded child outcomes and durations. `goal analysis`
+  adds a calendar-day or rolling-window activity report and lists every failed,
+  cancelled, or still-running child for artifact inspection. Neither command
+  starts sensor, decider, or worker processes.
 
 FILES
   goal.toml   Commands, timeouts, and the path to the natural-language goal.
@@ -138,11 +141,16 @@ FAILURE ANALYSIS
   invocations retain prompts, results, stdout, stderr, and metadata under
   .goal/runs/, and compact outcomes are appended to .goal/events.jsonl. Run
   `goal stats --since 24h` for outcome counts, worker success rate, and
-  role-specific average, p50, and p95 durations. Historical directories without
-  metadata are counted across all time and excluded from filtered duration and
-  success rates.
-  Automation must not improve apparent success by weakening success criteria or
-  silently waiving unmet requirements.
+  role-specific average, p50, and p95 durations. Run `goal analysis` for the
+  current local calendar day, `goal analysis --date YYYY-MM-DD` for a past local
+  date, or `goal analysis --since 24h` for a rolling window. Analysis adds
+  decision/wait activity and exact non-success run IDs, reasons, and artifact
+  paths. Historical directories without metadata are counted across all time
+  and excluded from filtered metrics.
+  These are process and protocol reports, not independent verification of task
+  quality. Audit retained artifacts before changing automation. Automation must
+  not improve apparent success by weakening success criteria or silently
+  waiving unmet requirements.
 
 OUTPUT
   --output tui (default) opens a fullscreen streaming activity feed on an
@@ -152,8 +160,9 @@ OUTPUT
   --output plain prints timestamped text. --output pretty preserves every child
   JSON value but indents it as one terminal block. stdout.log/stderr.log always
   retain the original one-line output. For controller runs, --output json emits
-  strict JSONL envelopes on stdout. For stats, tui, plain, and pretty emit the
-  human-readable report, while json emits one JSON report. Oversized child lines
+  strict JSONL envelopes on stdout. For stats and analysis, tui, plain, and
+  pretty emit a human-readable report, while json emits one JSON report.
+  Oversized child lines
   are summarized only in foreground displays; run logs retain exact output.
 
 EXAMPLES
@@ -161,6 +170,8 @@ EXAMPLES
   goal run                                  Explicitly run ./goal.toml
   GOAL_DIR=goals/ci goal                    Run another goal
   GOAL_DIR=goals/ci goal stats --since 24h  Human-readable statistics
+  goal analysis                             Analyze today's local calendar day
+  goal analysis --date 2026-08-03 --output json
   goal stats --since 7d --output json
   goal --output json | jq --unbuffered -C .
 
@@ -198,6 +209,15 @@ enum Commands {
         /// Include runs started within this duration, such as 24h or 7d.
         #[arg(long, value_name = "DURATION")]
         since: Option<String>,
+    },
+    /// Report activity and non-success runs for offline inspection.
+    Analysis {
+        /// Analyze a rolling duration instead of today's local calendar day.
+        #[arg(long, value_name = "DURATION", conflicts_with = "date")]
+        since: Option<String>,
+        /// Analyze one local calendar date in YYYY-MM-DD form.
+        #[arg(long, value_name = "YYYY-MM-DD", conflicts_with = "since")]
+        date: Option<String>,
     },
 }
 
@@ -254,6 +274,9 @@ fn dispatch(cli: Cli, output_mode: output::OutputMode) -> Result<()> {
     match cli.command {
         None | Some(Commands::Run) => run_controller(target, output_mode),
         Some(Commands::Stats { since }) => run_stats(target, since.as_deref(), output_mode),
+        Some(Commands::Analysis { since, date }) => {
+            run_analysis(target, since.as_deref(), date.as_deref(), output_mode)
+        }
     }
 }
 
@@ -274,6 +297,28 @@ fn run_controller(config: PathBuf, output_mode: output::OutputMode) -> Result<()
         let output = output::Output::new(output_mode);
         controller::Controller::new(loaded, cancelled, output)?.run()
     }
+}
+
+fn run_analysis(
+    config_or_dir: PathBuf,
+    since: Option<&str>,
+    date: Option<&str>,
+    output_mode: output::OutputMode,
+) -> Result<()> {
+    let project_dir = analytics::resolve_project_dir(&config_or_dir)?;
+    let report = analysis::analyze(&project_dir, since, date)?;
+    let mut stdout = io::stdout().lock();
+    match output_mode {
+        output::OutputMode::Tui | output::OutputMode::Plain | output::OutputMode::Pretty => {
+            stdout.write_all(analysis::render_plain(&report).as_bytes())?
+        }
+        output::OutputMode::Json => {
+            serde_json::to_writer(&mut stdout, &report)?;
+            stdout.write_all(b"\n")?;
+        }
+    }
+    stdout.flush()?;
+    Ok(())
 }
 
 fn run_stats(
