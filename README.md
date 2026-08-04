@@ -1,90 +1,76 @@
 # goal
 
-`goal` is a small foreground controller that repeatedly senses the world, asks a one-shot read-only decider for one typed action, and runs at most one disposable worker.
+A foreground controller that continuously pursues one natural-language goal:
 
 ```text
-sense -> decide -> run task -- done/failure -> sense
-                  wait ---------------------> sense
-                  complete -----------------> exit 0
-                  failure ------------------> sense
+sense → decide → run one task → sense
+             ↘ wait          → sense
+             ↘ complete      → exit 0
 ```
 
-It has no daemon, child PTY, interactive workflow, worker pool, or persistent agent conversation. Its optional terminal interaction is an observational activity viewer only.
+The decider is one-shot and read-only. Workers are disposable and non-interactive. There is no daemon, child PTY, worker pool, or persistent agent conversation; the TUI is observational only.
 
-## Build and run
+## Run
 
-Stable Rust 1.85 or newer is required.
+Requires Rust 1.85+ and a directory containing `goal.toml` plus the configured goal file.
 
 ```sh
-cargo build
-GOAL_DIR=/path/to/goal cargo run
+cargo install --path .
+cd /path/to/goal && goal
+# or
+GOAL_DIR=/path/to/goal goal
 ```
 
-`goal` uses `GOAL_DIR`, or the current directory when it is unset. That directory must contain `goal.toml` and is also the child working directory. Relative goal and command paths resolve from there.
+`GOAL_DIR` defaults to the current directory, which is also the child working directory. Run `goal --help` for the complete configuration and protocol reference.
 
-```sh
-cd ~/goals/mergeable-prs && goal
-GOAL_DIR=~/goals/mergeable-prs goal
-GOAL_DIR=~/goals/mergeable-prs goal run
+A minimal `goal.toml`:
+
+```toml
+goal_file = "GOAL.md"
+interval_seconds = 60
+max_wait_seconds = 3600
+
+[sensor]
+command = ["./sensor.sh"]
+timeout_seconds = 60
+
+[decider]
+command = ["agent-cli", "--non-interactive", "{prompt}"]
+timeout_seconds = 300
+
+[worker]
+command = ["agent-cli", "--non-interactive", "{prompt}"]
+timeout_seconds = 1800
 ```
 
-See [`examples/fake`](examples/fake) for a runnable deterministic cycle:
+## Contract
+
+- The sensor is read-only and prints one JSON value to stdout.
+- The decider returns `run_task`, `wait`, `complete`, or `failure`.
+- The worker returns `done` or `failure` in `GOAL_RESULT_PATH`.
+- Deciders and workers cannot request human input or approval.
+- Sensor and decider failures are recorded and retried after re-sensing.
+- Worker process, timeout, or protocol failures are terminal; a valid worker `failure` is task-local and the loop continues.
+
+Each invocation receives `GOAL_RUN_ID`, `GOAL_PROMPT_PATH`, `GOAL_RESULT_PATH`, and `GOAL_PROJECT_DIR`. `{prompt}` is replaced with the prompt path; without it, the prompt is piped to stdin.
+
+## Observe
 
 ```sh
-cargo build
-cd examples/fake
-./run.sh
-```
-
-The example resets its fake progress, performs 20 deterministic worker cycles, and completes without interactive input in roughly one minute. This produces enough activity to exercise the TUI scrollbar. Set `GOAL_FAKE_STEPS` or `GOAL_FAKE_DELAY_SECONDS` to adjust its length, for example `GOAL_FAKE_STEPS=40 ./run.sh`.
-
-## Child protocol
-
-Sensors, deciders, and workers are ordinary argv commands, without an implicit shell or PTY. Every invocation receives:
-
-- `GOAL_RUN_ID`
-- `GOAL_PROMPT_PATH`
-- `GOAL_RESULT_PATH`
-- `GOAL_PROJECT_DIR`
-
-The sensor must be read-only and emit exactly one JSON value on stdout; its stderr is diagnostic. Deciders and workers use `{prompt}` in any argv element to receive the generated prompt path. Without `{prompt}`, the prompt is piped to stdin and then closed. They must atomically write one tagged JSON object to `GOAL_RESULT_PATH`; their stdout and stderr are diagnostics only. Decider action tags are `run_task`, `wait`, `complete`, and `failure`; worker completion tags are `done` and `failure`. Neither process may request human input, approval, or intervention. Observation and prior-context fields are treated as untrusted data, not as instructions that override the generated contract.
-
-Each child-output line, including sensor stdout, is limited to 4 MiB; each stdout or stderr stream is limited to 64 MiB; and captured sensor stdout is limited to 16 MiB. Exceeding a limit fails the run while preserving the bytes already written to its log. Child commands must not deliberately detach descendants into a new process group or session: on Unix, the controller terminates the invocation's process group on completion, timeout, or cancellation, but cannot reclaim a deliberately detached process.
-
-Runtime state, the controller lock, compact events, prompts, results, logs, and per-run `metadata.json` files are kept under `.goal/`. In human output modes, sensor stdout is treated as protocol data and hidden from the terminal; it remains available in the run's `stdout.log`, and the parsed JSON value is included in the decider prompt. Sensor stderr diagnostics are still displayed. Sensor and decider failures are recorded with their reason and run ID, followed by a short backoff and a fresh observation; retrying is safe because both roles are read-only. A `wait` action sleeps for `min(retry_after_seconds, max_wait_seconds)` before re-sensing; `interval_seconds` is not added to that delay. A decider `failure` marks that decision run as failed without terminating the controller. Worker process, timeout, or protocol failures terminate the controller with a non-zero status because the worker may have modified external state. A worker `failure` is task-local: it is recorded and passed to the next decider after a fresh observation, allowing other safe work to continue without retrying the failed task blindly. The retained artifacts support offline analysis of successful and failed runs. Improvements must not weaken success criteria or silently waive unmet requirements.
-
-## Statistics and analysis
-
-`stats` and `analysis` read existing artifacts without starting a sensor, decider, or worker:
-
-```sh
+goal                                # fullscreen TUI on a terminal
+goal --output plain                 # timestamped text
+goal --output json | jq --unbuffered
 goal stats --since 24h
-goal analysis                              # current local calendar day
+goal analysis                       # today
+goal analysis --since 7d
 goal analysis --date 2026-08-03
-goal analysis --since 24h --output json
-GOAL_DIR=~/goals/mergeable-prs goal stats --since 7d --output json
 ```
 
-`stats` reports outcome counts, worker success rate, failure kinds, and average/p50/p95 duration by role. `analysis` adds sense/decision/worker activity, requested versus actual wait time, and a chronological list of every failed, cancelled, or still-running child with its exact run ID, recorded reason, and artifact path. `--date` uses the machine's local calendar day, while `--since` selects a rolling duration; without either, `analysis` selects today locally.
+TUI: `↑/↓` or `j/k` selects, `PgUp/PgDn` scrolls details, `End` follows, and `q` stops. Redirection automatically falls back to plain output.
 
-Both commands report process and protocol outcomes, not independent proof that successful work was semantically correct. Audit the retained prompt, result, and logs before using the report to change automation or success criteria. Directories created before metadata support are counted separately across all time and excluded from filtered calculations rather than inferred.
+State, events, prompts, results, exact child logs, and run metadata are stored under `.goal/`. `stats` and `analysis` inspect these artifacts without starting children.
 
-## Output modes
+## Examples
 
-The default `--output tui` opens a fullscreen streaming activity feed when stdin and stdout are terminals. Each newline-delimited child diagnostic is one row, and the selected row's details are always shown in a separate pane. The detail pane sits to the right on wide terminals and moves below the activity list when the terminal is narrower than 100 columns. Use Up/Down or `j`/`k` to select, click a row to select it, PageUp/PageDown to scroll its details, and End or `a` to resume following new activity. The mouse wheel scrolls whichever pane is under the pointer; the activity scrollbar can also be dragged or clicked. Use `q` or Ctrl-C to stop. Scrolling the activity list away from the end pauses automatic following, while reaching the end resumes it.
-
-TUI mode falls back silently to plain output when redirected or run without an interactive terminal. `goal stats` and `goal analysis` always print their reports instead of opening the fullscreen viewer.
-
-Use `--output plain` for timestamped streaming text. Use `--output pretty` to indent JSON diagnostics as one prefixed terminal block without omitting any values. Display formatting affects only the foreground; each run's `stdout.log` and `stderr.log` retains the original bytes. Non-JSON diagnostics remain unchanged.
-
-Use `--output json` for a machine-readable controller stream:
-
-```sh
-goal --output json | jq --unbuffered -C .
-```
-
-Every stdout line has the same `timestamp`, `type`, and `details` envelope. Controller events such as waits, completions, failures, and errors are structured. Child JSON up to 1 MiB is nested under `details.payload`; non-JSON and larger child diagnostics are represented by bounded `details.content` previews. JSON diagnostics over 16 KiB are summarized, while inputs over 1 MiB use a bounded content preview instead of being parsed for display. `pretty` mode leaves diagnostics over 16 KiB unformatted. These display limits do not alter the exact bytes retained in each run's `stdout.log` or `stderr.log`. Intentional Ctrl-C/SIGTERM emits `stopped` in JSON mode and exits successfully.
-
-## Read-only GitHub sensor example
-
-[`examples/mergeable-prs`](examples/mergeable-prs) contains a read-only `gh api graphql` sensor for authored open pull requests. It reports CI checks, merge state, and unresolved review threads. Replace the placeholder agent commands in its `goal.toml` with locally available non-TUI decider and worker commands.
+- [`examples/fake`](examples/fake): deterministic runnable cycle (`cd examples/fake && ./run.sh`)
+- [`examples/mergeable-prs`](examples/mergeable-prs): read-only GitHub sensor
