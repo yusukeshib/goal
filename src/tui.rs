@@ -263,6 +263,7 @@ impl UiState {
 
     fn push(&mut self, activity: Activity) {
         let stick_to_end = self.auto_follow || self.scrollbar_is_at_bottom();
+        let keep_selection = self.selected.is_some();
         if let Activity::Controller { kind, details, .. } = &activity {
             match kind.as_str() {
                 "cycle_started" => {
@@ -288,7 +289,9 @@ impl UiState {
         let was_empty = self.cards.is_empty();
         self.cards.push_back(Card { activity });
         if stick_to_end || was_empty {
-            self.select(self.cards.len() - 1);
+            if keep_selection || was_empty {
+                self.select(self.cards.len() - 1);
+            }
             self.auto_follow = true;
             self.unseen = 0;
         } else {
@@ -318,6 +321,14 @@ impl UiState {
             self.detail_max_top = 0;
         }
         self.selected = Some(index);
+    }
+
+    fn clear_selection(&mut self) {
+        self.selected = None;
+        self.detail = None;
+        self.detail_top = 0;
+        self.detail_max_top = 0;
+        self.detail_area = None;
     }
 
     fn ensure_detail(&mut self) {
@@ -367,8 +378,13 @@ impl UiState {
         if self.cards.is_empty() {
             return;
         }
-        let old = self.selected.unwrap_or(0) as isize;
-        let index = (old + delta).clamp(0, self.cards.len() as isize - 1) as usize;
+        let index = if let Some(old) = self.selected {
+            (old as isize + delta).clamp(0, self.cards.len() as isize - 1) as usize
+        } else if delta < 0 {
+            self.cards.len() - 1
+        } else {
+            0
+        };
         self.select(index);
         self.auto_follow = self.selected == Some(self.cards.len() - 1);
         if self.auto_follow {
@@ -611,6 +627,9 @@ fn handle_event(event: Event, state: &mut UiState, cancelled: &AtomicBool) -> Re
             ..
         }) => cancelled.store(true, Ordering::SeqCst),
         Event::Key(KeyEvent {
+            code: KeyCode::Esc, ..
+        }) if state.selected.is_some() => state.clear_selection(),
+        Event::Key(KeyEvent {
             code: KeyCode::Up | KeyCode::Char('k'),
             ..
         }) => state.move_selection(-1),
@@ -731,16 +750,21 @@ fn render(frame: &mut Frame<'_>, state: &mut UiState) {
     );
 
     let body = areas[1];
-    let panes = Layout::default()
-        .direction(if body.width >= SIDE_BY_SIDE_MIN_WIDTH {
-            Direction::Horizontal
-        } else {
-            Direction::Vertical
-        })
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(body);
-    render_activity_pane(frame, panes[0], state);
-    render_detail_pane(frame, panes[1], state);
+    if state.selected.is_some() {
+        let panes = Layout::default()
+            .direction(if body.width >= SIDE_BY_SIDE_MIN_WIDTH {
+                Direction::Horizontal
+            } else {
+                Direction::Vertical
+            })
+            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .split(body);
+        render_activity_pane(frame, panes[0], state);
+        render_detail_pane(frame, panes[1], state);
+    } else {
+        state.detail_area = None;
+        render_activity_pane(frame, body, state);
+    }
 
     let evicted = if state.evicted == 0 {
         String::new()
@@ -749,7 +773,7 @@ fn render(frame: &mut Frame<'_>, state: &mut UiState) {
     };
     frame.render_widget(
         Paragraph::new(format!(
-            " ↑↓/jk select  PgUp/PgDn details  Wheel pane scroll  Click select  End follow  q quit{evicted}"
+            " ↑↓/jk select  Esc close details  PgUp/PgDn details  Wheel pane scroll  Click select  End follow  q quit{evicted}"
         ))
         .block(Block::default().borders(Borders::TOP)),
         areas[2],
@@ -778,30 +802,31 @@ fn render_activity_pane(frame: &mut Frame<'_>, area: Rect, state: &mut UiState) 
             .min(content_height.saturating_sub(content.height as usize))
     };
     let start = state.top;
-    let mut lines = Vec::new();
-    for (index, card) in state
+    for (visible_row, (index, card)) in state
         .cards
         .iter()
         .enumerate()
         .skip(start)
         .take(content.height as usize)
+        .enumerate()
     {
-        let row = content.y + lines.len() as u16;
+        let row = content.y + visible_row as u16;
         state.hit_regions.push((row, index));
         let selected = state.selected == Some(index);
-        let (timestamp, label, summary, color) = card_parts(&card.activity);
-        let style = Style::default().fg(color).add_modifier(if selected {
-            Modifier::REVERSED
-        } else {
-            Modifier::empty()
-        });
+        let (timestamp, label, summary, _) = card_parts(&card.activity);
+        let style = Style::default()
+            .fg(Color::White)
+            .add_modifier(if selected {
+                Modifier::REVERSED
+            } else {
+                Modifier::empty()
+            });
         let header = format!("{} {label:<10} {summary}", clock(timestamp));
-        lines.push(Line::from(Span::styled(
-            truncate(&header, content.width as usize),
-            style,
-        )));
+        frame.render_widget(
+            Paragraph::new(truncate(&header, content.width as usize)).style(style),
+            Rect::new(inner.x, row, inner.width, 1),
+        );
     }
-    frame.render_widget(Paragraph::new(Text::from(lines)), content);
 
     state.scrollbar = ScrollbarGeometry::new(
         scrollbar_area,
@@ -1038,25 +1063,15 @@ fn card_parts(activity: &Activity) -> (u64, String, String, Color) {
                 "{}{summary} · {original_bytes} B",
                 if stream == "stderr" { "[stderr] " } else { "" }
             ),
-            if stream == "stderr" {
-                Color::Yellow
-            } else {
-                Color::White
-            },
+            Color::White,
         ),
         Activity::Notice {
-            timestamp,
-            level,
-            text,
+            timestamp, text, ..
         } => (
             *timestamp,
             "NOTICE".into(),
             text.clone(),
-            if *level == NoticeLevel::Error {
-                Color::Red
-            } else {
-                Color::Green
-            },
+            Color::White,
         ),
     }
 }
@@ -1165,6 +1180,30 @@ mod tests {
             state.detail.as_ref().map(|detail| detail.text.as_str()),
             Some("two")
         );
+    }
+
+    #[test]
+    fn escape_clears_selection_and_closes_details() {
+        let cancelled = AtomicBool::new(false);
+        let mut state = UiState::new();
+        state.push(notice("one"));
+        state.ensure_detail();
+
+        handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            &mut state,
+            &cancelled,
+        )
+        .unwrap();
+
+        assert_eq!(state.selected, None);
+        assert!(state.detail.is_none());
+        state.push(notice("two"));
+        assert_eq!(state.selected, None);
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        assert!(state.detail_area.is_none());
     }
 
     #[test]
@@ -1439,6 +1478,24 @@ mod tests {
         state.push(notice("one"));
         state.push(notice("two"));
         terminal.draw(|frame| render(frame, &mut state)).unwrap();
+    }
+
+    #[test]
+    fn activity_rows_are_white_and_selected_highlight_fills_width() {
+        let mut terminal = Terminal::new(TestBackend::new(30, 3)).unwrap();
+        let mut state = UiState::new();
+        state.push(notice("finished"));
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_activity_pane(frame, area, &mut state);
+            })
+            .unwrap();
+
+        let last_inner_cell = terminal.backend().buffer().cell((28, 1)).unwrap();
+        assert_eq!(last_inner_cell.fg, Color::White);
+        assert!(last_inner_cell.modifier.contains(Modifier::REVERSED));
     }
 
     #[test]
