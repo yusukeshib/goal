@@ -1,0 +1,77 @@
+#!/bin/bash
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'EOF'
+usage: goal-runner-pi [PI_OPTIONS...] -- PROMPT_PATH
+
+Run Pi as an isolated one-shot goal agent and emit a compact JSON event stream.
+Model, thinking level, and tools remain explicit caller policy.
+
+example:
+  goal-runner-pi \
+    --model openai-codex/gpt-5.6-luna \
+    --thinking high \
+    --tools write \
+    -- prompt.md
+
+Environment:
+  PI_BIN  Pi executable to invoke (default: pi)
+EOF
+}
+
+pi_command=("${PI_BIN:-pi}")
+while (($#)); do
+  case $1 in
+    --)
+      shift
+      break
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      pi_command+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if (($# != 1)); then
+  usage
+  exit 2
+fi
+
+prompt_path=$1
+
+if [[ ! -r $prompt_path ]]; then
+  echo "goal-runner-pi: prompt is not readable: $prompt_path" >&2
+  exit 2
+fi
+
+if ! command -v "${pi_command[0]}" >/dev/null 2>&1; then
+  echo "goal-runner-pi: Pi executable not found: ${pi_command[0]}" >&2
+  exit 127
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "goal-runner-pi: jq is required" >&2
+  exit 127
+fi
+
+"${pi_command[@]}" \
+  --mode json \
+  --no-session \
+  --no-context-files \
+  --no-extensions \
+  --no-skills \
+  --no-prompt-templates \
+  "@$prompt_path" |
+  jq --compact-output --unbuffered '
+    select(.type != "message_update" and .type != "tool_execution_update")
+    | if .type == "turn_end" then del(.message, .toolResults)
+      elif .type == "agent_end" then del(.messages)
+      else .
+      end
+  '
