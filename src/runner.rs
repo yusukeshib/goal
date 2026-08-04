@@ -1,8 +1,8 @@
 use std::{
     fs::{self, File},
-    io::{BufRead, BufReader, Read, Write},
+    io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus, Stdio},
+    process::{Child, ChildStdin, Command, ExitStatus, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -21,6 +21,10 @@ use crate::{
     output::Output,
     tui::ArtifactRange,
 };
+
+const MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CHILD_LINE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_STREAM_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct RunArtifacts {
@@ -218,15 +222,29 @@ impl Runner {
         artifacts: &RunArtifacts,
         prompt: Option<&str>,
     ) -> std::result::Result<(Vec<u8>, Vec<u8>), RunError> {
-        let prompt_path = artifacts.prompt_path.to_string_lossy();
         let uses_placeholder =
             prompt.is_some() && config.command.iter().any(|arg| arg.contains("{prompt}"));
+        let prompt_path = if uses_placeholder {
+            artifacts.prompt_path.to_str().ok_or_else(|| {
+                RunError::Infrastructure(anyhow!(
+                    "prompt path is not valid UTF-8: {}",
+                    artifacts.prompt_path.display()
+                ))
+            })?
+        } else {
+            ""
+        };
         let argv: Vec<String> = config
             .command
             .iter()
-            .map(|arg| arg.replace("{prompt}", &prompt_path))
+            .map(|arg| arg.replace("{prompt}", prompt_path))
             .collect();
-        let mut command = Command::new(&argv[0]);
+        let Some(program) = argv.first() else {
+            return Err(RunError::Infrastructure(anyhow!(
+                "child command must not be empty"
+            )));
+        };
+        let mut command = Command::new(program);
         command
             .args(&argv[1..])
             .current_dir(&self.project_dir)
@@ -247,30 +265,47 @@ impl Runner {
             command.process_group(0);
         }
         let mut child = command.spawn().map_err(|error| {
-            RunError::Infrastructure(anyhow!(error).context(format!("spawn {}", argv[0])))
+            RunError::Infrastructure(anyhow!(error).context(format!("spawn {program}")))
         })?;
 
-        if let Some(prompt) = prompt.filter(|_| !uses_placeholder) {
-            let mut stdin = child
-                .stdin
-                .take()
-                .ok_or_else(|| RunError::Infrastructure(anyhow!("child stdin unavailable")))?;
-            if let Err(error) = stdin.write_all(prompt.as_bytes()) {
-                terminate(&mut child);
-                return Err(RunError::Infrastructure(
-                    anyhow!(error).context("write prompt to child stdin"),
-                ));
+        let input = if prompt.is_some() && !uses_placeholder {
+            match child.stdin.take() {
+                Some(stdin) => Some(stdin),
+                None => {
+                    terminate(&mut child);
+                    return Err(RunError::Infrastructure(anyhow!(
+                        "child stdin unavailable"
+                    )));
+                }
             }
+        } else {
+            None
+        };
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                terminate(&mut child);
+                return Err(RunError::Infrastructure(anyhow!(
+                    "child stdout unavailable"
+                )));
+            }
+        };
+        let stderr = match child.stderr.take() {
+            Some(stderr) => stderr,
+            None => {
+                terminate(&mut child);
+                return Err(RunError::Infrastructure(anyhow!(
+                    "child stderr unavailable"
+                )));
+            }
+        };
+        if let Err(error) = set_nonblocking(&stdout)
+            .and_then(|()| set_nonblocking(&stderr))
+            .and_then(|()| input.as_ref().map_or(Ok(()), set_nonblocking))
+        {
+            terminate(&mut child);
+            return Err(RunError::Infrastructure(error));
         }
-
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| RunError::Infrastructure(anyhow!("child stdout unavailable")))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| RunError::Infrastructure(anyhow!("child stderr unavailable")))?;
         let stdout_log = artifacts.dir.join("stdout.log");
         let stderr_log = artifacts.dir.join("stderr.log");
         let stdout_output = self.output.clone();
@@ -279,37 +314,78 @@ impl Runner {
         let stderr_role = role.to_owned();
         let stdout_run_id = artifacts.id.clone();
         let stderr_run_id = artifacts.id.clone();
+        let capture_stdout = role == "sensor";
+        let io_stopped = Arc::new(AtomicBool::new(false));
+        let stream_failed = Arc::new(AtomicBool::new(false));
+        let stdout_stopped = Arc::clone(&io_stopped);
+        let stderr_stopped = Arc::clone(&io_stopped);
+        let stdout_failed = Arc::clone(&stream_failed);
+        let stderr_failed = Arc::clone(&stream_failed);
         let out_thread = thread::spawn(move || {
-            tee(
+            let result = tee(
                 stdout,
                 stdout_log,
                 stdout_output,
                 stdout_role,
                 "stdout",
                 stdout_run_id,
-            )
+                capture_stdout,
+                stdout_stopped,
+            );
+            if result.is_err() {
+                stdout_failed.store(true, Ordering::SeqCst);
+            }
+            result
         });
         let err_thread = thread::spawn(move || {
-            tee(
+            let result = tee(
                 stderr,
                 stderr_log,
                 stderr_output,
                 stderr_role,
                 "stderr",
                 stderr_run_id,
-            )
+                false,
+                stderr_stopped,
+            );
+            if result.is_err() {
+                stderr_failed.store(true, Ordering::SeqCst);
+            }
+            result
+        });
+        // Write stdin concurrently with reading diagnostics and enforcing the
+        // timeout. Writing first can deadlock when a child fills stdout before
+        // it starts reading a large prompt.
+        let input_path = artifacts.prompt_path.clone();
+        let input_stopped = Arc::clone(&io_stopped);
+        let mut in_thread = input.map(|stdin| {
+            thread::spawn(move || write_prompt(stdin, &input_path, &input_stopped))
         });
 
         let result = wait_for_child(
             &mut child,
             Duration::from_secs(config.timeout_seconds),
             &self.cancelled,
+            &mut in_thread,
+            &stream_failed,
         );
-        if result.is_err() {
-            terminate(&mut child);
-        }
+        let stream_failure_before_cleanup = stream_failed.load(Ordering::SeqCst);
+        // Always terminate the process group, even after the direct child exits.
+        // A stray descendant may otherwise keep stdin/stdout/stderr open and
+        // make the joins below hang forever outside the configured timeout.
+        terminate(&mut child);
+        io_stopped.store(true, Ordering::SeqCst);
+        let input_result = join_input(in_thread);
         let stream_result = join_streams(out_thread, err_thread);
-        result?;
+        if let Err(error) = result {
+            if stream_failure_before_cleanup
+                && let Err(stream_error) = stream_result
+            {
+                return Err(RunError::Infrastructure(stream_error));
+            }
+            return Err(error);
+        }
+        input_result.map_err(RunError::Infrastructure)?;
         stream_result.map_err(RunError::Infrastructure)
     }
 }
@@ -318,11 +394,21 @@ fn wait_for_child(
     child: &mut Child,
     timeout: Duration,
     cancelled: &AtomicBool,
+    input: &mut Option<thread::JoinHandle<Result<()>>>,
+    stream_failed: &AtomicBool,
 ) -> std::result::Result<(), RunError> {
     let start = Instant::now();
     loop {
         if cancelled.load(Ordering::SeqCst) {
             return Err(RunError::Cancelled);
+        }
+        if input.as_ref().is_some_and(|thread| thread.is_finished()) {
+            join_input(input.take()).map_err(RunError::Infrastructure)?;
+        }
+        if stream_failed.load(Ordering::SeqCst) {
+            return Err(RunError::Infrastructure(anyhow!(
+                "child output streaming failed"
+            )));
         }
         let Some(remaining) = timeout.checked_sub(start.elapsed()) else {
             return Err(RunError::Timeout);
@@ -340,6 +426,50 @@ fn wait_for_child(
     }
 }
 
+fn write_prompt(
+    mut stdin: ChildStdin,
+    path: &Path,
+    stopped: &AtomicBool,
+) -> Result<()> {
+    let mut prompt = File::open(path).with_context(|| format!("open prompt {}", path.display()))?;
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        if stopped.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let read = prompt.read(&mut buffer).context("read prompt")?;
+        if read == 0 {
+            return Ok(());
+        }
+        let mut written = 0;
+        while written < read {
+            if stopped.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            match stdin.write(&buffer[written..read]) {
+                Ok(0) => {
+                    return Err(std::io::Error::from(std::io::ErrorKind::WriteZero))
+                        .context("write prompt to child stdin");
+                }
+                Ok(count) => written += count,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error).context("write prompt to child stdin"),
+            }
+        }
+    }
+}
+
+fn join_input(input: Option<thread::JoinHandle<Result<()>>>) -> Result<()> {
+    match input {
+        Some(input) => input
+            .join()
+            .map_err(|_| anyhow!("stdin writer thread panicked"))?,
+        None => Ok(()),
+    }
+}
+
 fn terminate(child: &mut Child) {
     #[cfg(unix)]
     // SAFETY: the child was placed in its own process group at spawn time. A
@@ -353,41 +483,111 @@ fn terminate(child: &mut Child) {
 }
 
 fn tee(
-    reader: impl Read,
+    mut reader: impl Read,
     path: PathBuf,
     output: Output,
     role: String,
     stream: &'static str,
     run_id: String,
+    capture: bool,
+    stopped: Arc<AtomicBool>,
 ) -> Result<Vec<u8>> {
     let mut captured = Vec::new();
     let mut log = File::create(&path).with_context(|| format!("open {}", path.display()))?;
-    let mut reader = BufReader::new(reader);
+    let mut buffer = [0_u8; 16 * 1024];
     let mut line = Vec::new();
     let mut offset = 0_u64;
+    let mut total = 0_usize;
     loop {
-        line.clear();
-        let read = reader.read_until(b'\n', &mut line)?;
-        if read == 0 {
-            break;
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                let bytes = &buffer[..read];
+                let remaining = MAX_STREAM_BYTES.saturating_sub(total);
+                if read > remaining {
+                    log.write_all(&bytes[..remaining])?;
+                    anyhow::bail!("{stream} exceeded {MAX_STREAM_BYTES} bytes");
+                }
+                log.write_all(bytes)?;
+                total += read;
+                if capture {
+                    if captured.len().saturating_add(read) > MAX_CAPTURE_BYTES {
+                        anyhow::bail!("captured {stream} exceeded {MAX_CAPTURE_BYTES} bytes");
+                    }
+                    captured.extend_from_slice(bytes);
+                }
+                for segment in bytes.split_inclusive(|byte| *byte == b'\n') {
+                    if line.len().saturating_add(segment.len()) > MAX_CHILD_LINE_BYTES {
+                        anyhow::bail!("{stream} line exceeded {MAX_CHILD_LINE_BYTES} bytes");
+                    }
+                    line.extend_from_slice(segment);
+                    if line.ends_with(b"\n") {
+                        emit_line(&mut log, &output, &role, stream, &run_id, &path, offset, &line)?;
+                        offset += line.len() as u64;
+                        line.clear();
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if stopped.load(Ordering::SeqCst) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error).with_context(|| format!("read {stream}")),
         }
-        log.write_all(&line)?;
-        log.flush()?;
-        captured.extend_from_slice(&line);
-        output.child_line(
-            &role,
-            stream,
-            &run_id,
-            ArtifactRange {
-                path: path.clone(),
-                offset,
-                length: read as u64,
-            },
-            &line,
-        )?;
-        offset += read as u64;
     }
+    if !line.is_empty() {
+        emit_line(&mut log, &output, &role, stream, &run_id, &path, offset, &line)?;
+    }
+    log.flush()?;
     Ok(captured)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_line(
+    log: &mut File,
+    output: &Output,
+    role: &str,
+    stream: &str,
+    run_id: &str,
+    path: &Path,
+    offset: u64,
+    line: &[u8],
+) -> Result<()> {
+    log.flush()?;
+    output.child_line(
+        role,
+        stream,
+        run_id,
+        ArtifactRange {
+            path: path.to_owned(),
+            offset,
+            length: line.len() as u64,
+        },
+        line,
+    )
+}
+
+#[cfg(unix)]
+fn set_nonblocking<T: std::os::fd::AsRawFd>(stream: &T) -> Result<()> {
+    let descriptor = stream.as_raw_fd();
+    // SAFETY: fcntl only reads and updates the flags of this owned descriptor.
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error()).context("read child pipe flags");
+    }
+    // SAFETY: the descriptor remains valid for this call and O_NONBLOCK is a
+    // supported status flag for Unix pipes.
+    if unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(std::io::Error::last_os_error()).context("set child pipe nonblocking");
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_nonblocking<T>(_stream: &T) -> Result<()> {
+    Ok(())
 }
 
 fn join_streams(
@@ -473,6 +673,30 @@ mod tests {
     }
 
     #[test]
+    fn reads_diagnostics_while_writing_a_large_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = command(
+            "dd if=/dev/zero bs=65536 count=4 2>/dev/null; cat > received; printf '{\"ok\":true}' > \"$GOAL_RESULT_PATH\"",
+        );
+        config.timeout_seconds = 3;
+        let prompt = "x".repeat(256 * 1024);
+        let quiet_runner = Runner::new(
+            dir.path(),
+            Arc::new(AtomicBool::new(false)),
+            Output::new(crate::output::OutputMode::Json),
+        )
+        .unwrap();
+        let (_, artifacts) = quiet_runner
+            .run_json::<serde_json::Value>("test", &config, &prompt)
+            .unwrap();
+        assert_eq!(fs::metadata(dir.path().join("received")).unwrap().len(), prompt.len() as u64);
+        assert_eq!(
+            fs::metadata(artifacts.dir.join("stdout.log")).unwrap().len(),
+            256 * 1024
+        );
+    }
+
+    #[test]
     fn tui_notifications_reference_exact_logged_lines() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("stdout.log");
@@ -485,6 +709,8 @@ mod tests {
             "decider".to_owned(),
             "stdout",
             "run".to_owned(),
+            true,
+            Arc::new(AtomicBool::new(false)),
         )
         .unwrap();
         assert_eq!(captured, input);
@@ -505,8 +731,32 @@ mod tests {
     }
 
     #[test]
+    fn cleans_up_descendants_that_outlive_a_successful_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = Instant::now();
+        runner(dir.path())
+            .run_json::<serde_json::Value>(
+                "test",
+                &command("sleep 10 & printf '{\"ok\":true}' > \"$GOAL_RESULT_PATH\""),
+                "",
+            )
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
     fn distinguishes_process_timeout_and_protocol_failures() {
         let dir = tempfile::tempdir().unwrap();
+        let empty = CommandConfig {
+            command: Vec::new(),
+            timeout_seconds: 1,
+        };
+        let empty = runner(dir.path())
+            .run_json::<serde_json::Value>("empty", &empty, "")
+            .unwrap_err()
+            .0;
+        assert!(matches!(empty, RunError::Infrastructure(_)));
+
         let failed = runner(dir.path())
             .run_json::<serde_json::Value>("failed", &command("exit 7"), "")
             .unwrap_err()

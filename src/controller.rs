@@ -70,7 +70,7 @@ pub struct Controller {
 
 impl Controller {
     pub fn new(loaded: LoadedConfig, cancelled: Arc<AtomicBool>, output: Output) -> Result<Self> {
-        let controller_lock = ControllerLock::acquire(&loaded.config_path)?;
+        let controller_lock = ControllerLock::acquire(&loaded.project_dir)?;
         let store = StateStore::new(&loaded.project_dir)?;
         let state = store.load()?;
         let runner = Runner::new(&loaded.project_dir, Arc::clone(&cancelled), output.clone())?;
@@ -297,6 +297,10 @@ impl Controller {
                     self.store.event("wait", details.clone())?;
                     self.output.event("wait", details)?;
                     self.sleep(seconds)?;
+                    // The action's retry delay fully determines when to sense again;
+                    // adding the cycle interval here would make the recorded
+                    // `actual_seconds` understate the real wait.
+                    continue;
                 }
                 DeciderAction::Complete { summary } => {
                     let details = serde_json::json!({"summary": summary});

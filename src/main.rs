@@ -46,7 +46,7 @@ COMMANDS
 FILES
   goal.toml   Commands, timeouts, and the path to the natural-language goal.
   GOAL.md     The goal text (the filename is configurable).
-  .goal/      Restart state, events, prompts, results, and process logs.
+  .goal/      Controller lock, restart state, events, prompts, results, and logs.
 "#;
 
 const RUN_HELP: &str = r#"CONFIGURATION
@@ -99,9 +99,11 @@ GOAL SEMANTICS
 
 SENSOR CONTRACT
   The sensor must be read-only and emit exactly one JSON value on stdout.
-  Stderr is diagnostic. Non-zero exit, timeout, or invalid JSON prevents the
-  decider from running in that cycle, records the failed sensor run, and causes
-  a short backoff followed by a fresh observation.
+  Each sensor output line is limited to 4 MiB, each output stream to 64 MiB,
+  and captured sensor stdout to 16 MiB. Stderr is diagnostic. Non-zero exit,
+  timeout, invalid JSON, or exceeding an output limit prevents the decider from
+  running in that cycle, records the failed sensor run, and causes a short
+  backoff followed by a fresh observation.
 
 DECIDER AND WORKER CONTRACT
   Both are non-TUI child processes without a PTY. Every invocation receives:
@@ -114,7 +116,10 @@ DECIDER AND WORKER CONTRACT
   If any argv element contains {prompt}, it is replaced with GOAL_PROMPT_PATH
   and child stdin is closed. Otherwise prompt.md is piped to stdin and closed.
   The child must atomically write exactly one tagged JSON object to
-  GOAL_RESULT_PATH. Stdout and stderr are diagnostics only and are never parsed.
+  GOAL_RESULT_PATH. Stdout and stderr are diagnostics only and are never parsed
+  as protocol. Each stdout or stderr line is limited to 4 MiB and each stream
+  to 64 MiB; exceeding a limit fails the run while preserving bytes already
+  written to its log.
 
   Decider actions (`type` field):
     run_task      {"type":"run_task","task":"one bounded task"}
@@ -135,7 +140,13 @@ DECIDER AND WORKER CONTRACT
   retrying is safe because both roles are read-only. A decider's logical failure
   marks that decision run as failed without terminating the controller. Worker
   process, timeout, and protocol failures are terminal because the worker may
-  have modified external state.
+  have modified external state. A wait action's capped retry_after_seconds is
+  the complete delay before re-sensing; interval_seconds is not added to it.
+
+  Child commands must not deliberately detach descendants into another process
+  group or session. On Unix, the controller terminates the invocation's
+  process group when it finishes, times out, or is cancelled, but cannot reclaim
+  a deliberately detached process.
 
 FAILURE ANALYSIS
   Runtime data lives under .goal/ beside the config file. Successful and failed
@@ -158,13 +169,14 @@ OUTPUT
   interactive terminal. Selecting a row shows its details beside the activity
   list, or below it when the terminal is narrow. Mouse wheel scrolling follows
   the pane under the pointer. TUI mode falls back to plain output when redirected.
-  --output plain prints timestamped text. --output pretty preserves every child
-  JSON value but indents it as one terminal block. stdout.log/stderr.log always
-  retain the original one-line output. For controller runs, --output json emits
-  strict JSONL envelopes on stdout. For stats and analysis, tui, plain, and
-  pretty emit a human-readable report, while json emits one JSON report.
-  Oversized child lines
-  are summarized only in foreground displays; run logs retain exact output.
+  --output plain prints timestamped text. --output pretty indents child JSON up
+  to 16 KiB as one terminal block and leaves larger diagnostics unformatted.
+  stdout.log and stderr.log retain the exact received byte streams. For
+  controller runs, --output json emits strict JSONL envelopes on stdout. JSON
+  diagnostics over 16 KiB are summarized; inputs over 1 MiB use a bounded text
+  preview instead of being parsed for display. For stats and analysis, tui,
+  plain, and pretty emit a human-readable report, while json emits one JSON
+  report.
 
 EXAMPLES
   goal                                      Run ./goal.toml

@@ -51,6 +51,15 @@ timeout_seconds = 5
         command(&self.config).output().unwrap()
     }
 
+    fn set_interval(&self, seconds: u64) {
+        let config = fs::read_to_string(&self.config).unwrap();
+        fs::write(
+            &self.config,
+            config.replace("interval_seconds = 0", &format!("interval_seconds = {seconds}")),
+        )
+        .unwrap();
+    }
+
     fn set_timeout(&self, section: &str, seconds: u64) {
         let mut config = fs::read_to_string(&self.config).unwrap();
         let section_offset = config.find(&format!("[{section}]")).unwrap();
@@ -144,6 +153,9 @@ fn help_fully_describes_configuration_and_process_contracts() {
         "run_task",
         "failure",
         "Neither process may request human input",
+        "captured sensor stdout",
+        "Each stdout or stderr line is limited to 4 MiB",
+        "process group",
         "exit non-zero",
         "FAILURE ANALYSIS",
     ] {
@@ -240,6 +252,12 @@ fn rejects_a_second_controller_for_the_same_config_and_releases_after_exit() {
     }
     assert!(lock_ready.exists(), "first controller did not start");
 
+    // Configuration editors commonly publish via atomic rename. Locking the
+    // config inode itself would let a second controller lock the replacement.
+    let replacement = fixture.config.with_extension("toml.new");
+    fs::copy(&fixture.config, &replacement).unwrap();
+    fs::rename(replacement, &fixture.config).unwrap();
+
     let second = command(&fixture.config).output().unwrap();
     assert!(!second.status.success());
     assert!(
@@ -331,6 +349,22 @@ fn pretty_output_formats_child_json_but_keeps_run_log_exact() {
         fs::read_to_string(decider_dir.join("stdout.log")).unwrap(),
         format!("{diagnostic}\n")
     );
+}
+
+#[test]
+fn wait_retry_delay_is_not_extended_by_the_cycle_interval() {
+    let fixture = Fixture::new(
+        COUNT_SENSOR,
+        r#"n=0; test ! -f decider-count || n=$(cat decider-count); n=$((n+1)); echo "$n" > decider-count; if test "$n" = 1; then r='{"type":"wait","reason":"retry immediately","retry_after_seconds":0}'; else r='{"type":"complete","summary":"retried"}'; fi; printf '%s' "$r" > "$GOAL_RESULT_PATH""#,
+        r#"exit 99"#,
+    );
+    fixture.set_interval(5);
+
+    let started = Instant::now();
+    let output = fixture.run();
+    assert!(output.status.success());
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert_eq!(fixture.count("sensor-count"), 2);
 }
 
 #[test]

@@ -26,16 +26,26 @@ pub struct ControllerLock {
 }
 
 impl ControllerLock {
-    pub fn acquire(config_path: &Path) -> Result<Self> {
+    pub fn acquire(project_dir: &Path) -> Result<Self> {
+        let state_dir = project_dir.join(".goal");
+        fs::create_dir_all(&state_dir).context("create .goal directory for controller lock")?;
+        let lock_path = state_dir.join("controller.lock");
         let file = OpenOptions::new()
+            .create(true)
             .read(true)
-            .open(config_path)
-            .with_context(|| format!("open config lock {}", config_path.display()))?;
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("open controller lock {}", lock_path.display()))?;
         if let Err(error) = file.try_lock_exclusive() {
-            bail!(
-                "another goal controller is already running for {}: {error}",
-                config_path.display()
-            );
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                bail!(
+                    "another goal controller is already running for {}: {error}",
+                    project_dir.display()
+                );
+            }
+            return Err(error)
+                .with_context(|| format!("lock controller file {}", lock_path.display()));
         }
         Ok(Self { _file: file })
     }
@@ -130,14 +140,11 @@ mod tests {
     #[test]
     fn controller_lock_is_exclusive_and_released_on_drop() {
         let dir = tempfile::tempdir().unwrap();
-        let config = dir.path().join("goal.toml");
-        fs::write(&config, "goal_file = 'GOAL.md'").unwrap();
-
-        let first = ControllerLock::acquire(&config).unwrap();
-        let error = ControllerLock::acquire(&config).unwrap_err();
+        let first = ControllerLock::acquire(dir.path()).unwrap();
+        let error = ControllerLock::acquire(dir.path()).unwrap_err();
         assert!(error.to_string().contains("already running"));
         drop(first);
-        ControllerLock::acquire(&config).unwrap();
+        ControllerLock::acquire(dir.path()).unwrap();
     }
 
     #[test]

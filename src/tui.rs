@@ -36,9 +36,11 @@ use serde_json::Value;
 
 const MAX_CARDS: usize = 2_000;
 const SUMMARY_CHARS: usize = 160;
+const SUMMARY_PARSE_BYTES: usize = 16 * 1024;
 const DETAIL_BYTES: usize = 256 * 1024;
 const DETAIL_LINES: usize = 2_000;
 const SIDE_BY_SIDE_MIN_WIDTH: u16 = 100;
+const MAX_ACTIVITY_DRAIN_PER_TICK: usize = 1_024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactRange {
@@ -78,6 +80,11 @@ pub enum Activity {
 
 /// Produce a schema-independent, single-line and bounded description.
 pub fn summarize_line(bytes: &[u8]) -> String {
+    if bytes.len() > SUMMARY_PARSE_BYTES {
+        let preview = String::from_utf8_lossy(&bytes[..SUMMARY_PARSE_BYTES])
+            .replace(['\n', '\r', '\t'], " ");
+        return format!("{} · {} B", truncate(&preview, SUMMARY_CHARS), bytes.len());
+    }
     let value = serde_json::from_slice::<Value>(bytes);
     let summary = match value {
         Ok(Value::Object(map)) => {
@@ -520,11 +527,12 @@ pub fn run(
     let mut ui_error = None;
 
     'ui: loop {
-        loop {
+        // Bound each drain so a producer that continuously fills the channel
+        // cannot starve rendering, keyboard input, or cancellation handling.
+        for _ in 0..MAX_ACTIVITY_DRAIN_PER_TICK {
             match receiver.try_recv() {
                 Ok(activity) => state.push(activity),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             }
         }
         if let Err(error) = terminal.draw(|frame| render(frame, &mut state)) {
@@ -1098,6 +1106,9 @@ mod tests {
         assert!(result.contains("nested: {… 1 fields}"));
         assert!(result.chars().count() <= SUMMARY_CHARS + 1);
         assert!(summarize_line(&[0xff, b'\n', b'x']).chars().count() <= SUMMARY_CHARS + 1);
+        let oversized = summarize_line(&vec![b'x'; SUMMARY_PARSE_BYTES + 1]);
+        assert!(oversized.contains(&format!("{} B", SUMMARY_PARSE_BYTES + 1)));
+        assert!(oversized.chars().count() <= SUMMARY_CHARS + 16);
     }
 
     #[test]

@@ -35,6 +35,20 @@ pub struct RunMetadata {
 }
 
 impl RunMetadata {
+    pub fn from_slice(bytes: &[u8]) -> Result<Self> {
+        let record: Self = serde_json::from_slice(bytes)?;
+        if record.schema_version != 1 {
+            bail!(
+                "unsupported run metadata schema version {}",
+                record.schema_version
+            );
+        }
+        if record.run_id.trim().is_empty() || record.role.trim().is_empty() {
+            bail!("run metadata must contain non-empty run_id and role");
+        }
+        Ok(record)
+    }
+
     pub fn running(run_id: &str, role: &str, started_at_ms: u64) -> Self {
         Self {
             schema_version: 1,
@@ -156,7 +170,7 @@ pub fn stats(project_dir: &Path, since: Option<&str>) -> Result<StatsReport> {
                 let path = entry.path().join(METADATA_FILE);
                 match fs::read(&path) {
                     Ok(bytes) => {
-                        let record: RunMetadata = serde_json::from_slice(&bytes)
+                        let record = RunMetadata::from_slice(&bytes)
                             .with_context(|| format!("parse {}", path.display()))?;
                         if cutoff_ms.is_none_or(|cutoff| record.started_at_ms >= cutoff) {
                             metadata.push(record);
@@ -440,13 +454,30 @@ mod tests {
     }
 
     #[test]
-    fn malformed_metadata_is_reported_instead_of_silently_skipped() {
-        let dir = tempfile::tempdir().unwrap();
-        let run = dir.path().join(".goal/runs/broken");
-        fs::create_dir_all(&run).unwrap();
-        fs::write(run.join(METADATA_FILE), "not json").unwrap();
-        let error = stats(dir.path(), None).unwrap_err();
-        assert!(error.to_string().contains("metadata.json"));
+    fn malformed_or_unsupported_metadata_is_reported_instead_of_silently_skipped() {
+        for contents in [
+            "not json".to_owned(),
+            serde_json::to_string(&RunMetadata {
+                schema_version: 2,
+                run_id: "future".into(),
+                role: "worker".into(),
+                started_at_ms: 0,
+                finished_at_ms: None,
+                duration_ms: None,
+                outcome: RunOutcome::Running,
+                failure_kind: None,
+                result_type: None,
+                reason: None,
+            })
+            .unwrap(),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let run = dir.path().join(".goal/runs/broken");
+            fs::create_dir_all(&run).unwrap();
+            fs::write(run.join(METADATA_FILE), contents).unwrap();
+            let error = stats(dir.path(), None).unwrap_err();
+            assert!(error.to_string().contains("metadata.json"));
+        }
     }
 
     #[test]

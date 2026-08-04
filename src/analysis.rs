@@ -321,7 +321,7 @@ fn load_metadata(project_dir: &Path, window: &AnalysisWindow) -> Result<(Vec<Run
                 let path = entry.path().join(METADATA_FILE);
                 match fs::read(&path) {
                     Ok(bytes) => {
-                        let record: RunMetadata = serde_json::from_slice(&bytes)
+                        let record = RunMetadata::from_slice(&bytes)
                             .with_context(|| format!("parse {}", path.display()))?;
                         if record.started_at_ms >= window.start_ms
                             && record.started_at_ms < window.end_ms

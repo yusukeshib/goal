@@ -15,6 +15,7 @@ use crate::{
 };
 
 const MAX_STREAM_PAYLOAD_BYTES: usize = 16 * 1024;
+const MAX_STREAM_JSON_PARSE_BYTES: usize = 1024 * 1024;
 const CONTENT_PREVIEW_BYTES: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -136,13 +137,17 @@ impl Output {
             "stream": stream,
             "run_id": run_id,
         });
-        if let Ok(payload) = serde_json::from_slice::<Value>(trimmed) {
+        if trimmed.len() <= MAX_STREAM_JSON_PARSE_BYTES
+            && let Ok(payload) = serde_json::from_slice::<Value>(trimmed)
+        {
             details["payload"] = if trimmed.len() > MAX_STREAM_PAYLOAD_BYTES {
                 summarize_large_payload(&payload, trimmed.len())
             } else {
                 payload
             };
         } else {
+            // Do not build an unbounded JSON tree just to summarize a
+            // diagnostic. The exact bytes are already retained in the run log.
             let preview = &trimmed[..trimmed.len().min(CONTENT_PREVIEW_BYTES)];
             details["content"] = Value::String(String::from_utf8_lossy(preview).into_owned());
             if preview.len() < trimmed.len() {
@@ -232,6 +237,9 @@ fn prettify_json_line(line: &[u8]) -> Result<Vec<u8>> {
     } else {
         (line, b"")
     };
+    if trimmed.len() > MAX_STREAM_PAYLOAD_BYTES {
+        return Ok(line.to_vec());
+    }
     let Ok(payload) = serde_json::from_slice::<Value>(trimmed) else {
         return Ok(line.to_vec());
     };
@@ -366,6 +374,19 @@ mod tests {
             )
             .unwrap();
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn oversized_json_is_not_expanded_for_pretty_output() {
+        let original = format!(
+            r#"{{"content":"{}"}}
+"#,
+            "x".repeat(MAX_STREAM_PAYLOAD_BYTES)
+        );
+        assert_eq!(
+            prettify_json_line(original.as_bytes()).unwrap(),
+            original.as_bytes()
+        );
     }
 
     #[test]
