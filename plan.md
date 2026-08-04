@@ -33,10 +33,11 @@ Confirmed design
 9. Sensor and decider failures are recorded and retried after a short backoff and
    fresh observation because both roles are read-only. A logical decider
    `failure` marks that run as failed without terminating the controller. Worker
-   process, timeout, or protocol failures are terminal because the worker may
-   have modified external state. A logical worker `failure` is task-local
-   instead: the controller records it, senses again, and lets the next decider
-   select other work.
+   process, timeout, and protocol failures are recorded, exponentially backed
+   off, and followed by a fresh observation. Logical failures are recorded and
+   re-sensed without infrastructure backoff. Because a failed worker may have modified external state,
+   its failure context tells the next decider not to repeat the task unless the
+   newly observed reality materially changed.
 10. No daemon, child PTY, worker pool, parallel workers, scheduler, workflow DAG,
     or persistent agent conversation is part of the controller. A bounded,
     observational TUI may render controller and child activity.
@@ -113,9 +114,8 @@ Process and logical outcomes are distinct:
 
 * exit 0 plus a valid result: valid outcome;
 * non-zero exit: process failure;
-* exit 0 without a valid result: protocol failure (a sensor or decider is
-  retried after a short backoff and fresh observation; a worker failure is
-  terminal);
+* exit 0 without a valid result: protocol failure, recorded before a fresh
+  observation and decision;
 * timeout: process failure terminated by the controller.
 
 Worker contract
@@ -131,10 +131,12 @@ Every worker prompt requires the worker to:
 * write exactly one completion and exit;
 * report what changed and what was actually verified.
 
-A worker process/protocol failure terminates the controller. A valid logical
-worker `failure` is recorded, followed by a fresh observation and decision. The
-next decider is instructed not to repeat the same task unless reality materially
-changed, preventing a blind loop while allowing independent work to continue.
+A worker process, timeout, or protocol failure is recorded, exponentially backed
+off, and followed by fresh observation and decision. A logical failure follows
+the same observation path without infrastructure backoff. The next decider receives failure context that
+warns the worker may have modified external state and instructs it not to repeat
+the same task unless reality materially changed. This prevents a blind loop while
+allowing the continuous controller and independent work to continue.
 
 Persistence and analysis
 ------------------------
@@ -157,8 +159,8 @@ The artifacts must distinguish:
 * logical decider or worker `failure` and its reason;
 * worker process, timeout, and protocol failures;
 * finite goal `complete`;
-* terminal sensor, decider-process, and worker infrastructure failures;
-* recoverable decider protocol failures.
+* recoverable sensor, decider, and worker infrastructure failures;
+* terminal controller and cancellation failures.
 
 Target selection is shared by run and analysis commands: `GOAL_DIR` selects the
 goal directory, otherwise the current directory is used. `goal stats --since
@@ -215,7 +217,8 @@ Failure policy
 * Worker `failure`: record the result and reason, re-sense, and pass the
   task-local failure to the next decider so other work can continue.
 * Worker process/protocol failure or timeout: preserve artifacts, record the
-  reason, and exit non-zero without re-sensing or launching another worker.
+  reason and partial-side-effect warning, back off, re-sense, and pass that
+  context to the next decider without blindly relaunching the same task.
 * Ctrl-C/SIGTERM: terminate the active child and exit cleanly without starting
   another cycle.
 
@@ -230,7 +233,8 @@ Integration tests cover:
 * decider process failure is recorded and a later cycle can complete the goal;
 * decider `failure` is recorded and a later cycle can complete the goal;
 * worker `failure` is recorded and a later cycle can complete the goal;
-* worker non-zero, timeout, and missing/invalid result are terminal;
+* worker non-zero, timeout, and missing/invalid result are recorded and a later
+  cycle can complete the goal;
 * full failure reason and run ID are retained in events;
 * legacy human state loads without restoring an interaction path;
 * Ctrl-C does not start another cycle.

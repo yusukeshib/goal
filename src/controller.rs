@@ -8,7 +8,6 @@ use std::{
 };
 
 use anyhow::Result;
-use serde_json::Value;
 
 use crate::{
     analytics::RunOutcome,
@@ -21,64 +20,27 @@ use crate::{
     state::{ControllerLock, PersistentState, StateStore, unix_timestamp},
 };
 
-const SENSOR_FAILURE_INITIAL_BACKOFF_SECONDS: u64 = 5;
-const SENSOR_FAILURE_MAX_BACKOFF_SECONDS: u64 = 60;
+const FAILURE_INITIAL_BACKOFF_SECONDS: u64 = 5;
+const FAILURE_MAX_BACKOFF_SECONDS: u64 = 60;
 
 #[derive(Default)]
-struct SensorFailureBackoff {
+struct FailureBackoff {
     consecutive_failures: u32,
 }
 
-impl SensorFailureBackoff {
+impl FailureBackoff {
     fn next_delay(&mut self) -> u64 {
         let exponent = self.consecutive_failures.min(4);
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-        SENSOR_FAILURE_INITIAL_BACKOFF_SECONDS
+        FAILURE_INITIAL_BACKOFF_SECONDS
             .saturating_mul(1_u64 << exponent)
-            .min(SENSOR_FAILURE_MAX_BACKOFF_SECONDS)
+            .min(FAILURE_MAX_BACKOFF_SECONDS)
     }
 
     fn reset(&mut self) {
         self.consecutive_failures = 0;
     }
 }
-
-#[derive(Debug)]
-pub struct GoalFailure {
-    source: String,
-    reason: String,
-    run_id: Option<String>,
-}
-
-impl GoalFailure {
-    fn new(source: &str, reason: String, run_id: Option<String>) -> Self {
-        Self {
-            source: source.to_owned(),
-            reason,
-            run_id,
-        }
-    }
-
-    pub fn details(&self) -> Value {
-        serde_json::json!({
-            "source": self.source,
-            "reason": self.reason,
-            "run_id": self.run_id,
-        })
-    }
-}
-
-impl std::fmt::Display for GoalFailure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "{} reported failure: {}",
-            self.source, self.reason
-        )
-    }
-}
-
-impl std::error::Error for GoalFailure {}
 
 pub struct Controller {
     loaded: LoadedConfig,
@@ -108,7 +70,8 @@ impl Controller {
     }
 
     pub fn run(mut self) -> Result<()> {
-        let mut sensor_failure_backoff = SensorFailureBackoff::default();
+        let mut sensor_failure_backoff = FailureBackoff::default();
+        let mut worker_failure_backoff = FailureBackoff::default();
 
         loop {
             self.ensure_running()?;
@@ -243,8 +206,8 @@ impl Controller {
                         &self.loaded.config.worker,
                         &worker_prompt,
                     ) {
-                        Ok((completion, artifacts)) => {
-                            if let Err(error) = completion.validate() {
+                        Ok((completion, artifacts)) => match completion.validate() {
+                            Err(error) => {
                                 let reason = format!("schema validation: {error:#}");
                                 artifacts.finish(
                                     RunOutcome::Failure,
@@ -252,49 +215,57 @@ impl Controller {
                                     None,
                                     Some(&reason),
                                 )?;
+                                let retry_after_seconds = self
+                                    .loaded
+                                    .config
+                                    .interval_seconds
+                                    .max(worker_failure_backoff.next_delay());
+                                self.record_recoverable_worker_failure(
+                                    reason,
+                                    Some(artifacts.id.clone()),
+                                    retry_after_seconds,
+                                )?;
+                                self.sleep(retry_after_seconds)?;
+                                continue;
+                            }
+                            Ok(()) => {
+                                worker_failure_backoff.reset();
+                                let (outcome, failure_kind, result_type, failure_reason) =
+                                    match &completion {
+                                        WorkerCompletion::Done { .. } => {
+                                            (RunOutcome::Success, None, "done", None)
+                                        }
+                                        WorkerCompletion::Failure { reason } => (
+                                            RunOutcome::Failure,
+                                            Some("logical"),
+                                            "failure",
+                                            Some(reason.as_str()),
+                                        ),
+                                    };
+                                artifacts.finish(
+                                    outcome,
+                                    failure_kind,
+                                    Some(result_type),
+                                    failure_reason,
+                                )?;
+                                self.output.event(
+                                    "phase_finished",
+                                    serde_json::json!({
+                                        "phase": "worker",
+                                        "run_id": artifacts.id,
+                                        "duration_ms": phase_started.elapsed().as_millis() as u64,
+                                        "outcome": outcome,
+                                    }),
+                                )?;
                                 let details = serde_json::json!({
                                     "run_id": artifacts.id,
-                                    "error": reason,
+                                    "completion": completion,
                                 });
-                                self.store.event("worker_failed", details.clone())?;
-                                self.output.event("worker_failed", details)?;
-                                return self.terminal_failure("worker", reason, Some(artifacts.id));
+                                self.store.event("worker_completed", details.clone())?;
+                                self.output.event("worker_completed", details)?;
+                                self.state.latest_worker_completion = Some(completion);
+                                self.store.save(&self.state)?;
                             }
-                            let (outcome, failure_kind, result_type, failure_reason) =
-                                match &completion {
-                                    WorkerCompletion::Done { .. } => {
-                                        (RunOutcome::Success, None, "done", None)
-                                    }
-                                    WorkerCompletion::Failure { reason } => (
-                                        RunOutcome::Failure,
-                                        Some("logical"),
-                                        "failure",
-                                        Some(reason.as_str()),
-                                    ),
-                                };
-                            artifacts.finish(
-                                outcome,
-                                failure_kind,
-                                Some(result_type),
-                                failure_reason,
-                            )?;
-                            self.output.event(
-                                "phase_finished",
-                                serde_json::json!({
-                                    "phase": "worker",
-                                    "run_id": artifacts.id,
-                                    "duration_ms": phase_started.elapsed().as_millis() as u64,
-                                    "outcome": outcome,
-                                }),
-                            )?;
-                            let details = serde_json::json!({
-                                "run_id": artifacts.id,
-                                "completion": completion,
-                            });
-                            self.store.event("worker_completed", details.clone())?;
-                            self.output.event("worker_completed", details)?;
-                            self.state.latest_worker_completion = Some(completion);
-                            self.store.save(&self.state)?;
                         }
                         Err((RunError::Cancelled, artifacts)) => {
                             finish_run_error(artifacts.as_deref(), &RunError::Cancelled)?;
@@ -303,13 +274,18 @@ impl Controller {
                         Err((error, artifacts)) => {
                             finish_run_error(artifacts.as_deref(), &error)?;
                             let run_id = artifacts.as_ref().map(|artifact| artifact.id.clone());
-                            let reason = error.to_string();
-                            self.record_run_error("worker_failed", &error, run_id.as_deref())?;
-                            self.output.event(
-                                "worker_failed",
-                                serde_json::json!({"run_id": run_id, "error": reason}),
+                            let retry_after_seconds = self
+                                .loaded
+                                .config
+                                .interval_seconds
+                                .max(worker_failure_backoff.next_delay());
+                            self.record_recoverable_worker_failure(
+                                error.to_string(),
+                                run_id,
+                                retry_after_seconds,
                             )?;
-                            return self.terminal_failure("worker", reason, run_id);
+                            self.sleep(retry_after_seconds)?;
+                            continue;
                         }
                     }
                 }
@@ -363,10 +339,28 @@ impl Controller {
         Ok(cycle_id)
     }
 
-    fn terminal_failure(&self, source: &str, reason: String, run_id: Option<String>) -> Result<()> {
-        let failure = GoalFailure::new(source, reason, run_id);
-        self.store.event("failure", failure.details())?;
-        Err(failure.into())
+    fn record_recoverable_worker_failure(
+        &mut self,
+        error: String,
+        run_id: Option<String>,
+        retry_after_seconds: u64,
+    ) -> Result<()> {
+        let completion = WorkerCompletion::Failure {
+            reason: format!(
+                "Worker invocation failed after it may have modified external state: {error}. A fresh observation is required; do not repeat the same task unless reality materially changed."
+            ),
+        };
+        let details = serde_json::json!({
+            "run_id": run_id,
+            "error": error,
+            "completion": &completion,
+            "recovery": "resense",
+            "retry_after_seconds": retry_after_seconds,
+        });
+        self.store.event("worker_failed", details.clone())?;
+        self.output.event("worker_failed", details)?;
+        self.state.latest_worker_completion = Some(completion);
+        self.store.save(&self.state)
     }
 
     fn record_run_error(&self, kind: &str, error: &RunError, run_id: Option<&str>) -> Result<()> {
@@ -413,7 +407,7 @@ fn cap_wait(requested: u64, maximum: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{SensorFailureBackoff, cap_wait};
+    use super::{FailureBackoff, cap_wait};
 
     #[test]
     fn wait_duration_is_capped() {
@@ -422,8 +416,8 @@ mod tests {
     }
 
     #[test]
-    fn sensor_failure_backoff_grows_and_caps() {
-        let mut backoff = SensorFailureBackoff::default();
+    fn failure_backoff_grows_and_caps() {
+        let mut backoff = FailureBackoff::default();
 
         assert_eq!(backoff.next_delay(), 5);
         assert_eq!(backoff.next_delay(), 10);
@@ -434,8 +428,8 @@ mod tests {
     }
 
     #[test]
-    fn sensor_failure_backoff_resets_after_success() {
-        let mut backoff = SensorFailureBackoff::default();
+    fn failure_backoff_resets_after_success() {
+        let mut backoff = FailureBackoff::default();
         assert_eq!(backoff.next_delay(), 5);
         assert_eq!(backoff.next_delay(), 10);
 

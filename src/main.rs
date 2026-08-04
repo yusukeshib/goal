@@ -140,9 +140,11 @@ DECIDER AND WORKER CONTRACT
   exponential backoff capped at 60 seconds; retrying is safe because both roles
   are read-only. A decider's logical failure
   marks that decision run as failed without terminating the controller. Worker
-  process, timeout, and protocol failures are terminal because the worker may
-  have modified external state. A wait action's capped retry_after_seconds is
-  the complete delay before re-sensing; interval_seconds is not added to it.
+  process, timeout, and protocol failures are recorded with a warning that the
+  worker may have modified external state, followed by exponential backoff and a
+  fresh observation; the next decider must not blindly repeat the task. A wait action's capped
+  retry_after_seconds is the complete delay before re-sensing; interval_seconds
+  is not added to it.
 
   Child commands must not deliberately detach descendants into another process
   group or session. On Unix, the controller terminates the invocation's
@@ -252,13 +254,7 @@ fn main() {
             let _ = output.plain_stderr("controller stopped\n");
             return;
         }
-        if let Some(failure) = error.downcast_ref::<controller::GoalFailure>() {
-            if report_mode == output::OutputMode::Json {
-                let _ = output.event("failure", failure.details());
-            } else {
-                let _ = output.plain_stderr(&format!("goal failed: {failure}\n"));
-            }
-        } else if report_mode == output::OutputMode::Json {
+        if report_mode == output::OutputMode::Json {
             let _ = output.event(
                 "error",
                 serde_json::json!({"message": format!("{error:#}")}),

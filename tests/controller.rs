@@ -77,15 +77,6 @@ timeout_seconds = 5
             .and_then(|text| text.trim().parse().ok())
             .unwrap_or(0)
     }
-
-    fn failure_event(&self) -> serde_json::Value {
-        fs::read_to_string(self.dir.path().join(".goal/events.jsonl"))
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-            .find(|event| event["type"] == "failure")
-            .expect("missing terminal failure event")
-    }
 }
 
 fn command(config: &Path) -> Command {
@@ -634,76 +625,112 @@ fn worker_reported_failure_is_recorded_and_the_next_cycle_can_complete() {
 }
 
 #[test]
-fn worker_process_failure_is_terminal_and_is_not_retried() {
+fn worker_process_failure_is_recorded_and_the_controller_resenses() {
     let fixture = Fixture::new(
         COUNT_SENSOR,
-        r#"echo 1 > decider-count; printf '{"type":"run_task","task":"possibly partial"}' > "$GOAL_RESULT_PATH""#,
-        r#"n=0; test ! -f worker-count || n=$(cat worker-count); n=$((n+1)); echo "$n" > worker-count; exit 8"#,
+        r#"n=0; test ! -f decider-count || n=$(cat decider-count); n=$((n+1)); echo "$n" > decider-count; if test "$n" = 1; then r='{"type":"run_task","task":"possibly partial"}'; else grep -q 'Worker invocation failed after it may have modified external state' "$1"; r='{"type":"complete","summary":"recovered after worker process failure"}'; fi; printf '%s' "$r" > "$GOAL_RESULT_PATH""#,
+        r#"echo 1 > worker-count; exit 8"#,
     );
     let output = fixture.run();
-    assert!(!output.status.success());
-    assert_eq!(fixture.count("sensor-count"), 1);
-    assert_eq!(fixture.count("decider-count"), 1);
-    assert_eq!(fixture.count("worker-count"), 1);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("worker reported failure"), "{stderr}");
-    assert!(stderr.contains("process exited unsuccessfully"), "{stderr}");
-    let failure = fixture.failure_event();
-    assert_eq!(failure["details"]["source"], "worker");
     assert!(
-        failure["details"]["reason"]
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fixture.count("sensor-count"), 2);
+    assert_eq!(fixture.count("decider-count"), 2);
+    assert_eq!(fixture.count("worker-count"), 1);
+
+    let events = fs::read_to_string(fixture.dir.path().join(".goal/events.jsonl")).unwrap();
+    let events = events
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let failure = events
+        .iter()
+        .find(|event| event["type"] == "worker_failed")
+        .expect("missing worker failure event");
+    assert!(
+        failure["details"]["error"]
             .as_str()
             .unwrap()
             .contains("process exited unsuccessfully")
     );
-    assert!(failure["details"]["run_id"].is_string());
+    assert_eq!(failure["details"]["completion"]["type"], "failure");
+    assert_eq!(failure["details"]["recovery"], "resense");
+    assert_eq!(failure["details"]["retry_after_seconds"], 5);
+    assert!(!events.iter().any(|event| event["type"] == "failure"));
+    assert!(events.iter().any(|event| event["type"] == "complete"));
 }
 
 #[test]
-fn missing_worker_result_is_terminal_protocol_failure() {
+fn missing_worker_result_is_recorded_and_the_controller_resenses() {
     let fixture = Fixture::new(
         COUNT_SENSOR,
-        r#"echo 1 > decider-count; printf '{"type":"run_task","task":"missing result"}' > "$GOAL_RESULT_PATH""#,
+        r#"n=0; test ! -f decider-count || n=$(cat decider-count); n=$((n+1)); echo "$n" > decider-count; if test "$n" = 1; then r='{"type":"run_task","task":"missing result"}'; else r='{"type":"complete","summary":"recovered after missing result"}'; fi; printf '%s' "$r" > "$GOAL_RESULT_PATH""#,
         r#"echo 1 > worker-count; exit 0"#,
     );
     let output = fixture.run();
-    assert!(!output.status.success());
-    assert_eq!(fixture.count("sensor-count"), 1);
-    assert_eq!(fixture.count("decider-count"), 1);
-    assert_eq!(fixture.count("worker-count"), 1);
-    assert!(String::from_utf8_lossy(&output.stderr).contains("protocol failure"));
-    let failure = fixture.failure_event();
-    assert_eq!(failure["details"]["source"], "worker");
     assert!(
-        failure["details"]["reason"]
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fixture.count("sensor-count"), 2);
+    assert_eq!(fixture.count("decider-count"), 2);
+    assert_eq!(fixture.count("worker-count"), 1);
+    let events = fs::read_to_string(fixture.dir.path().join(".goal/events.jsonl")).unwrap();
+    let events = events
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let failure = events
+        .iter()
+        .find(|event| event["type"] == "worker_failed")
+        .expect("missing worker failure event");
+    assert!(
+        failure["details"]["error"]
             .as_str()
             .unwrap()
             .contains("protocol failure")
     );
-    assert!(failure["details"]["run_id"].is_string());
+    assert!(!events.iter().any(|event| event["type"] == "failure"));
+    assert!(events.iter().any(|event| event["type"] == "complete"));
 }
 
 #[test]
-fn malformed_worker_result_is_terminal_protocol_failure() {
+fn malformed_worker_result_is_recorded_and_the_controller_resenses() {
     let fixture = Fixture::new(
         COUNT_SENSOR,
-        r#"echo 1 > decider-count; printf '{"type":"run_task","task":"malformed result"}' > "$GOAL_RESULT_PATH""#,
+        r#"n=0; test ! -f decider-count || n=$(cat decider-count); n=$((n+1)); echo "$n" > decider-count; if test "$n" = 1; then r='{"type":"run_task","task":"malformed result"}'; else r='{"type":"complete","summary":"recovered after malformed result"}'; fi; printf '%s' "$r" > "$GOAL_RESULT_PATH""#,
         r#"echo 1 > worker-count; printf 'not json' > "$GOAL_RESULT_PATH""#,
     );
     let output = fixture.run();
-    assert!(!output.status.success());
-    assert_eq!(fixture.count("sensor-count"), 1);
-    assert_eq!(fixture.count("decider-count"), 1);
-    assert_eq!(fixture.count("worker-count"), 1);
-    let failure = fixture.failure_event();
-    assert_eq!(failure["details"]["source"], "worker");
     assert!(
-        failure["details"]["reason"]
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fixture.count("sensor-count"), 2);
+    assert_eq!(fixture.count("decider-count"), 2);
+    assert_eq!(fixture.count("worker-count"), 1);
+    let events = fs::read_to_string(fixture.dir.path().join(".goal/events.jsonl")).unwrap();
+    let events = events
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let failure = events
+        .iter()
+        .find(|event| event["type"] == "worker_failed")
+        .expect("missing worker failure event");
+    assert!(
+        failure["details"]["error"]
             .as_str()
             .unwrap()
             .contains("protocol failure")
     );
-    assert!(failure["details"]["run_id"].is_string());
+    assert!(!events.iter().any(|event| event["type"] == "failure"));
+    assert!(events.iter().any(|event| event["type"] == "complete"));
 }
 
 #[test]
@@ -756,23 +783,34 @@ fn decider_reported_failure_is_recorded_and_the_next_cycle_can_complete() {
 }
 
 #[test]
-fn worker_timeout_is_terminal_and_is_not_retried() {
+fn worker_timeout_is_recorded_and_the_controller_resenses() {
     let fixture = Fixture::new(
         COUNT_SENSOR,
-        r#"echo 1 > decider-count; printf '{"type":"run_task","task":"times out"}' > "$GOAL_RESULT_PATH""#,
+        r#"n=0; test ! -f decider-count || n=$(cat decider-count); n=$((n+1)); echo "$n" > decider-count; if test "$n" = 1; then r='{"type":"run_task","task":"times out"}'; else r='{"type":"complete","summary":"recovered after worker timeout"}'; fi; printf '%s' "$r" > "$GOAL_RESULT_PATH""#,
         r#"echo 1 > worker-count; sleep 10"#,
     );
     fixture.set_timeout("worker", 3);
     let output = fixture.run();
-    assert!(!output.status.success());
-    assert_eq!(fixture.count("sensor-count"), 1);
-    assert_eq!(fixture.count("decider-count"), 1);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fixture.count("sensor-count"), 2);
+    assert_eq!(fixture.count("decider-count"), 2);
     assert_eq!(fixture.count("worker-count"), 1);
-    assert!(String::from_utf8_lossy(&output.stderr).contains("process timed out"));
-    let failure = fixture.failure_event();
-    assert_eq!(failure["details"]["source"], "worker");
-    assert_eq!(failure["details"]["reason"], "process timed out");
-    assert!(failure["details"]["run_id"].is_string());
+    let events = fs::read_to_string(fixture.dir.path().join(".goal/events.jsonl")).unwrap();
+    let events = events
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let failure = events
+        .iter()
+        .find(|event| event["type"] == "worker_failed")
+        .expect("missing worker failure event");
+    assert_eq!(failure["details"]["error"], "process timed out");
+    assert!(!events.iter().any(|event| event["type"] == "failure"));
+    assert!(events.iter().any(|event| event["type"] == "complete"));
 }
 
 #[test]

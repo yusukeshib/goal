@@ -50,7 +50,7 @@ timeout_seconds = 1800
 - The worker returns `done` or `failure` in `GOAL_RESULT_PATH`.
 - Deciders and workers cannot request human input or approval.
 - Sensor and decider failures are recorded and retried after re-sensing.
-- Worker process, timeout, or protocol failures are terminal; a valid worker `failure` is task-local and the loop continues.
+- Worker process, timeout, and protocol failures are recorded, exponentially backed off, and followed by a fresh observation. The failure context warns the next decider not to blindly repeat a task that may have partially changed external state. A valid logical worker `failure` follows the same re-observation path without infrastructure backoff.
 
 Each invocation receives `GOAL_RUN_ID`, `GOAL_PROMPT_PATH`, `GOAL_RESULT_PATH`, and `GOAL_PROJECT_DIR`. `{prompt}` is replaced with the prompt path; without it, the prompt is piped to stdin.
 
