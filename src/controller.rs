@@ -21,6 +21,28 @@ use crate::{
     state::{ControllerLock, PersistentState, StateStore, unix_timestamp},
 };
 
+const SENSOR_FAILURE_INITIAL_BACKOFF_SECONDS: u64 = 5;
+const SENSOR_FAILURE_MAX_BACKOFF_SECONDS: u64 = 60;
+
+#[derive(Default)]
+struct SensorFailureBackoff {
+    consecutive_failures: u32,
+}
+
+impl SensorFailureBackoff {
+    fn next_delay(&mut self) -> u64 {
+        let exponent = self.consecutive_failures.min(4);
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        SENSOR_FAILURE_INITIAL_BACKOFF_SECONDS
+            .saturating_mul(1_u64 << exponent)
+            .min(SENSOR_FAILURE_MAX_BACKOFF_SECONDS)
+    }
+
+    fn reset(&mut self) {
+        self.consecutive_failures = 0;
+    }
+}
+
 #[derive(Debug)]
 pub struct GoalFailure {
     source: String,
@@ -86,6 +108,8 @@ impl Controller {
     }
 
     pub fn run(mut self) -> Result<()> {
+        let mut sensor_failure_backoff = SensorFailureBackoff::default();
+
         loop {
             self.ensure_running()?;
             let cycle_id = self.begin_cycle()?;
@@ -96,6 +120,7 @@ impl Controller {
             let phase_started = Instant::now();
             let observation = match self.runner.run_sensor(&self.loaded.config.sensor) {
                 Ok((observation, artifacts)) => {
+                    sensor_failure_backoff.reset();
                     artifacts.finish(RunOutcome::Success, None, Some("observation"), None)?;
                     let details = serde_json::json!({
                         "run_id": artifacts.id,
@@ -114,12 +139,19 @@ impl Controller {
                     finish_run_error(artifacts.as_deref(), &error)?;
                     let run_id = artifacts.as_ref().map(|artifact| artifact.id.clone());
                     let reason = error.to_string();
-                    self.record_run_error("sense_failed", &error, run_id.as_deref())?;
-                    self.output.event(
-                        "sense_failed",
-                        serde_json::json!({"run_id": run_id, "error": reason}),
-                    )?;
-                    self.sleep(self.loaded.config.interval_seconds.max(1))?;
+                    let retry_after_seconds = self
+                        .loaded
+                        .config
+                        .interval_seconds
+                        .max(sensor_failure_backoff.next_delay());
+                    let details = serde_json::json!({
+                        "run_id": run_id,
+                        "error": reason,
+                        "retry_after_seconds": retry_after_seconds,
+                    });
+                    self.store.event("sense_failed", details.clone())?;
+                    self.output.event("sense_failed", details)?;
+                    self.sleep(retry_after_seconds)?;
                     continue;
                 }
             };
@@ -381,11 +413,34 @@ fn cap_wait(requested: u64, maximum: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::cap_wait;
+    use super::{SensorFailureBackoff, cap_wait};
 
     #[test]
     fn wait_duration_is_capped() {
         assert_eq!(cap_wait(120, 30), 30);
         assert_eq!(cap_wait(10, 30), 10);
+    }
+
+    #[test]
+    fn sensor_failure_backoff_grows_and_caps() {
+        let mut backoff = SensorFailureBackoff::default();
+
+        assert_eq!(backoff.next_delay(), 5);
+        assert_eq!(backoff.next_delay(), 10);
+        assert_eq!(backoff.next_delay(), 20);
+        assert_eq!(backoff.next_delay(), 40);
+        assert_eq!(backoff.next_delay(), 60);
+        assert_eq!(backoff.next_delay(), 60);
+    }
+
+    #[test]
+    fn sensor_failure_backoff_resets_after_success() {
+        let mut backoff = SensorFailureBackoff::default();
+        assert_eq!(backoff.next_delay(), 5);
+        assert_eq!(backoff.next_delay(), 10);
+
+        backoff.reset();
+
+        assert_eq!(backoff.next_delay(), 5);
     }
 }

@@ -136,8 +136,9 @@ DECIDER AND WORKER CONTRACT
   its assigned task, writes one completion, and exits. A worker's logical
   failure is task-local: it is recorded, followed by a fresh observation, and
   passed to the next decider so other work can continue. Sensor and decider
-  failures are recorded, followed by a short backoff and a fresh observation;
-  retrying is safe because both roles are read-only. A decider's logical failure
+  failures are recorded and followed by a fresh observation. Sensor failures use
+  exponential backoff capped at 60 seconds; retrying is safe because both roles
+  are read-only. A decider's logical failure
   marks that decision run as failed without terminating the controller. Worker
   process, timeout, and protocol failures are terminal because the worker may
   have modified external state. A wait action's capped retry_after_seconds is
