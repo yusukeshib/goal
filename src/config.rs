@@ -32,7 +32,6 @@ fn default_max_wait() -> u64 {
 #[derive(Debug, Clone)]
 pub struct LoadedConfig {
     pub config: Config,
-    pub config_path: PathBuf,
     pub project_dir: PathBuf,
     pub goal: String,
 }
@@ -70,7 +69,6 @@ impl LoadedConfig {
         }
         Ok(Self {
             config,
-            config_path,
             project_dir,
             goal,
         })
@@ -127,11 +125,9 @@ timeout_seconds = 1
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("goal.toml"), valid()).unwrap();
         fs::write(dir.path().join("GOAL.md"), "Ship the feature").unwrap();
-        let expected_config = fs::canonicalize(dir.path().join("goal.toml")).unwrap();
         for path in [dir.path(), &dir.path().join("goal.toml")] {
             let loaded = LoadedConfig::load(path).unwrap();
             assert_eq!(loaded.goal, "Ship the feature");
-            assert_eq!(loaded.config_path, expected_config);
             assert_eq!(loaded.project_dir, fs::canonicalize(dir.path()).unwrap());
         }
     }
