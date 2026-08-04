@@ -119,7 +119,8 @@ impl Controller {
                         "sense_failed",
                         serde_json::json!({"run_id": run_id, "error": reason}),
                     )?;
-                    return self.terminal_failure("sensor", reason, run_id);
+                    self.sleep(self.loaded.config.interval_seconds.max(1))?;
+                    continue;
                 }
             };
 

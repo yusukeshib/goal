@@ -130,11 +130,12 @@ DECIDER AND WORKER CONTRACT
   its assigned task, writes one completion, and exits. A worker's logical
   failure is task-local: it is recorded, followed by a fresh observation, and
   passed to the next decider so other work can continue. A decider's logical
-  failure is goal-wide and terminal. A decider protocol failure is recorded,
-  followed by a short backoff and a fresh observation because the decider is
-  read-only. Sensor failures and decider process failures cause the controller
-  to exit non-zero. Worker process, timeout, and protocol failures are also
-  terminal because the worker may have modified external state.
+  failure is goal-wide and terminal. Sensor failures are recorded, followed by
+  a short backoff and a fresh observation so transient observation failures do
+  not stop the goal. A decider protocol failure is retried the same way because
+  the decider is read-only. Decider process failures cause the controller to
+  exit non-zero. Worker process, timeout, and protocol failures are also terminal
+  because the worker may have modified external state.
 
 FAILURE ANALYSIS
   Runtime data lives under .goal/ beside the config file. Successful and failed

@@ -30,9 +30,10 @@ Confirmed design
 8. If the decider determines that the goal as a whole cannot progress, or a
    worker cannot complete its assigned task, it returns `failure` with a
    concrete reason.
-9. A decider protocol failure is recorded and retried after a short backoff and
-   fresh observation because the decider is read-only. Sensor failures, decider
-   process failures, and worker process, timeout, or protocol failures are
+9. A sensor failure is recorded and retried after a short backoff and fresh
+   observation so transient observation failures do not stop the goal. A decider
+   protocol failure is retried the same way because the decider is read-only.
+   Decider process failures and worker process, timeout, or protocol failures are
    terminal. A logical worker `failure` is task-local instead: the controller
    records it, senses again, and lets the next decider select other work.
 10. No daemon, child PTY, worker pool, parallel workers, scheduler, workflow DAG,
@@ -109,8 +110,9 @@ Process and logical outcomes are distinct:
 
 * exit 0 plus a valid result: valid outcome;
 * non-zero exit: process failure;
-* exit 0 without a valid result: protocol failure (a decider is retried after a
-  short backoff and fresh observation; a worker failure is terminal);
+* exit 0 without a valid result: protocol failure (a sensor or decider is
+  retried after a short backoff and fresh observation; a worker failure is
+  terminal);
 * timeout: process failure terminated by the controller.
 
 Worker contract
@@ -220,7 +222,7 @@ Integration tests cover:
 
 * sense -> run task -> done -> re-sense -> complete;
 * finite completion and continuous waiting;
-* sensor failure exits non-zero without invoking the decider;
+* sensor process failure is recorded and a later cycle can complete the goal;
 * decider process failure exits non-zero without acting or re-sensing;
 * decider `failure` exits non-zero without a worker;
 * worker `failure` is recorded and a later cycle can complete the goal;

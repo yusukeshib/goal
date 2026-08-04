@@ -428,22 +428,53 @@ fn stats_reports_metadata_from_goal_dir_or_current_directory() {
 }
 
 #[test]
-fn sensor_timeout_is_terminal_and_never_calls_decider() {
+fn sensor_process_failure_is_recorded_and_retried_after_resensing() {
     let fixture = Fixture::new(
-        r#"echo 1 > sensor-count; sleep 10"#,
-        r#"echo 1 > decider-count"#,
+        r#"n=0; test ! -f sensor-count || n=$(cat sensor-count); n=$((n+1)); echo "$n" > sensor-count; if test "$n" = 1; then echo 'transient sensor failure' >&2; exit 1; fi; printf '{"sense":%s}\n' "$n""#,
+        r#"echo 1 > decider-count; printf '{"type":"complete","summary":"recovered after sensor failure"}' > "$GOAL_RESULT_PATH""#,
         r#"echo 1 > worker-count"#,
     );
-    fixture.set_timeout("sensor", 3);
     let output = fixture.run();
-    assert!(!output.status.success());
-    assert_eq!(fixture.count("sensor-count"), 1);
-    assert_eq!(fixture.count("decider-count"), 0);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fixture.count("sensor-count"), 2);
+    assert_eq!(fixture.count("decider-count"), 1);
     assert_eq!(fixture.count("worker-count"), 0);
-    let failure = fixture.failure_event();
-    assert_eq!(failure["details"]["source"], "sensor");
-    assert_eq!(failure["details"]["reason"], "process timed out");
+
+    let events = fs::read_to_string(fixture.dir.path().join(".goal/events.jsonl")).unwrap();
+    let events = events
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let failure = events
+        .iter()
+        .find(|event| event["type"] == "sense_failed")
+        .expect("missing sensor failure event");
+    assert!(
+        failure["details"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("process exited unsuccessfully")
+    );
     assert!(failure["details"]["run_id"].is_string());
+    assert!(!events.iter().any(|event| event["type"] == "failure"));
+    assert!(events.iter().any(|event| event["type"] == "complete"));
+
+    let stats = Command::new(env!("CARGO_BIN_EXE_goal"))
+        .args(["stats", "--output", "json"])
+        .current_dir(fixture.dir.path())
+        .env_remove("GOAL_DIR")
+        .output()
+        .unwrap();
+    assert!(stats.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&stats.stdout).unwrap();
+    assert_eq!(report["recorded_runs"], 3);
+    assert_eq!(report["outcomes"]["success"], 2);
+    assert_eq!(report["outcomes"]["failure"], 1);
+    assert_eq!(report["failures_by_kind"]["process"], 1);
 }
 
 #[test]
