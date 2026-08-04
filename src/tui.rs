@@ -244,9 +244,11 @@ struct UiState {
     phase_started_at: Option<u64>,
     cycle: String,
     project: String,
-    hit_regions: Vec<(u16, usize)>,
-    scrollbar: Option<ScrollbarGeometry>,
-    scrollbar_drag_offset: Option<usize>,
+    hit_regions: Vec<(Rect, usize)>,
+    activity_scrollbar: Option<ScrollbarGeometry>,
+    activity_scrollbar_drag_offset: Option<usize>,
+    detail_scrollbar: Option<ScrollbarGeometry>,
+    detail_scrollbar_drag_offset: Option<usize>,
 }
 
 impl UiState {
@@ -262,7 +264,7 @@ impl UiState {
     }
 
     fn push(&mut self, activity: Activity) {
-        let stick_to_end = self.auto_follow || self.scrollbar_is_at_bottom();
+        let stick_to_end = self.auto_follow || self.activity_scrollbar_is_at_bottom();
         let keep_selection = self.selected.is_some();
         if let Activity::Controller { kind, details, .. } = &activity {
             match kind.as_str() {
@@ -359,8 +361,9 @@ impl UiState {
             .saturating_sub(self.viewport_height as usize)
     }
 
-    fn scrollbar_is_at_bottom(&self) -> bool {
-        self.scrollbar.is_some_and(|_| self.top == self.max_top())
+    fn activity_scrollbar_is_at_bottom(&self) -> bool {
+        self.activity_scrollbar
+            .is_some_and(|_| self.top == self.max_top())
     }
 
     fn set_scroll_top(&mut self, top: usize) {
@@ -417,9 +420,14 @@ impl UiState {
         self.set_scroll_top(top);
     }
 
+    fn set_detail_scroll_top(&mut self, top: usize) {
+        self.detail_top = top.min(self.detail_max_top);
+    }
+
     fn scroll_detail(&mut self, amount: isize) {
-        self.detail_top =
+        let top =
             (self.detail_top as isize + amount).clamp(0, self.detail_max_top as isize) as usize;
+        self.set_detail_scroll_top(top);
     }
 
     fn mouse_is_over_detail(&self, column: u16, row: u16) -> bool {
@@ -663,12 +671,41 @@ fn handle_event(event: Event, state: &mut UiState, cancelled: &AtomicBool) -> Re
             MouseEventKind::ScrollUp => state.scroll(-1),
             MouseEventKind::ScrollDown => state.scroll(1),
             MouseEventKind::Down(MouseButton::Left) => {
+                state.activity_scrollbar_drag_offset = None;
+                state.detail_scrollbar_drag_offset = None;
                 if let Some(scrollbar) = state
-                    .scrollbar
+                    .detail_scrollbar
                     .filter(|scrollbar| scrollbar.contains(mouse.column, mouse.row))
                 {
                     if scrollbar.thumb_contains(mouse.row) {
-                        state.scrollbar_drag_offset = Some(
+                        state.detail_scrollbar_drag_offset = Some(
+                            scrollbar
+                                .relative_row(mouse.row)
+                                .saturating_sub(scrollbar.thumb_start),
+                        );
+                    } else {
+                        state.set_detail_scroll_top(scrollbar.top_for_click(mouse.row));
+                        if let Some(updated) = ScrollbarGeometry::new(
+                            scrollbar.area,
+                            scrollbar.content_height,
+                            scrollbar.viewport_height,
+                            state.detail_top,
+                        ) {
+                            state.detail_scrollbar_drag_offset = Some(
+                                updated
+                                    .relative_row(mouse.row)
+                                    .saturating_sub(updated.thumb_start)
+                                    .min(updated.thumb_length - 1),
+                            );
+                            state.detail_scrollbar = Some(updated);
+                        }
+                    }
+                } else if let Some(scrollbar) = state
+                    .activity_scrollbar
+                    .filter(|scrollbar| scrollbar.contains(mouse.column, mouse.row))
+                {
+                    if scrollbar.thumb_contains(mouse.row) {
+                        state.activity_scrollbar_drag_offset = Some(
                             scrollbar
                                 .relative_row(mouse.row)
                                 .saturating_sub(scrollbar.thumb_start),
@@ -681,37 +718,45 @@ fn handle_event(event: Event, state: &mut UiState, cancelled: &AtomicBool) -> Re
                             scrollbar.viewport_height,
                             state.top,
                         ) {
-                            state.scrollbar_drag_offset = Some(
+                            state.activity_scrollbar_drag_offset = Some(
                                 updated
                                     .relative_row(mouse.row)
                                     .saturating_sub(updated.thumb_start)
                                     .min(updated.thumb_length - 1),
                             );
-                            state.scrollbar = Some(updated);
+                            state.activity_scrollbar = Some(updated);
                         }
                     }
-                } else {
-                    state.scrollbar_drag_offset = None;
-                    if let Some((_, index)) =
-                        state.hit_regions.iter().find(|(row, _)| *row == mouse.row)
-                    {
-                        let index = *index;
-                        state.select(index);
-                        state.auto_follow = index + 1 == state.cards.len();
-                        if state.auto_follow {
-                            state.unseen = 0;
-                        }
+                } else if let Some((_, index)) = state.hit_regions.iter().find(|(area, _)| {
+                    mouse.column >= area.x
+                        && mouse.column < area.right()
+                        && mouse.row >= area.y
+                        && mouse.row < area.bottom()
+                }) {
+                    let index = *index;
+                    state.select(index);
+                    state.auto_follow = index + 1 == state.cards.len();
+                    if state.auto_follow {
+                        state.unseen = 0;
                     }
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 if let (Some(scrollbar), Some(grab_offset)) =
-                    (state.scrollbar, state.scrollbar_drag_offset)
+                    (state.detail_scrollbar, state.detail_scrollbar_drag_offset)
                 {
+                    state.set_detail_scroll_top(scrollbar.top_for_drag(mouse.row, grab_offset));
+                } else if let (Some(scrollbar), Some(grab_offset)) = (
+                    state.activity_scrollbar,
+                    state.activity_scrollbar_drag_offset,
+                ) {
                     state.set_scroll_top(scrollbar.top_for_drag(mouse.row, grab_offset));
                 }
             }
-            MouseEventKind::Up(MouseButton::Left) => state.scrollbar_drag_offset = None,
+            MouseEventKind::Up(MouseButton::Left) => {
+                state.activity_scrollbar_drag_offset = None;
+                state.detail_scrollbar_drag_offset = None;
+            }
             _ => {}
         },
         _ => {}
@@ -763,6 +808,8 @@ fn render(frame: &mut Frame<'_>, state: &mut UiState) {
         render_detail_pane(frame, panes[1], state);
     } else {
         state.detail_area = None;
+        state.detail_scrollbar = None;
+        state.detail_scrollbar_drag_offset = None;
         render_activity_pane(frame, body, state);
     }
 
@@ -811,7 +858,9 @@ fn render_activity_pane(frame: &mut Frame<'_>, area: Rect, state: &mut UiState) 
         .enumerate()
     {
         let row = content.y + visible_row as u16;
-        state.hit_regions.push((row, index));
+        state
+            .hit_regions
+            .push((Rect::new(content.x, row, content.width, 1), index));
         let selected = state.selected == Some(index);
         let (timestamp, label, summary, _) = card_parts(&card.activity);
         let style = Style::default()
@@ -828,13 +877,13 @@ fn render_activity_pane(frame: &mut Frame<'_>, area: Rect, state: &mut UiState) 
         );
     }
 
-    state.scrollbar = ScrollbarGeometry::new(
+    state.activity_scrollbar = ScrollbarGeometry::new(
         scrollbar_area,
         content_height,
         content.height as usize,
         start,
     );
-    if state.scrollbar.is_some() {
+    if state.activity_scrollbar.is_some() {
         let mut scrollbar_state = ScrollbarState::new(state.max_top() + 1)
             .position(start)
             .viewport_content_length(content.height as usize);
@@ -847,7 +896,7 @@ fn render_activity_pane(frame: &mut Frame<'_>, area: Rect, state: &mut UiState) 
             &mut scrollbar_state,
         );
     } else {
-        state.scrollbar_drag_offset = None;
+        state.activity_scrollbar_drag_offset = None;
     }
 }
 
@@ -884,8 +933,14 @@ fn render_detail_pane(frame: &mut Frame<'_>, area: Rect, state: &mut UiState) {
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(Text::from(visible)), content);
 
-    if state.detail_max_top > 0 && scrollbar_area.height > 0 {
-        let mut scrollbar_state = ScrollbarState::new(line_count)
+    state.detail_scrollbar = ScrollbarGeometry::new(
+        scrollbar_area,
+        line_count,
+        content.height as usize,
+        state.detail_top,
+    );
+    if state.detail_scrollbar.is_some() {
+        let mut scrollbar_state = ScrollbarState::new(state.detail_max_top + 1)
             .position(state.detail_top)
             .viewport_content_length(content.height as usize);
         frame.render_stateful_widget(
@@ -896,6 +951,8 @@ fn render_detail_pane(frame: &mut Frame<'_>, area: Rect, state: &mut UiState) {
             scrollbar_area,
             &mut scrollbar_state,
         );
+    } else {
+        state.detail_scrollbar_drag_offset = None;
     }
 }
 
@@ -1224,7 +1281,7 @@ mod tests {
         state.push(notice("one"));
         state.push(notice("two"));
         state.home();
-        state.hit_regions = vec![(4, 1)];
+        state.hit_regions = vec![(Rect::new(0, 4, 10, 1), 1)];
         handle_event(
             Event::Mouse(MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
@@ -1274,6 +1331,61 @@ mod tests {
     }
 
     #[test]
+    fn detail_scrollbar_uses_detail_state_without_selecting_activity_rows() {
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        let mut state = UiState::new();
+        for index in 0..30 {
+            state.push(notice(&format!("activity {index}")));
+        }
+        state.select(5);
+        state.auto_follow = false;
+        state.detail = Some(SelectedDetail {
+            index: 5,
+            text: (0..40)
+                .map(|index| format!("detail line {index}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        });
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+
+        let cancelled = AtomicBool::new(false);
+        let activity_top = state.top;
+        let scrollbar = state.detail_scrollbar.unwrap();
+        let bottom_row = scrollbar.area.bottom() - 1;
+        handle_event(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                scrollbar.area.x,
+                bottom_row,
+            ),
+            &mut state,
+            &cancelled,
+        )
+        .unwrap();
+
+        assert_eq!(state.selected, Some(5));
+        assert_eq!(state.top, activity_top);
+        assert_eq!(state.detail_top, state.detail_max_top);
+        assert!(state.detail_scrollbar_drag_offset.is_some());
+
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        let scrollbar = state.detail_scrollbar.unwrap();
+        assert_eq!(
+            scrollbar.thumb_start + scrollbar.thumb_length,
+            scrollbar.area.height as usize
+        );
+        assert_eq!(
+            terminal
+                .backend()
+                .buffer()
+                .cell((scrollbar.area.x, scrollbar.area.bottom() - 1))
+                .unwrap()
+                .symbol(),
+            "█"
+        );
+    }
+
+    #[test]
     fn artifact_loader_reads_only_range() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         write!(file, "prefix{{\"a\":1}}suffix").unwrap();
@@ -1319,13 +1431,13 @@ mod tests {
         state.home();
 
         terminal.draw(|frame| render(frame, &mut state)).unwrap();
-        let top = state.scrollbar.unwrap().thumb_start;
+        let top = state.activity_scrollbar.unwrap().thumb_start;
         state.scroll(12);
         terminal.draw(|frame| render(frame, &mut state)).unwrap();
-        let middle = state.scrollbar.unwrap().thumb_start;
+        let middle = state.activity_scrollbar.unwrap().thumb_start;
         state.scroll(100);
         terminal.draw(|frame| render(frame, &mut state)).unwrap();
-        let scrollbar = state.scrollbar.unwrap();
+        let scrollbar = state.activity_scrollbar.unwrap();
         assert!(top < middle, "top={top}, middle={middle}");
         assert!(middle < scrollbar.thumb_start);
         assert_eq!(
@@ -1346,7 +1458,7 @@ mod tests {
         state.home();
         terminal.draw(|frame| render(frame, &mut state)).unwrap();
         let cancelled = AtomicBool::new(false);
-        let scrollbar = state.scrollbar.unwrap();
+        let scrollbar = state.activity_scrollbar.unwrap();
         let top_row = scrollbar.area.y;
         let bottom_row = scrollbar.area.y + scrollbar.area.height - 1;
         let column = scrollbar.area.x;
@@ -1399,7 +1511,7 @@ mod tests {
         .unwrap();
         assert_eq!(state.top, state.max_top());
         assert!(state.auto_follow);
-        assert!(state.scrollbar_drag_offset.is_none());
+        assert!(state.activity_scrollbar_drag_offset.is_none());
 
         terminal.draw(|frame| render(frame, &mut state)).unwrap();
         handle_event(
@@ -1429,7 +1541,7 @@ mod tests {
         state.home();
         terminal.draw(|frame| render(frame, &mut state)).unwrap();
         let cancelled = AtomicBool::new(false);
-        let scrollbar = state.scrollbar.unwrap();
+        let scrollbar = state.activity_scrollbar.unwrap();
 
         handle_event(
             mouse(
@@ -1444,7 +1556,7 @@ mod tests {
         let backend = TestBackend::new(20, 20);
         terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, &mut state)).unwrap();
-        assert_eq!(state.scrollbar.unwrap().area.width, 1);
+        assert_eq!(state.activity_scrollbar.unwrap().area.width, 1);
 
         handle_event(
             mouse(MouseEventKind::Drag(MouseButton::Left), 0, 100),
@@ -1460,7 +1572,7 @@ mod tests {
             &cancelled,
         )
         .unwrap();
-        assert!(state.scrollbar_drag_offset.is_none());
+        assert!(state.activity_scrollbar_drag_offset.is_none());
     }
 
     #[test]
@@ -1470,7 +1582,7 @@ mod tests {
         let mut state = UiState::new();
         state.push(notice("one"));
         terminal.draw(|frame| render(frame, &mut state)).unwrap();
-        assert!(state.scrollbar.is_none());
+        assert!(state.activity_scrollbar.is_none());
 
         let backend = TestBackend::new(1, 7);
         let mut terminal = Terminal::new(backend).unwrap();
