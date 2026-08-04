@@ -148,11 +148,8 @@ impl Controller {
                         "decider_failed",
                         serde_json::json!({"run_id": run_id, "error": reason}),
                     )?;
-                    if matches!(error, RunError::Protocol(_)) {
-                        self.sleep(self.loaded.config.interval_seconds.max(1))?;
-                        continue;
-                    }
-                    return self.terminal_failure("decider", reason, run_id);
+                    self.sleep(self.loaded.config.interval_seconds.max(1))?;
+                    continue;
                 }
             };
             if let Err(error) = action.validate() {
@@ -309,8 +306,9 @@ impl Controller {
                         .plain_stdout(&format!("goal complete: {summary}\n"))?;
                     return Ok(());
                 }
-                DeciderAction::Failure { reason } => {
-                    return self.terminal_failure("decider", reason, Some(decider_run_id));
+                DeciderAction::Failure { .. } => {
+                    self.sleep(self.loaded.config.interval_seconds.max(1))?;
+                    continue;
                 }
             }
 

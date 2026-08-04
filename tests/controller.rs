@@ -478,22 +478,40 @@ fn sensor_process_failure_is_recorded_and_retried_after_resensing() {
 }
 
 #[test]
-fn decider_timeout_is_terminal_and_never_calls_worker() {
+fn decider_process_failure_is_recorded_and_retried_after_resensing() {
     let fixture = Fixture::new(
         COUNT_SENSOR,
-        r#"echo 1 > decider-count; sleep 10"#,
+        r#"n=0; test ! -f decider-count || n=$(cat decider-count); n=$((n+1)); echo "$n" > decider-count; if test "$n" = 1; then exit 1; fi; printf '{"type":"complete","summary":"recovered after decider process failure"}' > "$GOAL_RESULT_PATH""#,
         r#"echo 1 > worker-count"#,
     );
-    fixture.set_timeout("decider", 3);
     let output = fixture.run();
-    assert!(!output.status.success());
-    assert_eq!(fixture.count("sensor-count"), 1);
-    assert_eq!(fixture.count("decider-count"), 1);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fixture.count("sensor-count"), 2);
+    assert_eq!(fixture.count("decider-count"), 2);
     assert_eq!(fixture.count("worker-count"), 0);
-    let failure = fixture.failure_event();
-    assert_eq!(failure["details"]["source"], "decider");
-    assert_eq!(failure["details"]["reason"], "process timed out");
+
+    let events = fs::read_to_string(fixture.dir.path().join(".goal/events.jsonl")).unwrap();
+    let events = events
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let failure = events
+        .iter()
+        .find(|event| event["type"] == "decider_failed")
+        .expect("missing decider failure event");
+    assert!(
+        failure["details"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("process exited unsuccessfully")
+    );
     assert!(failure["details"]["run_id"].is_string());
+    assert!(!events.iter().any(|event| event["type"] == "failure"));
+    assert!(events.iter().any(|event| event["type"] == "complete"));
 }
 
 #[test]
@@ -655,30 +673,52 @@ fn malformed_worker_result_is_terminal_protocol_failure() {
 }
 
 #[test]
-fn decider_reported_failure_exits_without_starting_worker() {
+fn decider_reported_failure_is_recorded_and_the_next_cycle_can_complete() {
     let fixture = Fixture::new(
         COUNT_SENSOR,
-        r#"echo 1 > decider-count; printf '{"type":"failure","reason":"goal requires unavailable authority"}' > "$GOAL_RESULT_PATH""#,
+        r#"n=0; test ! -f decider-count || n=$(cat decider-count); n=$((n+1)); echo "$n" > decider-count; if test "$n" = 1; then r='{"type":"failure","reason":"goal requires unavailable authority"}'; else r='{"type":"complete","summary":"recovered after decider failure"}'; fi; printf '%s' "$r" > "$GOAL_RESULT_PATH""#,
         r#"echo 1 > worker-count"#,
     );
     let output = fixture.run();
-    assert!(!output.status.success());
-    assert_eq!(fixture.count("sensor-count"), 1);
-    assert_eq!(fixture.count("decider-count"), 1);
-    assert_eq!(fixture.count("worker-count"), 0);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("decider reported failure"), "{stderr}");
     assert!(
-        stderr.contains("goal requires unavailable authority"),
-        "{stderr}"
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    let failure = fixture.failure_event();
-    assert_eq!(failure["details"]["source"], "decider");
+    assert_eq!(fixture.count("sensor-count"), 2);
+    assert_eq!(fixture.count("decider-count"), 2);
+    assert_eq!(fixture.count("worker-count"), 0);
+
+    let events = fs::read_to_string(fixture.dir.path().join(".goal/events.jsonl")).unwrap();
+    let events = events
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let failure = events
+        .iter()
+        .find(|event| {
+            event["type"] == "decision" && event["details"]["action"]["type"] == "failure"
+        })
+        .expect("missing decider failure decision");
     assert_eq!(
-        failure["details"]["reason"],
+        failure["details"]["action"]["reason"],
         "goal requires unavailable authority"
     );
-    assert!(failure["details"]["run_id"].is_string());
+    assert!(!events.iter().any(|event| event["type"] == "failure"));
+    assert!(events.iter().any(|event| event["type"] == "complete"));
+
+    let stats = Command::new(env!("CARGO_BIN_EXE_goal"))
+        .args(["stats", "--output", "json"])
+        .current_dir(fixture.dir.path())
+        .env_remove("GOAL_DIR")
+        .output()
+        .unwrap();
+    assert!(stats.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&stats.stdout).unwrap();
+    assert_eq!(report["recorded_runs"], 4);
+    assert_eq!(report["outcomes"]["success"], 3);
+    assert_eq!(report["outcomes"]["failure"], 1);
+    assert_eq!(report["failures_by_kind"]["logical"], 1);
 }
 
 #[test]
@@ -702,10 +742,10 @@ fn worker_timeout_is_terminal_and_is_not_retried() {
 }
 
 #[test]
-fn json_failure_output_is_structured_and_keeps_the_reason() {
+fn json_decider_failure_output_is_structured_and_the_next_cycle_can_complete() {
     let fixture = Fixture::new(
         COUNT_SENSOR,
-        r#"printf '{"type":"failure","reason":"automatic authority is unavailable"}' > "$GOAL_RESULT_PATH""#,
+        r#"n=0; test ! -f decider-count || n=$(cat decider-count); n=$((n+1)); echo "$n" > decider-count; if test "$n" = 1; then r='{"type":"failure","reason":"automatic authority is unavailable"}'; else r='{"type":"complete","summary":"recovered"}'; fi; printf '%s' "$r" > "$GOAL_RESULT_PATH""#,
         r#"exit 99"#,
     );
     let output = Command::new(env!("CARGO_BIN_EXE_goal"))
@@ -714,7 +754,7 @@ fn json_failure_output_is_structured_and_keeps_the_reason() {
         .env_remove("GOAL_DIR")
         .output()
         .unwrap();
-    assert!(!output.status.success());
+    assert!(output.status.success());
     assert!(output.stderr.is_empty());
 
     let events: Vec<serde_json::Value> = String::from_utf8(output.stdout)
@@ -724,14 +764,16 @@ fn json_failure_output_is_structured_and_keeps_the_reason() {
         .collect();
     let failure = events
         .iter()
-        .find(|event| event["type"] == "failure")
+        .find(|event| {
+            event["type"] == "decision" && event["details"]["action"]["type"] == "failure"
+        })
         .unwrap();
-    assert_eq!(failure["details"]["source"], "decider");
     assert_eq!(
-        failure["details"]["reason"],
+        failure["details"]["action"]["reason"],
         "automatic authority is unavailable"
     );
-    assert!(failure["details"]["run_id"].is_string());
+    assert!(!events.iter().any(|event| event["type"] == "failure"));
+    assert!(events.iter().any(|event| event["type"] == "complete"));
     assert!(!events.iter().any(|event| event["type"] == "error"));
 }
 

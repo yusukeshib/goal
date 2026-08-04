@@ -12,8 +12,8 @@ Valid actions use a `type` tag:
 - {{"type":"run_task","task":"one bounded task"}}
 - {{"type":"wait","reason":"why automatic progress is temporarily unavailable","retry_after_seconds":60}}
 - {{"type":"complete","summary":"why the finite goal is satisfied"}}
-- {{"type":"failure","reason":"specific reason the goal cannot be pursued automatically"}}
-Use failure only when the goal as a whole cannot be pursued automatically. A prior worker failure is task-local: do not repeat the same task unless the observation materially changed; choose other safe work when available, or wait if a world condition may change. Include concrete evidence useful for diagnosing and improving future runs.
+- {{"type":"failure","reason":"specific reason this decision cycle cannot make automatic progress"}}
+Use failure when this cycle cannot make safe automatic progress and waiting is not the more accurate action. The failed decider run is recorded, then the controller backs off and obtains a fresh observation. A prior worker failure is task-local: do not repeat the same task unless the observation materially changed; choose other safe work when available, or wait if a world condition may change. Include concrete evidence useful for diagnosing and improving future runs.
 Do not write protocol JSON to stdout.
 
 GOAL:

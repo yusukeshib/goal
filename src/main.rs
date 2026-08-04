@@ -100,7 +100,8 @@ GOAL SEMANTICS
 SENSOR CONTRACT
   The sensor must be read-only and emit exactly one JSON value on stdout.
   Stderr is diagnostic. Non-zero exit, timeout, or invalid JSON prevents the
-  decider from running, records a terminal failure, and exits non-zero.
+  decider from running in that cycle, records the failed sensor run, and causes
+  a short backoff followed by a fresh observation.
 
 DECIDER AND WORKER CONTRACT
   Both are non-TUI child processes without a PTY. Every invocation receives:
@@ -119,7 +120,7 @@ DECIDER AND WORKER CONTRACT
     run_task      {"type":"run_task","task":"one bounded task"}
     wait          {"type":"wait","reason":"...","retry_after_seconds":60}
     complete      {"type":"complete","summary":"..."}
-    failure       {"type":"failure","reason":"why automatic progress is impossible"}
+    failure       {"type":"failure","reason":"why this cycle cannot progress"}
 
   Worker completions (`type` field):
     done          {"type":"done","summary":"actual work and verification"}
@@ -129,13 +130,12 @@ DECIDER AND WORKER CONTRACT
   decider must not modify the project or external world. A worker performs only
   its assigned task, writes one completion, and exits. A worker's logical
   failure is task-local: it is recorded, followed by a fresh observation, and
-  passed to the next decider so other work can continue. A decider's logical
-  failure is goal-wide and terminal. Sensor failures are recorded, followed by
-  a short backoff and a fresh observation so transient observation failures do
-  not stop the goal. A decider protocol failure is retried the same way because
-  the decider is read-only. Decider process failures cause the controller to
-  exit non-zero. Worker process, timeout, and protocol failures are also terminal
-  because the worker may have modified external state.
+  passed to the next decider so other work can continue. Sensor and decider
+  failures are recorded, followed by a short backoff and a fresh observation;
+  retrying is safe because both roles are read-only. A decider's logical failure
+  marks that decision run as failed without terminating the controller. Worker
+  process, timeout, and protocol failures are terminal because the worker may
+  have modified external state.
 
 FAILURE ANALYSIS
   Runtime data lives under .goal/ beside the config file. Successful and failed

@@ -27,15 +27,16 @@ Confirmed design
 7. Human input is not part of the controller workflow. There are no questions,
    pending approvals, or resumable conversations. The default fullscreen TUI is
    observational only and cannot steer child work.
-8. If the decider determines that the goal as a whole cannot progress, or a
-   worker cannot complete its assigned task, it returns `failure` with a
-   concrete reason.
-9. A sensor failure is recorded and retried after a short backoff and fresh
-   observation so transient observation failures do not stop the goal. A decider
-   protocol failure is retried the same way because the decider is read-only.
-   Decider process failures and worker process, timeout, or protocol failures are
-   terminal. A logical worker `failure` is task-local instead: the controller
-   records it, senses again, and lets the next decider select other work.
+8. If the decider determines that the current cycle cannot make automatic
+   progress, or a worker cannot complete its assigned task, it returns `failure`
+   with a concrete reason.
+9. Sensor and decider failures are recorded and retried after a short backoff and
+   fresh observation because both roles are read-only. A logical decider
+   `failure` marks that run as failed without terminating the controller. Worker
+   process, timeout, or protocol failures are terminal because the worker may
+   have modified external state. A logical worker `failure` is task-local
+   instead: the controller records it, senses again, and lets the next decider
+   select other work.
 10. No daemon, child PTY, worker pool, parallel workers, scheduler, workflow DAG,
     or persistent agent conversation is part of the controller. A bounded,
     observational TUI may render controller and child activity.
@@ -66,7 +67,7 @@ Decider actions use serde's `type` tag:
     {"type":"run_task","task":"one bounded task"}
     {"type":"wait","reason":"temporary reason","retry_after_seconds":60}
     {"type":"complete","summary":"fresh evidence of convergence"}
-    {"type":"failure","reason":"why automatic progress is impossible"}
+    {"type":"failure","reason":"why this decision cycle cannot progress"}
 
 Worker completions:
 
@@ -77,10 +78,12 @@ Every text field must be non-empty. Unknown and extra fields are rejected.
 `failure` reasons must contain concrete evidence useful for diagnosing the run
 and improving future goals or automation.
 
-`wait` is only for a temporary world condition that can resolve automatically.
-A decider uses `failure` only when the goal as a whole cannot be pursued. A
-worker uses `failure` when its bounded task cannot be completed; that task-local
-outcome becomes context for the next decider rather than terminating the goal.
+`wait` is for a temporary world condition expected to resolve automatically. A
+decider uses `failure` when the current cycle cannot make safe automatic
+progress and waiting is not the more accurate action; the run is recorded as
+failed, then the controller backs off and re-senses. A worker uses `failure` when
+its bounded task cannot be completed; that task-local outcome becomes context
+for the next decider rather than terminating the goal.
 
 Runner contract
 ---------------
@@ -203,11 +206,12 @@ Failure policy
 --------------
 
 * Sensor process/protocol failure or timeout: preserve artifacts, record the
-  reason, and exit non-zero. Never treat missing or invalid sensor data as a
-  healthy world.
+  reason, back off, and obtain a fresh observation. Never treat missing or
+  invalid sensor data as a healthy world.
 * Decider process/protocol failure or timeout: preserve artifacts, record the
-  reason, and exit non-zero.
-* Decider `failure`: record the reason and exit non-zero.
+  reason, back off, and obtain a fresh observation.
+* Decider `failure`: record the failed run, back off, and obtain a fresh
+  observation.
 * Worker `failure`: record the result and reason, re-sense, and pass the
   task-local failure to the next decider so other work can continue.
 * Worker process/protocol failure or timeout: preserve artifacts, record the
@@ -223,8 +227,8 @@ Integration tests cover:
 * sense -> run task -> done -> re-sense -> complete;
 * finite completion and continuous waiting;
 * sensor process failure is recorded and a later cycle can complete the goal;
-* decider process failure exits non-zero without acting or re-sensing;
-* decider `failure` exits non-zero without a worker;
+* decider process failure is recorded and a later cycle can complete the goal;
+* decider `failure` is recorded and a later cycle can complete the goal;
 * worker `failure` is recorded and a later cycle can complete the goal;
 * worker non-zero, timeout, and missing/invalid result are terminal;
 * full failure reason and run ID are retained in events;

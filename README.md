@@ -6,7 +6,7 @@
 sense -> decide -> run task -- done/failure -> sense
                   wait ---------------------> sense
                   complete -----------------> exit 0
-                  failure ------------------> exit 1
+                  failure ------------------> sense
 ```
 
 It has no daemon, child PTY, interactive workflow, worker pool, or persistent agent conversation. Its optional terminal interaction is an observational activity viewer only.
@@ -49,7 +49,7 @@ Deciders and workers are ordinary argv commands, without an implicit shell or PT
 
 The process must atomically write one tagged JSON object to `GOAL_RESULT_PATH`. Stdout and stderr are diagnostics only. Decider action tags are `run_task`, `wait`, `complete`, and `failure`; worker completion tags are `done` and `failure`. Neither process may request human input, approval, or intervention.
 
-Runtime state, compact events, prompts, results, logs, and per-run `metadata.json` files are kept under `.goal/`. In human output modes, sensor stdout is treated as protocol data and hidden from the terminal; it remains available in the run's `stdout.log` and is passed unchanged to the decider. Sensor stderr diagnostics are still displayed. A sensor failure is recorded with its reason and run ID, followed by a short backoff and a fresh observation so transient observation failures do not stop the goal. A decider protocol failure is retried the same way because the decider is read-only. Decider process failures and worker process, timeout, or protocol failures terminate the controller with a non-zero status. A decider `failure` is also terminal because it describes the goal as a whole. A worker `failure` is task-local: it is recorded and passed to the next decider after a fresh observation, allowing other safe work to continue without retrying the failed task blindly. The retained artifacts support offline analysis of successful and failed runs. Improvements must not weaken success criteria or silently waive unmet requirements.
+Runtime state, compact events, prompts, results, logs, and per-run `metadata.json` files are kept under `.goal/`. In human output modes, sensor stdout is treated as protocol data and hidden from the terminal; it remains available in the run's `stdout.log` and is passed unchanged to the decider. Sensor stderr diagnostics are still displayed. Sensor and decider failures are recorded with their reason and run ID, followed by a short backoff and a fresh observation; retrying is safe because both roles are read-only. A decider `failure` marks that decision run as failed without terminating the controller. Worker process, timeout, or protocol failures terminate the controller with a non-zero status because the worker may have modified external state. A worker `failure` is task-local: it is recorded and passed to the next decider after a fresh observation, allowing other safe work to continue without retrying the failed task blindly. The retained artifacts support offline analysis of successful and failed runs. Improvements must not weaken success criteria or silently waive unmet requirements.
 
 ## Statistics and analysis
 
