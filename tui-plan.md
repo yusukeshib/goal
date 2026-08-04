@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Make `goal` easy to observe while it runs. The default interactive experience should be a fullscreen streaming activity feed, not a dump of child JSON. Each child output line is one independently collapsible card. The UI is observational only: it must not add approval gates, questions, a PTY for children, or any other human dependency to the controller state machine.
+Make `goal` easy to observe while it runs. The default interactive experience should be a fullscreen streaming activity feed, not a dump of child JSON. Each child output line is one selectable row whose details appear in a responsive master-detail pane. The UI is observational only: it must not add approval gates, questions, a PTY for children, or any other human dependency to the controller state machine.
 
 This file is the implementation plan used after context compaction. The work described here is now implemented.
 
@@ -15,7 +15,7 @@ This file is the implementation plan used after context compaction. The work des
 - `goal stats` renders the existing human-readable report when output mode is `tui`; it does not open a fullscreen UI. `--output json` remains the way to get structured stats.
 - Child stdout/stderr files remain exact. TUI formatting, collapsing, retention, and truncation affect display only.
 - One newline-delimited child output record is one card. Do not combine Pi `message_start`, `message_update`, or `message_end` events; that would make the UI depend on Pi's schema.
-- Collapsed summaries are derived generically from arbitrary JSON shape. Unknown JSON and non-JSON output must remain usable.
+- Row summaries are derived generically from arbitrary JSON shape. Unknown JSON and non-JSON output must remain usable.
 - The controller's exit codes, failure policy, timeout policy, and Ctrl-C behavior must not change.
 - On terminal completion, restore the normal screen immediately and print one concise final outcome line. Do not wait for confirmation before exiting.
 
@@ -26,8 +26,8 @@ Implemented on branch `main` in `/Users/yusuke/projects/goal`:
 - Ratatui/crossterm fullscreen activity feed and terminal guard
 - default `tui` mode with non-TTY plain fallback
 - generic one-line child summaries and one card per diagnostic
-- keyboard and mouse collapse/expand, scrolling, and auto-follow
-- bounded card/detail retention and lazy exact-log expansion
+- keyboard and mouse row selection, pane scrolling, and auto-follow
+- responsive right/below detail pane with bounded retention and lazy exact-log loading
 - controller cycle/phase activities
 - exact artifact byte ranges emitted after run-log writes
 - documentation and focused unit/integration coverage
@@ -80,22 +80,14 @@ Suggested layout:
 ```text
  goal  ~/goals/mergeable-prs       cycle 12 · DECIDING · 00:18
 ──────────────────────────────────────────────────────────────────
-
-  08:05:14  SENSOR   completed · 1.2s
-▶ 08:05:15  DECIDER  {cwd: "/…", type: "session", version: 3}
-▶ 08:05:15  DECIDER  {type: "agent_start"}
-▶ 08:05:15  DECIDER  {type: "turn_start"}
-▼ 08:05:15  DECIDER  {message: {… 4 fields}, type: "message_start"}
-    {
-      "message": {
-        …
-      },
-      "type": "message_start"
-    }
-▶ 08:05:16  DECIDER  {message: {… 7 fields}, type: "message_start"}
-
+┌ Activity ───────────────────────┐┌ Details ─────────────────────┐
+│ 08:05:14 SENSOR   completed     ││ {                            │
+│ 08:05:15 DECIDER  {type: …}     ││   "type": "message_start", │
+│ 08:05:15 DECIDER  {message: …}  ││   "message": { … }          │
+│ 08:05:16 DECIDER  {message: …}  ││ }                            │
+└─────────────────────────────────┘└──────────────────────────────┘
 ──────────────────────────────────────────────────────────────────
- ↑↓/jk select  Enter/Click expand  PgUp/PgDn scroll  End follow  q quit
+ ↑↓/jk select  PgUp/PgDn details  Wheel pane scroll  End follow  q quit
 ```
 
 Header:
@@ -111,8 +103,8 @@ Body:
 - chronological cards
 - role and stream visually distinguished
 - controller lifecycle entries and child diagnostic entries share one timeline
-- collapsed cards occupy one row whenever possible
-- expanded cards use wrapped, pretty-rendered detail rows
+- activity rows always occupy one row whenever possible
+- the selected row's wrapped, pretty-rendered details appear to the right, or below on narrow terminals
 
 Footer:
 
@@ -123,12 +115,11 @@ Footer:
 ### Controls
 
 - `Up`/`Down`, `j`/`k`: move selection
-- `Enter`/`Space`: toggle selected card
-- left mouse click on a card header: select and toggle it
-- mouse wheel and `PageUp`/`PageDown`: scroll
-- `Home`: first retained card
-- `End` or `a`: last card and resume auto-follow
-- `Esc`: collapse the selected card
+- left mouse click on a row: select it
+- mouse wheel: scroll the pane under the pointer
+- `PageUp`/`PageDown`: scroll selected-row details
+- `Home`: first retained row
+- `End` or `a`: last row and resume auto-follow
 - `q` or Ctrl-C: set the existing cancellation flag and stop cleanly
 
 Scrolling away from the bottom pauses auto-follow. New events continue to be collected and a count is shown. Returning to the end resumes auto-follow.
@@ -159,7 +150,7 @@ For non-JSON:
 - Decode lossily as UTF-8 for display and show a bounded one-line preview.
 - Keep stream and byte length metadata.
 
-Expanded rendering:
+Detail-pane rendering:
 
 - Load the exact child line from its run log.
 - Pretty-print JSON generically with `serde_json`; show non-JSON as text.
@@ -206,14 +197,20 @@ struct ArtifactRange {
 struct Card {
     id: u64,
     activity: Activity,
-    expanded: bool,
-    loaded_detail: Option<RenderedDetail>,
+}
+
+struct SelectedDetail {
+    index: usize,
+    text: String,
+    scroll_row: usize,
 }
 
 struct UiState {
     cards: VecDeque<Card>,
     selected: Option<usize>,
+    detail: Option<SelectedDetail>,
     scroll_row: usize,
+    detail_scroll_row: usize,
     auto_follow: bool,
     unseen: usize,
     phase: ControllerPhase,
@@ -222,7 +219,7 @@ struct UiState {
 }
 ```
 
-Keep reducer/state transitions independent from Ratatui so selection, collapsing, retention, and auto-follow can be unit tested without a terminal.
+Keep reducer/state transitions independent from Ratatui so selection, per-pane scrolling, retention, and auto-follow can be unit tested without a terminal.
 
 ## Runtime architecture
 
@@ -348,9 +345,9 @@ Initial policy:
 
 - retain at most 2,000 cards
 - retain summaries and artifact references, not raw child lines
-- evict oldest collapsed cards first
-- never evict the currently selected expanded card until it is collapsed or selection moves
-- track and display the number of evicted cards
+- evict oldest rows first
+- keep only the selected row's loaded detail in memory
+- track and display the number of evicted rows
 
 Exact history remains under `.goal/runs/` and `.goal/events.jsonl`.
 
@@ -424,20 +421,20 @@ Consider splitting later into `src/tui/model.rs`, `render.rs`, and `runtime.rs`;
 - Nested objects/arrays are represented structurally without Pi-specific matching.
 - Long strings and non-UTF-8 diagnostics are bounded safely.
 - One child line creates exactly one card.
-- Toggle affects only the selected/clicked card.
+- Keyboard and mouse selection update the detail pane.
 - Scrolling up disables auto-follow.
 - `End` resumes auto-follow and selects/reveals the newest card.
 - New cards increment unseen count while follow is paused.
 - Retention eviction preserves valid selection and scroll state.
 - Artifact range loading reads exactly the requested bytes.
-- Expanded output cap reports the exact log path.
+- Capped detail output reports the exact log path.
 
 ### Renderer tests
 
 Use `ratatui::backend::TestBackend`:
 
-- collapsed and expanded card layout
-- narrow terminal wrapping
+- wide side-by-side and narrow stacked pane layouts
+- detail wrapping and independent scrolling
 - header/footer and active phase
 - selected/error/stderr styling
 - unseen and evicted indicators
@@ -459,9 +456,9 @@ Run the deterministic `examples/fake` controller in a real PTY or tmux pane and 
 
 - fullscreen entry
 - live cards
-- keyboard collapse/expand
-- mouse collapse/expand
-- wheel scrolling and paused follow
+- keyboard and mouse row selection
+- right/below responsive detail placement
+- per-pane wheel scrolling and paused follow
 - `End` auto-follow
 - Ctrl-C and `q`
 - terminal restoration after success, failure, and interruption
@@ -500,7 +497,7 @@ Then perform the PTY smoke test.
 
 - Running `goal` interactively opens the fullscreen activity feed by default.
 - Every newline-delimited child diagnostic is represented by exactly one card.
-- Cards can be collapsed/expanded with Enter and mouse click.
+- Selecting a row updates a separate detail pane, positioned right on wide terminals and below on narrow terminals.
 - The UI scrolls, pauses/resumes auto-follow correctly, and remains bounded during continuous runs.
 - Generic child rendering does not require Pi event names or schemas.
 - Exact child stdout/stderr logs are byte-for-byte unchanged.

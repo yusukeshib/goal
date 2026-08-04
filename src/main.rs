@@ -155,9 +155,9 @@ FAILURE ANALYSIS
 
 OUTPUT
   --output tui (default) opens a fullscreen streaming activity feed on an
-  interactive terminal. Each child diagnostic is one collapsible card; click or
-  press Enter to expand it. Overflowing activity shows a right-side scrollbar.
-  TUI mode falls back to plain output when redirected.
+  interactive terminal. Selecting a row shows its details beside the activity
+  list, or below it when the terminal is narrow. Mouse wheel scrolling follows
+  the pane under the pointer. TUI mode falls back to plain output when redirected.
   --output plain prints timestamped text. --output pretty preserves every child
   JSON value but indents it as one terminal block. stdout.log/stderr.log always
   retain the original one-line output. For controller runs, --output json emits

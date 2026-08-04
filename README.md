@@ -69,7 +69,7 @@ Both commands report process and protocol outcomes, not independent proof that s
 
 ## Output modes
 
-The default `--output tui` opens a fullscreen streaming activity feed when stdin and stdout are terminals. Each newline-delimited child diagnostic is one card. A scrollbar at the right shows the visible position when the activity buffer overflows; drag its thumb or click its track to move through the feed. Use Up/Down or `j`/`k` to select, Enter/Space or a card click to expand, the mouse wheel or PageUp/PageDown to scroll, End or `a` to resume following new activity, and `q` or Ctrl-C to stop. Scrolling away from the end pauses automatic following, while reaching the end resumes it so new activity remains pinned to the pane's last row.
+The default `--output tui` opens a fullscreen streaming activity feed when stdin and stdout are terminals. Each newline-delimited child diagnostic is one row, and the selected row's details are always shown in a separate pane. The detail pane sits to the right on wide terminals and moves below the activity list when the terminal is narrower than 100 columns. Use Up/Down or `j`/`k` to select, click a row to select it, PageUp/PageDown to scroll its details, and End or `a` to resume following new activity. The mouse wheel scrolls whichever pane is under the pointer; the activity scrollbar can also be dragged or clicked. Use `q` or Ctrl-C to stop. Scrolling the activity list away from the end pauses automatic following, while reaching the end resumes it.
 
 TUI mode falls back silently to plain output when redirected or run without an interactive terminal. `goal stats` and `goal analysis` always print their reports instead of opening the fullscreen viewer.
 
