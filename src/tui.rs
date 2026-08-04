@@ -840,27 +840,19 @@ fn render_detail_pane(frame: &mut Frame<'_>, area: Rect, state: &mut UiState) {
         .as_ref()
         .map(|detail| detail.text.as_str())
         .unwrap_or("No activity selected");
-    let wrapped = detail
-        .lines()
-        .flat_map(|line| wrap_line(line, content.width as usize))
-        .collect::<Vec<_>>();
-    state.detail_max_top = wrapped.len().saturating_sub(content.height as usize);
+    let lines = styled_detail_lines(detail, content.width as usize);
+    let line_count = lines.len();
+    state.detail_max_top = line_count.saturating_sub(content.height as usize);
     state.detail_top = state.detail_top.min(state.detail_max_top);
-    let lines = wrapped
-        .iter()
+    let visible = lines
+        .into_iter()
         .skip(state.detail_top)
         .take(content.height as usize)
-        .map(|line| {
-            Line::from(Span::styled(
-                line.as_str(),
-                Style::default().fg(Color::DarkGray),
-            ))
-        })
         .collect::<Vec<_>>();
-    frame.render_widget(Paragraph::new(Text::from(lines)), content);
+    frame.render_widget(Paragraph::new(Text::from(visible)), content);
 
     if state.detail_max_top > 0 && scrollbar_area.height > 0 {
-        let mut scrollbar_state = ScrollbarState::new(wrapped.len())
+        let mut scrollbar_state = ScrollbarState::new(line_count)
             .position(state.detail_top)
             .viewport_content_length(content.height as usize);
         frame.render_stateful_widget(
@@ -886,6 +878,130 @@ fn wrap_line(text: &str, width: usize) -> Vec<String> {
         .chunks(width)
         .map(|chunk| chunk.iter().collect())
         .collect()
+}
+
+fn styled_detail_lines(detail: &str, width: usize) -> Vec<Line<'static>> {
+    if let Ok(value) = serde_json::from_str::<Value>(detail) {
+        return styled_json_lines(&value, width);
+    }
+
+    if let Some((prefix, json)) = detail.split_once("\n\n") {
+        if let Ok(value) = serde_json::from_str::<Value>(json) {
+            let mut lines = plain_detail_lines(prefix, width);
+            lines.push(Line::default());
+            lines.extend(styled_json_lines(&value, width));
+            return lines;
+        }
+    }
+
+    plain_detail_lines(detail, width)
+}
+
+fn plain_detail_lines(text: &str, width: usize) -> Vec<Line<'static>> {
+    text.lines()
+        .flat_map(|line| wrap_line(line, width))
+        .map(Line::raw)
+        .collect()
+}
+
+fn styled_json_lines(value: &Value, width: usize) -> Vec<Line<'static>> {
+    serde_json::to_string_pretty(value)
+        .expect("serializing a JSON value cannot fail")
+        .lines()
+        .flat_map(|line| wrap_styled_spans(styled_json_line(line), width))
+        .collect()
+}
+
+fn styled_json_line(line: &str) -> Vec<Span<'static>> {
+    let bytes = line.as_bytes();
+    let mut spans = Vec::new();
+    let mut plain_start = 0;
+    let mut index = 0;
+
+    while index < bytes.len() {
+        let (end, color) = match bytes[index] {
+            b'"' => {
+                let mut end = index + 1;
+                let mut escaped = false;
+                while end < bytes.len() {
+                    let byte = bytes[end];
+                    end += 1;
+                    if escaped {
+                        escaped = false;
+                    } else if byte == b'\\' {
+                        escaped = true;
+                    } else if byte == b'"' {
+                        break;
+                    }
+                }
+                let is_key = line[end..].trim_start().starts_with(':');
+                (end, if is_key { Color::Cyan } else { Color::Green })
+            }
+            b'-' | b'0'..=b'9' => {
+                let mut end = index + 1;
+                while end < bytes.len()
+                    && matches!(bytes[end], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
+                {
+                    end += 1;
+                }
+                (end, Color::Yellow)
+            }
+            _ if line[index..].starts_with("true") => (index + 4, Color::Magenta),
+            _ if line[index..].starts_with("false") => (index + 5, Color::Magenta),
+            _ if line[index..].starts_with("null") => (index + 4, Color::Magenta),
+            _ => {
+                index += 1;
+                continue;
+            }
+        };
+
+        if plain_start < index {
+            spans.push(Span::raw(line[plain_start..index].to_owned()));
+        }
+        spans.push(Span::styled(
+            line[index..end].to_owned(),
+            Style::default().fg(color),
+        ));
+        index = end;
+        plain_start = end;
+    }
+
+    if plain_start < line.len() {
+        spans.push(Span::raw(line[plain_start..].to_owned()));
+    }
+    spans
+}
+
+fn wrap_styled_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut current = Vec::<Span<'static>>::new();
+    let mut columns = 0;
+
+    for span in spans {
+        for character in span.content.chars() {
+            if columns == width {
+                lines.push(Line::from(std::mem::take(&mut current)));
+                columns = 0;
+            }
+            if current.last().is_some_and(|last| last.style == span.style) {
+                current
+                    .last_mut()
+                    .expect("the last styled span exists")
+                    .content
+                    .to_mut()
+                    .push(character);
+            } else {
+                current.push(Span::styled(character.to_string(), span.style));
+            }
+            columns += 1;
+        }
+    }
+
+    if !current.is_empty() || lines.is_empty() {
+        lines.push(Line::from(current));
+    }
+    lines
 }
 
 fn card_parts(activity: &Activity) -> (u64, String, String, Color) {
@@ -1315,22 +1431,28 @@ mod tests {
     }
 
     #[test]
-    fn details_render_in_dark_gray() {
-        let backend = TestBackend::new(60, 16);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let mut state = UiState::new();
-        state.push(notice("detail body"));
+    fn plain_details_use_the_terminal_foreground() {
+        let lines = styled_detail_lines("detail body", 80);
 
-        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].spans.iter().all(|span| span.style.fg.is_none()));
+    }
 
-        assert!(
-            terminal
-                .backend()
-                .buffer()
-                .content()
-                .iter()
-                .any(|cell| cell.fg == Color::DarkGray && !cell.symbol().trim().is_empty())
-        );
+    #[test]
+    fn json_details_are_pretty_printed_and_colored() {
+        let lines =
+            styled_detail_lines(r#"{"name":"goal","count":2,"ready":true,"empty":null}"#, 80);
+        let colors = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .filter_map(|span| span.style.fg)
+            .collect::<Vec<_>>();
+
+        assert!(lines.len() > 1);
+        assert!(colors.contains(&Color::Cyan));
+        assert!(colors.contains(&Color::Green));
+        assert!(colors.contains(&Color::Yellow));
+        assert!(colors.contains(&Color::Magenta));
     }
 
     #[test]
