@@ -78,39 +78,33 @@ Use `std::io::IsTerminal` for terminal detection. Require both stdin and stdout 
 Suggested layout:
 
 ```text
- goal  ~/goals/mergeable-prs       cycle 12 · DECIDING · 00:18
-──────────────────────────────────────────────────────────────────
-┌ Activity ───────────────────────┐┌ Details ─────────────────────┐
-│ 08:05:14 SENSOR   completed     ││ {                            │
-│ 08:05:15 DECIDER  {type: …}     ││   "type": "message_start", │
-│ 08:05:15 DECIDER  {message: …}  ││   "message": { … }          │
-│ 08:05:16 DECIDER  {message: …}  ││ }                            │
-└─────────────────────────────────┘└──────────────────────────────┘
-──────────────────────────────────────────────────────────────────
+ goal  ~/goals/mergeable-prs · cycle 12 · DECIDING · 18s · following
  ↑↓/jk select  PgUp/PgDn details  Wheel pane scroll  End follow  q quit
+──────────────────────────────────────────────────────────────────
+ 08:05:14 SENSOR   completed       ┌ Details ─────────────────────┐
+ 08:05:15 DECIDER  {type: …}       │ {                            │
+ 08:05:15 DECIDER  {message: …}    │   "type": "message_start", │
+ 08:05:16 DECIDER  {message: …}    │   "message": { … }          │
+                                    │ }                            │
+                                    └──────────────────────────────┘
 ```
 
-Header:
+Unified header:
 
 - goal/project directory
 - current cycle number or ID
 - current controller phase (`SENSING`, `DECIDING`, `WORKING`, `WAITING`, terminal state)
 - phase elapsed time
 - whether auto-follow is paused and how many newer cards exist
+- relevant key help and eviction/truncation notice
 
 Body:
 
-- chronological cards
-- role and stream visually distinguished
+- the chronological activity rows are the borderless base screen
+- role and stream are visually distinguished
 - controller lifecycle entries and child diagnostic entries share one timeline
 - activity rows always occupy one row whenever possible
-- the selected row's wrapped, pretty-rendered details appear to the right, or below on narrow terminals
-
-Footer:
-
-- relevant key help
-- auto-follow state
-- eviction/truncation notice when applicable
+- the selected row's wrapped, pretty-rendered details appear in a bordered pane to the right, or below on narrow terminals
 
 ### Controls
 
@@ -122,7 +116,7 @@ Footer:
 - `End` or `a`: last row and resume auto-follow
 - `q` or Ctrl-C: set the existing cancellation flag and stop cleanly
 
-Scrolling away from the bottom pauses auto-follow. New events continue to be collected and a count is shown. Returning to the end resumes auto-follow.
+Scrolling away from the bottom pauses auto-follow. New events continue to be collected and a count is shown. Returning to the end resumes auto-follow without changing the selected row; `End` explicitly selects the newest row.
 
 ## Generic card summary rules
 

@@ -81,8 +81,8 @@ pub enum Activity {
 /// Produce a schema-independent, single-line and bounded description.
 pub fn summarize_line(bytes: &[u8]) -> String {
     if bytes.len() > SUMMARY_PARSE_BYTES {
-        let preview = String::from_utf8_lossy(&bytes[..SUMMARY_PARSE_BYTES])
-            .replace(['\n', '\r', '\t'], " ");
+        let preview =
+            String::from_utf8_lossy(&bytes[..SUMMARY_PARSE_BYTES]).replace(['\n', '\r', '\t'], " ");
         return format!("{} · {} B", truncate(&preview, SUMMARY_CHARS), bytes.len());
     }
     let value = serde_json::from_slice::<Value>(bytes);
@@ -265,7 +265,8 @@ impl UiState {
 
     fn push(&mut self, activity: Activity) {
         let stick_to_end = self.auto_follow || self.activity_scrollbar_is_at_bottom();
-        let keep_selection = self.selected.is_some();
+        let selection_follows_end =
+            self.selected.is_some() && self.selected == self.cards.len().checked_sub(1);
         if let Activity::Controller { kind, details, .. } = &activity {
             match kind.as_str() {
                 "cycle_started" => {
@@ -291,7 +292,7 @@ impl UiState {
         let was_empty = self.cards.is_empty();
         self.cards.push_back(Card { activity });
         if stick_to_end || was_empty {
-            if keep_selection || was_empty {
+            if selection_follows_end || was_empty {
                 self.select(self.cards.len() - 1);
             }
             self.auto_follow = true;
@@ -370,9 +371,6 @@ impl UiState {
         self.top = top.min(self.max_top());
         self.auto_follow = self.top == self.max_top();
         if self.auto_follow {
-            if let Some(index) = self.cards.len().checked_sub(1) {
-                self.select(index);
-            }
             self.unseen = 0;
         }
     }
@@ -767,11 +765,7 @@ fn handle_event(event: Event, state: &mut UiState, cancelled: &AtomicBool) -> Re
 fn render(frame: &mut Frame<'_>, state: &mut UiState) {
     let areas = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(1),
-            Constraint::Length(3),
-        ])
+        .constraints([Constraint::Length(3), Constraint::Min(1)])
         .split(frame.area());
     let status = if state.auto_follow {
         "following".into()
@@ -783,11 +777,16 @@ fn render(frame: &mut Frame<'_>, state: &mut UiState) {
         .map(|started| unix_now().saturating_sub(started))
         .map(|seconds| format!(" · {seconds}s"))
         .unwrap_or_default();
+    let evicted = if state.evicted == 0 {
+        String::new()
+    } else {
+        format!(" · {} evicted", state.evicted)
+    };
     let project = truncate(&state.project, (areas[0].width as usize / 3).max(12));
     let cycle = truncate(&state.cycle, 28);
     frame.render_widget(
         Paragraph::new(format!(
-            " goal  {project} · cycle {cycle} · {}{elapsed}\n {status}",
+            " goal  {project} · cycle {cycle} · {}{elapsed} · {status}{evicted}\n ↑↓/jk select  Esc close details  PgUp/PgDn details  Wheel pane scroll  Click select  End follow  q quit",
             state.phase
         ))
         .block(Block::default().borders(Borders::BOTTOM)),
@@ -812,29 +811,13 @@ fn render(frame: &mut Frame<'_>, state: &mut UiState) {
         state.detail_scrollbar_drag_offset = None;
         render_activity_pane(frame, body, state);
     }
-
-    let evicted = if state.evicted == 0 {
-        String::new()
-    } else {
-        format!(" · {} evicted", state.evicted)
-    };
-    frame.render_widget(
-        Paragraph::new(format!(
-            " ↑↓/jk select  Esc close details  PgUp/PgDn details  Wheel pane scroll  Click select  End follow  q quit{evicted}"
-        ))
-        .block(Block::default().borders(Borders::TOP)),
-        areas[2],
-    );
 }
 
 fn render_activity_pane(frame: &mut Frame<'_>, area: Rect, state: &mut UiState) {
-    let block = Block::default().borders(Borders::ALL).title(" Activity ");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(0), Constraint::Length(1)])
-        .split(inner);
+        .split(area);
     let content = columns[0];
     let scrollbar_area = columns[1];
 
@@ -863,17 +846,15 @@ fn render_activity_pane(frame: &mut Frame<'_>, area: Rect, state: &mut UiState) 
             .push((Rect::new(content.x, row, content.width, 1), index));
         let selected = state.selected == Some(index);
         let (timestamp, label, summary, _) = card_parts(&card.activity);
-        let style = Style::default()
-            .fg(Color::White)
-            .add_modifier(if selected {
-                Modifier::REVERSED
-            } else {
-                Modifier::empty()
-            });
+        let style = Style::default().fg(Color::White).add_modifier(if selected {
+            Modifier::REVERSED
+        } else {
+            Modifier::empty()
+        });
         let header = format!("{} {label:<10} {summary}", clock(timestamp));
         frame.render_widget(
             Paragraph::new(truncate(&header, content.width as usize)).style(style),
-            Rect::new(inner.x, row, inner.width, 1),
+            Rect::new(area.x, row, area.width, 1),
         );
     }
 
@@ -1124,12 +1105,7 @@ fn card_parts(activity: &Activity) -> (u64, String, String, Color) {
         ),
         Activity::Notice {
             timestamp, text, ..
-        } => (
-            *timestamp,
-            "NOTICE".into(),
-            text.clone(),
-            Color::White,
-        ),
+        } => (*timestamp, "NOTICE".into(), text.clone(), Color::White),
     }
 }
 
@@ -1216,6 +1192,29 @@ mod tests {
         state.end();
         assert!(state.auto_follow);
         assert_eq!(state.selected, Some(2));
+    }
+
+    #[test]
+    fn scrolling_to_the_bottom_does_not_change_selection() {
+        let mut state = UiState::new();
+        state.viewport_height = 2;
+        for index in 0..4 {
+            state.push(notice(&index.to_string()));
+        }
+        state.home();
+
+        state.scroll(100);
+        assert_eq!(state.top, state.max_top());
+        assert!(state.auto_follow);
+        assert_eq!(state.selected, Some(0));
+
+        state.push(notice("new last row"));
+        assert_eq!(state.selected, Some(0));
+
+        state.scroll(-100);
+        state.clear_selection();
+        state.scroll(100);
+        assert_eq!(state.selected, None);
     }
 
     #[test]
@@ -1593,7 +1592,7 @@ mod tests {
     }
 
     #[test]
-    fn activity_rows_are_white_and_selected_highlight_fills_width() {
+    fn activity_rows_are_borderless_and_selected_highlight_fills_width() {
         let mut terminal = Terminal::new(TestBackend::new(30, 3)).unwrap();
         let mut state = UiState::new();
         state.push(notice("finished"));
@@ -1605,9 +1604,11 @@ mod tests {
             })
             .unwrap();
 
-        let last_inner_cell = terminal.backend().buffer().cell((28, 1)).unwrap();
-        assert_eq!(last_inner_cell.fg, Color::White);
-        assert!(last_inner_cell.modifier.contains(Modifier::REVERSED));
+        let first_cell = terminal.backend().buffer().cell((0, 0)).unwrap();
+        let last_cell = terminal.backend().buffer().cell((29, 0)).unwrap();
+        assert_ne!(first_cell.symbol(), "│");
+        assert_eq!(last_cell.fg, Color::White);
+        assert!(last_cell.modifier.contains(Modifier::REVERSED));
     }
 
     #[test]
@@ -1653,15 +1654,15 @@ mod tests {
     }
 
     #[test]
-    fn test_backend_renders_header_card_and_footer() {
+    fn test_backend_renders_unified_header_and_card() {
         let backend = TestBackend::new(60, 16);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut state = UiState::new();
         state.push(notice("finished"));
+        state.clear_selection();
         terminal.draw(|frame| render(frame, &mut state)).unwrap();
-        let screen = terminal
-            .backend()
-            .buffer()
+        let buffer = terminal.backend().buffer();
+        let screen = buffer
             .content()
             .iter()
             .map(|c| c.symbol())
@@ -1669,6 +1670,8 @@ mod tests {
         assert!(screen.contains("goal  - · cycle - · STARTING"));
         assert!(screen.contains("finished"));
         assert!(screen.contains("PgUp/PgDn details"));
+        assert_eq!(buffer.cell((1, 1)).unwrap().symbol(), "↑");
+        assert_eq!(buffer.cell((0, 15)).unwrap().symbol(), " ");
         assert_eq!(state.hit_regions.len(), 1);
     }
 }
