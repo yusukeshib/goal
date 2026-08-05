@@ -192,7 +192,8 @@ def add_prior_worker_failures(pull_requests, events_path=None, limit_per_pr=5):
 def main():
     pull_requests = []
     cursor = None
-    updated_since = (datetime.now(timezone.utc) - timedelta(days=1)).date().isoformat()
+    observed_at = datetime.now(timezone.utc)
+    updated_since = (observed_at - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
     search_query = f"is:pr is:open author:@me updated:>={updated_since}"
     while True:
         search = graphql(SEARCH_QUERY, cursor=cursor, searchQuery=search_query)["search"]
@@ -225,11 +226,11 @@ def main():
     add_prior_worker_failures(pull_requests)
 
     observation = {
-        "observed_at": datetime.now(timezone.utc).isoformat(),
+        "observed_at": observed_at.isoformat(),
         "scope": {
             "owner": "authenticated gh user",
             "query": search_query,
-            "window": "updated since the previous UTC date",
+            "window": "updated within the previous 72 hours",
             "feedback_definition": "unresolved GitHub review threads and review states",
             "review_thread_filter": "reviewThreads.nodes contains only isResolved=false threads; unresolvedReviewThreadIds repeats the exact actionable IDs",
             "pagination": "all search, review-thread, and check-context pages",

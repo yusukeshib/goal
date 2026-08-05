@@ -1,4 +1,4 @@
-Continuously keep every open pull request authored by me and updated since the previous UTC date ready for required reviewer approval, such that receiving the necessary approval is the only remaining external gate. Pull requests outside this recent-update window are intentionally out of scope.
+Continuously keep every open pull request authored by me and updated within the previous 72 hours ready for required reviewer approval, such that receiving the necessary approval is the only remaining external gate. Pull requests outside this recent-update window are intentionally out of scope.
 
 The target state is approval-ready, not already approved or immediately mergeable. `REVIEW_REQUIRED`, a missing approval, or a merge-state blockage caused only by missing approval is acceptable and must not trigger work. Never attempt to approve my own PR. When approval is the only remaining gate, return Wait and continue monitoring for new CI results or review feedback.
 
