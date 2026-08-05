@@ -10,7 +10,6 @@ Model, thinking level, and tools remain explicit caller policy.
 
 example:
   goal-runner-pi \
-    --model openai-codex/gpt-5.6-luna \
     --thinking high \
     --tools write \
     -- prompt.md

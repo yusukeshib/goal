@@ -1,17 +1,29 @@
 goal_file = "GOAL.md"
-interval_seconds = 60
-max_wait_seconds = 3600
+interval_seconds = 0
+max_wait_seconds = 300
 
 [sensor]
-command = ["./sensor.sh"]
-timeout_seconds = 60
+command = ["python3", "./sensor.py"]
+timeout_seconds = 180
 
-# Replace agent-cli and its flags with a non-TUI command available locally.
-# Configure the decider with the least authority that CLI supports.
+# The decider receives only the generated prompt. Its sole tool is needed to
+# publish result.json; the injected contract forbids every other modification.
 [decider]
-command = ["agent-cli", "--read-only", "--non-interactive", "{prompt}"]
+command = [
+  "../../utils/goal-runner-pi",
+  "--thinking", "medium",
+  "--tools", "write",
+  "--", "{prompt}",
+]
 timeout_seconds = 300
 
+# The disposable worker is non-interactive and receives only standard coding
+# tools. It must return failure instead of requesting human input or approval.
 [worker]
-command = ["agent-cli", "--non-interactive", "{prompt}"]
+command = [
+  "../../utils/goal-runner-pi",
+  "--thinking", "medium",
+  "--tools", "read,bash,edit,write,grep,find,ls",
+  "--", "{prompt}",
+]
 timeout_seconds = 1800

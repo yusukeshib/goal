@@ -21,7 +21,7 @@ This file is the implementation plan used after context compaction. The work des
 
 ## Implementation status
 
-Implemented on branch `main` in `/Users/yusuke/projects/goal`:
+Implemented on branch `main` in this repository:
 
 - Ratatui/crossterm fullscreen activity feed and terminal guard
 - default `tui` mode with non-TTY plain fallback
@@ -473,7 +473,7 @@ Then perform the PTY smoke test.
 
 ## Implementation sequence
 
-1. Re-read `/Users/yusuke/AGENTS.md`, inspect `git status`, and review the existing `src/output.rs` diff.
+1. Re-read the applicable `AGENTS.md` instructions, inspect `git status`, and review the existing `src/output.rs` diff.
 2. Add `Tui` to `OutputMode`, make it the declared default, and implement effective non-TTY fallback. Update exhaustive matches and add CLI/default tests before adding Ratatui.
 3. Add the pure `Activity`, summary, `Card`, and `UiState` model with unit tests.
 4. Add Ratatui/crossterm and build a static TestBackend-rendered timeline.

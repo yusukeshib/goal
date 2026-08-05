@@ -73,4 +73,6 @@ State, events, prompts, results, exact child logs, and run metadata are stored u
 ## Examples
 
 - [`examples/fake`](examples/fake): deterministic runnable cycle (`cd examples/fake && ./run.sh`)
-- [`examples/mergeable-prs`](examples/mergeable-prs): read-only GitHub sensor
+- [`examples/mergeable-prs`](examples/mergeable-prs): continuously keep authored pull requests approval-ready
+
+The pull-request example uses Pi's configured default model. To reuse existing local checkouts, set `GOAL_CHECKOUT_ROOTS` to an OS-path-separated list of directories that contain repositories; otherwise workers use bounded disposable checkouts in the system temporary directory.

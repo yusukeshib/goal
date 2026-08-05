@@ -1,2 +1,3 @@
 /target/
-/.goal/
+.goal/
+__pycache__/
