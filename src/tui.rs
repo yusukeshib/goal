@@ -845,15 +845,26 @@ fn render_activity_pane(frame: &mut Frame<'_>, area: Rect, state: &mut UiState) 
             .hit_regions
             .push((Rect::new(content.x, row, content.width, 1), index));
         let selected = state.selected == Some(index);
-        let (timestamp, label, summary, _) = card_parts(&card.activity);
-        let style = Style::default().fg(Color::White).add_modifier(if selected {
+        let (timestamp, label, summary, label_color) = card_parts(&card.activity);
+        let row_style = Style::default().fg(Color::White).add_modifier(if selected {
             Modifier::REVERSED
         } else {
             Modifier::empty()
         });
-        let header = format!("{} {label:<10} {summary}", clock(timestamp));
+        let header = Line::from(vec![
+            Span::styled(clock(timestamp), Style::default().fg(Color::DarkGray)),
+            Span::raw(" "),
+            Span::styled(
+                format!("{label:<10}"),
+                Style::default()
+                    .fg(label_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::raw(summary),
+        ]);
         frame.render_widget(
-            Paragraph::new(truncate(&header, content.width as usize)).style(style),
+            Paragraph::new(header).style(row_style),
             Rect::new(area.x, row, area.width, 1),
         );
     }
@@ -1474,7 +1485,7 @@ fn card_parts(activity: &Activity) -> (u64, String, String, Color) {
             *timestamp,
             "GOAL".into(),
             format!("{kind} {}", summarize_line(details.to_string().as_bytes())),
-            Color::White,
+            Color::Cyan,
         ),
         Activity::Child {
             timestamp,
@@ -1490,11 +1501,26 @@ fn card_parts(activity: &Activity) -> (u64, String, String, Color) {
                 "{}{summary} · {original_bytes} B",
                 if stream == "stderr" { "[stderr] " } else { "" }
             ),
-            Color::White,
+            match role.as_str() {
+                "sensor" => Color::Blue,
+                "decider" => Color::Magenta,
+                "worker" => Color::Green,
+                _ => Color::Yellow,
+            },
         ),
         Activity::Notice {
-            timestamp, text, ..
-        } => (*timestamp, "NOTICE".into(), text.clone(), Color::White),
+            timestamp,
+            level,
+            text,
+        } => (
+            *timestamp,
+            "NOTICE".into(),
+            text.clone(),
+            match level {
+                NoticeLevel::Info => Color::Yellow,
+                NoticeLevel::Error => Color::Red,
+            },
+        ),
     }
 }
 
@@ -1563,10 +1589,11 @@ mod tests {
             summary: "diagnostic".into(),
             original_bytes: 10,
         };
-        let (_, _, stdout_summary, _) = card_parts(&child("stdout"));
+        let (_, _, stdout_summary, worker_color) = card_parts(&child("stdout"));
         let (_, _, stderr_summary, _) = card_parts(&child("stderr"));
         assert_eq!(stdout_summary, "diagnostic · 10 B");
         assert_eq!(stderr_summary, "[stderr] diagnostic · 10 B");
+        assert_eq!(worker_color, Color::Green);
     }
 
     #[test]
@@ -1994,8 +2021,12 @@ mod tests {
             .unwrap();
 
         let first_cell = terminal.backend().buffer().cell((0, 0)).unwrap();
+        let label_cell = terminal.backend().buffer().cell((9, 0)).unwrap();
         let last_cell = terminal.backend().buffer().cell((29, 0)).unwrap();
         assert_ne!(first_cell.symbol(), "│");
+        assert_eq!(first_cell.fg, Color::DarkGray);
+        assert_eq!(label_cell.fg, Color::Yellow);
+        assert!(label_cell.modifier.contains(Modifier::BOLD));
         assert_eq!(last_cell.fg, Color::White);
         assert!(last_cell.modifier.contains(Modifier::REVERSED));
     }
