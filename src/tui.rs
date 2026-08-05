@@ -3,7 +3,7 @@
 use std::{
     collections::VecDeque,
     fs::File,
-    io::{self, Read, Seek, SeekFrom},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::PathBuf,
     sync::{
         Arc,
@@ -26,8 +26,9 @@ use crossterm::{
 };
 use ratatui::{
     Frame, Terminal,
-    backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    backend::{Backend, ClearType, CrosstermBackend, WindowSize},
+    buffer::Cell,
+    layout::{Constraint, Direction, Layout, Position, Rect, Size},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
@@ -486,6 +487,72 @@ fn load_detail(activity: &Activity) -> Result<String> {
     ))
 }
 
+/// Crossterm normally omits cursor-position commands between adjacent changed
+/// cells. Some terminals can lose track of that implicit advance after rendering
+/// arbitrary worker output, causing later updates to land in stale cells. Drawing
+/// updates in reverse screen order makes Crossterm position every cell explicitly.
+struct PositionedCrosstermBackend<W: Write> {
+    inner: CrosstermBackend<W>,
+}
+
+impl<W: Write> PositionedCrosstermBackend<W> {
+    fn new(writer: W) -> Self {
+        Self {
+            inner: CrosstermBackend::new(writer),
+        }
+    }
+}
+
+impl<W: Write> Backend for PositionedCrosstermBackend<W> {
+    fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a Cell)>,
+    {
+        let updates = content.collect::<Vec<_>>();
+        self.inner.draw(updates.into_iter().rev())
+    }
+
+    fn append_lines(&mut self, count: u16) -> io::Result<()> {
+        self.inner.append_lines(count)
+    }
+
+    fn hide_cursor(&mut self) -> io::Result<()> {
+        self.inner.hide_cursor()
+    }
+
+    fn show_cursor(&mut self) -> io::Result<()> {
+        self.inner.show_cursor()
+    }
+
+    fn get_cursor_position(&mut self) -> io::Result<Position> {
+        self.inner.get_cursor_position()
+    }
+
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+        self.inner.set_cursor_position(position)
+    }
+
+    fn clear(&mut self) -> io::Result<()> {
+        self.inner.clear()
+    }
+
+    fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
+        self.inner.clear_region(clear_type)
+    }
+
+    fn size(&self) -> io::Result<Size> {
+        self.inner.size()
+    }
+
+    fn window_size(&mut self) -> io::Result<WindowSize> {
+        self.inner.window_size()
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 struct TerminalGuard;
 impl TerminalGuard {
     fn enter() -> Result<Self> {
@@ -525,7 +592,7 @@ pub fn run(
         return Err(error);
     }
     let guard = guard.unwrap();
-    let backend = CrosstermBackend::new(io::stdout());
+    let backend = PositionedCrosstermBackend::new(io::stdout());
     let mut terminal = match Terminal::new(backend) {
         Ok(terminal) => terminal,
         Err(error) => {
