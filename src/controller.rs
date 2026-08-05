@@ -78,6 +78,7 @@ impl Controller {
             let cycle_id = self.begin_cycle()?;
             self.output
                 .event("cycle_started", serde_json::json!({"cycle_id": cycle_id}))?;
+            let goal = self.loaded.read_goal()?;
             self.output
                 .event("phase_started", serde_json::json!({"phase": "sensor"}))?;
             let phase_started = Instant::now();
@@ -120,7 +121,7 @@ impl Controller {
             };
 
             let context = prompt::prior_context(self.state.latest_worker_completion.as_ref());
-            let decider_prompt = prompt::decider_prompt(&self.loaded.goal, &observation, &context);
+            let decider_prompt = prompt::decider_prompt(&goal, &observation, &context);
             self.output
                 .event("phase_started", serde_json::json!({"phase": "decider"}))?;
             let phase_started = Instant::now();
@@ -190,12 +191,8 @@ impl Controller {
 
             match action {
                 DeciderAction::RunTask { task } => {
-                    let worker_prompt = prompt::worker_prompt(
-                        &self.loaded.goal,
-                        &observation,
-                        &task,
-                        "$GOAL_RESULT_PATH",
-                    );
+                    let worker_prompt =
+                        prompt::worker_prompt(&goal, &observation, &task, "$GOAL_RESULT_PATH");
                     self.output.event(
                         "phase_started",
                         serde_json::json!({"phase": "worker", "task": task}),

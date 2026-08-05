@@ -21,7 +21,7 @@ cd /path/to/goal && goal
 GOAL_DIR=/path/to/goal goal
 ```
 
-`GOAL_DIR` defaults to the current directory, which is also the child working directory. Run `goal --help` for the complete configuration and protocol reference.
+`GOAL_DIR` defaults to the current directory, which is also the child working directory. The configured goal file is reloaded at the start of every cycle, and the decider and any dispatched worker receive the same per-cycle snapshot. Run `goal --help` for the complete configuration and protocol reference.
 
 A minimal `goal.toml`:
 

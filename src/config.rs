@@ -33,7 +33,7 @@ fn default_max_wait() -> u64 {
 pub struct LoadedConfig {
     pub config: Config,
     pub project_dir: PathBuf,
-    pub goal: String,
+    pub goal_path: PathBuf,
 }
 
 impl LoadedConfig {
@@ -62,16 +62,22 @@ impl LoadedConfig {
         } else {
             project_dir.join(&config.goal_file)
         };
-        let goal = fs::read_to_string(&goal_path)
-            .with_context(|| format!("read goal file {}", goal_path.display()))?;
-        if goal.trim().is_empty() {
-            bail!("goal file {} must not be empty", goal_path.display());
-        }
-        Ok(Self {
+        let loaded = Self {
             config,
             project_dir,
-            goal,
-        })
+            goal_path,
+        };
+        loaded.read_goal()?;
+        Ok(loaded)
+    }
+
+    pub fn read_goal(&self) -> Result<String> {
+        let goal = fs::read_to_string(&self.goal_path)
+            .with_context(|| format!("read goal file {}", self.goal_path.display()))?;
+        if goal.trim().is_empty() {
+            bail!("goal file {} must not be empty", self.goal_path.display());
+        }
+        Ok(goal)
     }
 }
 
@@ -127,7 +133,7 @@ timeout_seconds = 1
         fs::write(dir.path().join("GOAL.md"), "Ship the feature").unwrap();
         for path in [dir.path(), &dir.path().join("goal.toml")] {
             let loaded = LoadedConfig::load(path).unwrap();
-            assert_eq!(loaded.goal, "Ship the feature");
+            assert_eq!(loaded.read_goal().unwrap(), "Ship the feature");
             assert_eq!(loaded.project_dir, fs::canonicalize(dir.path()).unwrap());
         }
     }

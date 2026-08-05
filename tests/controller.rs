@@ -378,6 +378,30 @@ fn sense_task_done_resense_complete() {
 }
 
 #[test]
+fn goal_file_is_reloaded_between_cycles_with_one_snapshot_per_cycle() {
+    let fixture = Fixture::new(
+        COUNT_SENSOR,
+        r#"n=0; test ! -f decider-count || n=$(cat decider-count); n=$((n+1)); echo "$n" > decider-count; if test "$n" = 1; then grep -q 'Reach the fake goal safely.' "$1"; r='{"type":"run_task","task":"update the goal"}'; else grep -q 'Use the updated goal.' "$1"; r='{"type":"complete","summary":"observed updated goal"}'; fi; printf '%s' "$r" > "$GOAL_RESULT_PATH""#,
+        r#"cat > worker-prompt; grep -q 'Reach the fake goal safely.' worker-prompt; printf 'Use the updated goal.\n' > GOAL.md; printf '{"type":"done","summary":"updated goal file"}' > "$GOAL_RESULT_PATH""#,
+    );
+
+    let output = fixture.run();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fixture.count("sensor-count"), 2);
+    assert_eq!(fixture.count("decider-count"), 2);
+    assert!(
+        fs::read_to_string(fixture.dir.path().join("worker-prompt"))
+            .unwrap()
+            .contains("Reach the fake goal safely.")
+    );
+}
+
+#[test]
 fn stats_reports_metadata_from_goal_dir_or_current_directory() {
     let fixture = Fixture::new(
         COUNT_SENSOR,

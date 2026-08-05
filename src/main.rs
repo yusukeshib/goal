@@ -77,7 +77,8 @@ const RUN_HELP: &str = r#"CONFIGURATION
 
 GOAL SEMANTICS
   GOAL.md must define what success means and whether the goal is finite or
-  continuous.
+  continuous. It is reloaded at the start of every cycle; the decider and any
+  worker dispatched in that cycle receive the same goal snapshot.
 
   For a finite goal, the decider may return `complete` after a fresh observation
   proves the success conditions are satisfied.
