@@ -40,7 +40,7 @@ const SUMMARY_CHARS: usize = 160;
 const SUMMARY_PARSE_BYTES: usize = 16 * 1024;
 const DETAIL_BYTES: usize = 256 * 1024;
 const DETAIL_LINES: usize = 2_000;
-const SIDE_BY_SIDE_MIN_WIDTH: u16 = 100;
+const SIDE_BY_SIDE_MIN_WIDTH: u16 = 160;
 const MAX_ACTIVITY_DRAIN_PER_TICK: usize = 1_024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2258,8 +2258,8 @@ mod tests {
     }
 
     #[test]
-    fn detail_pane_moves_below_when_the_terminal_is_narrow() {
-        let mut wide = Terminal::new(TestBackend::new(120, 20)).unwrap();
+    fn detail_pane_stays_below_until_the_terminal_is_very_wide() {
+        let mut wide = Terminal::new(TestBackend::new(SIDE_BY_SIDE_MIN_WIDTH, 20)).unwrap();
         let mut state = UiState::new();
         state.push(notice("details"));
         wide.draw(|frame| render(frame, &mut state)).unwrap();
@@ -2267,11 +2267,12 @@ mod tests {
         assert!(wide_area.x > 0);
         assert_eq!(wide_area.y, 3);
 
-        let mut narrow = Terminal::new(TestBackend::new(60, 20)).unwrap();
-        narrow.draw(|frame| render(frame, &mut state)).unwrap();
-        let narrow_area = state.detail_area.unwrap();
-        assert_eq!(narrow_area.x, 0);
-        assert!(narrow_area.y > 3);
+        let mut stacked =
+            Terminal::new(TestBackend::new(SIDE_BY_SIDE_MIN_WIDTH - 1, 20)).unwrap();
+        stacked.draw(|frame| render(frame, &mut state)).unwrap();
+        let stacked_area = state.detail_area.unwrap();
+        assert_eq!(stacked_area.x, 0);
+        assert!(stacked_area.y > 3);
     }
 
     #[test]

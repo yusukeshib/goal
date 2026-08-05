@@ -104,9 +104,6 @@ impl Output {
         artifact: ArtifactRange,
         line: &[u8],
     ) -> Result<()> {
-        if role == "sensor" && stream == "stdout" && self.mode != OutputMode::Json {
-            return Ok(());
-        }
         if self.mode == OutputMode::Tui {
             self.send_activity(Activity::Child {
                 timestamp: unix_timestamp(),
@@ -343,7 +340,7 @@ mod tests {
     }
 
     #[test]
-    fn tui_emits_one_card_per_diagnostic_and_hides_sensor_protocol() {
+    fn tui_emits_one_card_for_sensor_protocol_output() {
         let (sender, receiver) = std::sync::mpsc::sync_channel(4);
         let output = Output::tui(sender);
         let artifact = ArtifactRange {
@@ -373,7 +370,10 @@ mod tests {
                 b"{\"secret\":true}\n",
             )
             .unwrap();
-        assert!(receiver.try_recv().is_err());
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            Activity::Child { role, run_id, .. } if role == "sensor" && run_id == "run-2"
+        ));
     }
 
     #[test]
