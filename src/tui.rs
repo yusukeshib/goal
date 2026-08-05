@@ -549,7 +549,7 @@ impl<W: Write> Backend for PositionedCrosstermBackend<W> {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
+        Backend::flush(&mut self.inner)
     }
 }
 
