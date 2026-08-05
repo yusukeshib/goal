@@ -978,6 +978,8 @@ fn plain_detail_lines(text: &str, width: usize) -> Vec<Line<'static>> {
 #[derive(Debug, PartialEq, Eq)]
 enum JsonPreviewLine {
     Syntax(String),
+    Markdown(String),
+    MarkdownCode(String),
     Plain(String),
 }
 
@@ -988,6 +990,13 @@ fn styled_json_lines(value: &Value, width: usize) -> Vec<Line<'static>> {
         .into_iter()
         .flat_map(|line| match line {
             JsonPreviewLine::Syntax(line) => wrap_styled_spans(styled_json_line(&line), width),
+            JsonPreviewLine::Markdown(line) => {
+                wrap_styled_spans(styled_markdown_line(&line), width)
+            }
+            JsonPreviewLine::MarkdownCode(line) => wrap_styled_spans(
+                vec![Span::styled(line, Style::default().fg(Color::Green))],
+                width,
+            ),
             JsonPreviewLine::Plain(line) => {
                 wrap_line(&line, width).into_iter().map(Line::raw).collect()
             }
@@ -1053,17 +1062,28 @@ fn push_json_preview(
                 lines.push(JsonPreviewLine::Syntax(format!(
                     "{prefix}{fence}{language}"
                 )));
+                let mut markdown_fence: Option<(char, usize)> = None;
                 for line in content.split('\n') {
-                    let line = format!(
-                        "{}{}",
-                        " ".repeat(indent),
-                        line.strip_suffix('\r').unwrap_or(line)
-                    );
+                    let line = line.strip_suffix('\r').unwrap_or(line);
+                    let fence = markdown_fence_marker(line);
+                    let in_markdown_code = markdown_fence.is_some();
+                    let rendered = format!("{}{line}", " ".repeat(indent));
                     lines.push(if language == "json" {
-                        JsonPreviewLine::Syntax(line)
+                        JsonPreviewLine::Syntax(rendered)
+                    } else if in_markdown_code || fence.is_some() {
+                        JsonPreviewLine::MarkdownCode(rendered)
                     } else {
-                        JsonPreviewLine::Plain(line)
+                        JsonPreviewLine::Markdown(rendered)
                     });
+                    if language == "md"
+                        && let Some(marker) = fence
+                    {
+                        markdown_fence = match markdown_fence {
+                            Some(open) if marker.0 == open.0 && marker.1 >= open.1 => None,
+                            Some(open) => Some(open),
+                            None => Some(marker),
+                        };
+                    }
                 }
                 lines.push(JsonPreviewLine::Plain(format!(
                     "{}{fence}{suffix}",
@@ -1105,6 +1125,247 @@ fn code_fence(content: &str) -> String {
         }
     }
     "`".repeat((longest + 1).max(3))
+}
+
+fn markdown_fence_marker(line: &str) -> Option<(char, usize)> {
+    let mut characters = line.trim_start().chars();
+    let marker = characters.next()?;
+    if !matches!(marker, '`' | '~') {
+        return None;
+    }
+    let length = 1 + characters
+        .take_while(|character| *character == marker)
+        .count();
+    (length >= 3).then_some((marker, length))
+}
+
+fn styled_markdown_line(line: &str) -> Vec<Span<'static>> {
+    let trimmed = line.trim_start_matches(|character| matches!(character, ' ' | '\t'));
+    let indent = &line[..line.len() - trimmed.len()];
+    let mut spans = Vec::new();
+    push_markdown_span(&mut spans, indent, Style::default());
+
+    if markdown_fence_marker(trimmed).is_some() {
+        push_markdown_span(
+            &mut spans,
+            trimmed,
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        );
+        return spans;
+    }
+
+    let heading_marks = trimmed.bytes().take_while(|byte| *byte == b'#').count();
+    if (1..=6).contains(&heading_marks) && trimmed.as_bytes().get(heading_marks) == Some(&b' ') {
+        push_markdown_span(
+            &mut spans,
+            &trimmed[..=heading_marks],
+            Style::default().fg(Color::DarkGray),
+        );
+        spans.extend(styled_markdown_inline(
+            &trimmed[heading_marks + 1..],
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        return spans;
+    }
+
+    if let Some(body) = trimmed.strip_prefix("> ") {
+        push_markdown_span(
+            &mut spans,
+            "> ",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        );
+        spans.extend(styled_markdown_inline(
+            body,
+            Style::default().add_modifier(Modifier::ITALIC),
+        ));
+        return spans;
+    }
+
+    if matches!(trimmed.get(..2), Some("- " | "* " | "+ ")) {
+        push_markdown_span(
+            &mut spans,
+            &trimmed[..2],
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
+        spans.extend(styled_markdown_inline(&trimmed[2..], Style::default()));
+        return spans;
+    }
+
+    if let Some(prefix) = ordered_list_prefix(trimmed) {
+        push_markdown_span(
+            &mut spans,
+            &trimmed[..prefix],
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
+        spans.extend(styled_markdown_inline(&trimmed[prefix..], Style::default()));
+        return spans;
+    }
+
+    let rule = trimmed
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    if rule.len() >= 3
+        && rule.chars().next().is_some_and(|marker| {
+            matches!(marker, '-' | '*' | '_') && rule.chars().all(|c| c == marker)
+        })
+    {
+        push_markdown_span(&mut spans, trimmed, Style::default().fg(Color::DarkGray));
+        return spans;
+    }
+
+    spans.extend(styled_markdown_inline(trimmed, Style::default()));
+    spans
+}
+
+fn ordered_list_prefix(text: &str) -> Option<usize> {
+    let digits = text.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 || !matches!(text.as_bytes().get(digits), Some(b'.' | b')')) {
+        return None;
+    }
+    (text.as_bytes().get(digits + 1) == Some(&b' ')).then_some(digits + 2)
+}
+
+fn styled_markdown_inline(text: &str, base: Style) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut plain_start = 0;
+    let mut index = 0;
+
+    while index < text.len() {
+        if index > 0 && text.as_bytes()[index - 1] == b'\\' {
+            index += text[index..]
+                .chars()
+                .next()
+                .expect("index is in bounds")
+                .len_utf8();
+            continue;
+        }
+
+        if text[index..].starts_with('`') {
+            let ticks = text[index..]
+                .bytes()
+                .take_while(|byte| *byte == b'`')
+                .count();
+            let delimiter = "`".repeat(ticks);
+            if let Some(relative_end) = text[index + ticks..].find(&delimiter) {
+                let content_end = index + ticks + relative_end;
+                push_markdown_span(&mut spans, &text[plain_start..index], base);
+                push_markdown_span(
+                    &mut spans,
+                    &text[index..index + ticks],
+                    Style::default().fg(Color::DarkGray),
+                );
+                push_markdown_span(
+                    &mut spans,
+                    &text[index + ticks..content_end],
+                    base.fg(Color::Yellow),
+                );
+                push_markdown_span(
+                    &mut spans,
+                    &text[content_end..content_end + ticks],
+                    Style::default().fg(Color::DarkGray),
+                );
+                index = content_end + ticks;
+                plain_start = index;
+                continue;
+            }
+        }
+
+        if text[index..].starts_with('[')
+            && let Some(label_end) = text[index + 1..].find("](")
+        {
+            let label_end = index + 1 + label_end;
+            let url_start = label_end + 2;
+            if let Some(url_end) = text[url_start..].find(')') {
+                let url_end = url_start + url_end;
+                push_markdown_span(&mut spans, &text[plain_start..index], base);
+                push_markdown_span(&mut spans, "[", Style::default().fg(Color::DarkGray));
+                push_markdown_span(
+                    &mut spans,
+                    &text[index + 1..label_end],
+                    base.fg(Color::Blue).add_modifier(Modifier::UNDERLINED),
+                );
+                push_markdown_span(&mut spans, "](", Style::default().fg(Color::DarkGray));
+                push_markdown_span(
+                    &mut spans,
+                    &text[url_start..url_end],
+                    Style::default().fg(Color::Blue),
+                );
+                push_markdown_span(&mut spans, ")", Style::default().fg(Color::DarkGray));
+                index = url_end + 1;
+                plain_start = index;
+                continue;
+            }
+        }
+
+        let delimiter = if text[index..].starts_with("**") {
+            Some(("**", Modifier::BOLD))
+        } else if text[index..].starts_with("__") {
+            Some(("__", Modifier::BOLD))
+        } else if text[index..].starts_with("~~") {
+            Some(("~~", Modifier::CROSSED_OUT))
+        } else if text[index..].starts_with('*') {
+            Some(("*", Modifier::ITALIC))
+        } else if text[index..].starts_with('_') {
+            Some(("_", Modifier::ITALIC))
+        } else {
+            None
+        };
+        if let Some((delimiter, modifier)) = delimiter {
+            let content_start = index + delimiter.len();
+            if let Some(relative_end) = text[content_start..].find(delimiter) {
+                let content_end = content_start + relative_end;
+                if content_end > content_start {
+                    push_markdown_span(&mut spans, &text[plain_start..index], base);
+                    push_markdown_span(&mut spans, delimiter, Style::default().fg(Color::DarkGray));
+                    push_markdown_span(
+                        &mut spans,
+                        &text[content_start..content_end],
+                        base.add_modifier(modifier),
+                    );
+                    push_markdown_span(&mut spans, delimiter, Style::default().fg(Color::DarkGray));
+                    index = content_end + delimiter.len();
+                    plain_start = index;
+                    continue;
+                }
+            }
+        }
+
+        index += text[index..]
+            .chars()
+            .next()
+            .expect("index is in bounds")
+            .len_utf8();
+    }
+
+    push_markdown_span(&mut spans, &text[plain_start..], base);
+    spans
+}
+
+fn push_markdown_span(spans: &mut Vec<Span<'static>>, text: &str, style: Style) {
+    if text.is_empty() {
+        return;
+    }
+    if spans.last().is_some_and(|span| span.style == style) {
+        spans
+            .last_mut()
+            .expect("the last span exists")
+            .content
+            .to_mut()
+            .push_str(text);
+    } else {
+        spans.push(Span::styled(text.to_owned(), style));
+    }
 }
 
 fn styled_json_line(line: &str) -> Vec<Span<'static>> {
@@ -1797,6 +2058,58 @@ mod tests {
             lines
                 .iter()
                 .any(|line| line == "  \"json_primitive\": \"true\",")
+        );
+    }
+
+    #[test]
+    fn markdown_string_blocks_are_syntax_highlighted() {
+        let value = serde_json::json!({
+            "markdown": "# Heading\n- **bold** and `code`\n> [link](https://example.com)\n```rust\nfn main() {}\n```",
+        });
+        let lines = styled_json_lines(&value, 120);
+        let matching_line = |needle: &str| {
+            lines
+                .iter()
+                .position(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                        .contains(needle)
+                })
+                .expect("highlighted Markdown line exists")
+        };
+
+        let heading = &lines[matching_line("# Heading")];
+        assert!(heading.spans.iter().any(|span| {
+            span.style.fg == Some(Color::Cyan) && span.style.add_modifier.contains(Modifier::BOLD)
+        }));
+
+        let list = &lines[matching_line("**bold**")];
+        assert!(
+            list.spans
+                .iter()
+                .any(|span| span.content == "bold"
+                    && span.style.add_modifier.contains(Modifier::BOLD))
+        );
+        assert!(
+            list.spans
+                .iter()
+                .any(|span| { span.content == "code" && span.style.fg == Some(Color::Yellow) })
+        );
+
+        let quote = &lines[matching_line("[link](https://example.com)")];
+        assert!(quote.spans.iter().any(|span| {
+            span.content == "link"
+                && span.style.fg == Some(Color::Blue)
+                && span.style.add_modifier.contains(Modifier::UNDERLINED)
+        }));
+
+        let code = &lines[matching_line("fn main() {}")];
+        assert!(
+            code.spans
+                .iter()
+                .any(|span| span.style.fg == Some(Color::Green))
         );
     }
 
