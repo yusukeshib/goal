@@ -1048,43 +1048,49 @@ fn push_json_preview(
             )));
         }
         Value::String(text) => {
-            let (language, content) = string_block(text);
-            let fence = code_fence(&content);
-            lines.push(JsonPreviewLine::Syntax(format!(
-                "{prefix}{fence}{language}"
-            )));
-            for line in content.split('\n') {
-                let line = format!(
-                    "{}{}",
-                    " ".repeat(indent),
-                    line.strip_suffix('\r').unwrap_or(line)
-                );
-                lines.push(if language == "json" {
-                    JsonPreviewLine::Syntax(line)
-                } else {
-                    JsonPreviewLine::Plain(line)
-                });
+            if let Some((language, content)) = string_block(text) {
+                let fence = code_fence(&content);
+                lines.push(JsonPreviewLine::Syntax(format!(
+                    "{prefix}{fence}{language}"
+                )));
+                for line in content.split('\n') {
+                    let line = format!(
+                        "{}{}",
+                        " ".repeat(indent),
+                        line.strip_suffix('\r').unwrap_or(line)
+                    );
+                    lines.push(if language == "json" {
+                        JsonPreviewLine::Syntax(line)
+                    } else {
+                        JsonPreviewLine::Plain(line)
+                    });
+                }
+                lines.push(JsonPreviewLine::Plain(format!(
+                    "{}{fence}{suffix}",
+                    " ".repeat(indent)
+                )));
+            } else {
+                lines.push(JsonPreviewLine::Syntax(format!(
+                    "{prefix}{}{suffix}",
+                    serde_json::to_string(text).expect("serializing a JSON string cannot fail")
+                )));
             }
-            lines.push(JsonPreviewLine::Plain(format!(
-                "{}{fence}{suffix}",
-                " ".repeat(indent)
-            )));
         }
         _ => lines.push(JsonPreviewLine::Syntax(format!("{prefix}{value}{suffix}"))),
     }
 }
 
-fn string_block(text: &str) -> (&'static str, String) {
+fn string_block(text: &str) -> Option<(&'static str, String)> {
     let trimmed = text.trim();
     if let Ok(value @ (Value::Object(_) | Value::Array(_))) = serde_json::from_str::<Value>(trimmed)
     {
-        return (
+        return Some((
             "json",
             serde_json::to_string_pretty(&value)
                 .expect("serializing an embedded JSON value cannot fail"),
-        );
+        ));
     }
-    ("md", text.to_owned())
+    text.contains('\n').then(|| ("md", text.to_owned()))
 }
 
 fn code_fence(content: &str) -> String {
@@ -1749,6 +1755,7 @@ mod tests {
 
         assert!(lines.len() > 1);
         assert!(colors.contains(&Color::Cyan));
+        assert!(colors.contains(&Color::Green));
         assert!(colors.contains(&Color::Yellow));
         assert!(colors.contains(&Color::Magenta));
     }
@@ -1779,15 +1786,17 @@ mod tests {
         assert!(lines.iter().any(|line| line == "  \"json\": ```json"));
         assert!(lines.iter().any(|line| line == "  {"));
         assert!(lines.iter().any(|line| line == "    \"nested\": ["));
-        assert!(lines.iter().any(|line| line == "  \"ordinary\": ```md"));
-        assert!(lines.iter().any(|line| line == "  goal"));
-        assert!(lines.iter().any(|line| line == "  \"invalid_json\": ```md"));
-        assert!(lines.iter().any(|line| line == "  {not json}"));
-        assert!(lines.iter().any(|line| line == "  \"empty\": ```md"));
+        assert!(lines.iter().any(|line| line == "  \"ordinary\": \"goal\""));
         assert!(
             lines
                 .iter()
-                .any(|line| line == "  \"json_primitive\": ```md")
+                .any(|line| line == "  \"invalid_json\": \"{not json}\",")
+        );
+        assert!(lines.iter().any(|line| line == "  \"empty\": \"\","));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "  \"json_primitive\": \"true\",")
         );
     }
 
