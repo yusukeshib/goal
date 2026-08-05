@@ -30,7 +30,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
 use serde_json::Value;
 
@@ -882,6 +882,10 @@ fn render_activity_pane(frame: &mut Frame<'_>, area: Rect, state: &mut UiState) 
 }
 
 fn render_detail_pane(frame: &mut Frame<'_>, area: Rect, state: &mut UiState) {
+    // The detail pane replaces content previously rendered by both the activity
+    // pane and longer previews. Explicitly reset the rectangle so terminals do
+    // not retain stale cells when the selected preview becomes shorter.
+    frame.render_widget(Clear, area);
     state.ensure_detail();
     state.detail_area = Some(area);
     let title = state
@@ -2111,6 +2115,48 @@ mod tests {
                 .iter()
                 .any(|span| span.style.fg == Some(Color::Green))
         );
+    }
+
+    #[test]
+    fn shorter_detail_clears_cells_from_the_previous_preview() {
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        let mut state = UiState::new();
+        let long = (0..30)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        state.push(Activity::Controller {
+            timestamp: 1,
+            kind: "long".into(),
+            details: serde_json::json!({"value": long}),
+        });
+        state.push(Activity::Controller {
+            timestamp: 2,
+            kind: "short".into(),
+            details: serde_json::json!({"value": "short"}),
+        });
+
+        state.select(0);
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        state.select(1);
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+
+        let detail = state.detail_area.expect("detail pane is visible");
+        let blank_start = detail.y + 1 + 3;
+        for row in blank_start..detail.bottom() - 1 {
+            for column in detail.x + 1..detail.right() - 2 {
+                assert_eq!(
+                    terminal
+                        .backend()
+                        .buffer()
+                        .cell((column, row))
+                        .unwrap()
+                        .symbol(),
+                    " ",
+                    "stale detail cell at ({column}, {row})"
+                );
+            }
+        }
     }
 
     #[test]
