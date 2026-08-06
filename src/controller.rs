@@ -79,8 +79,6 @@ impl Controller {
             self.output
                 .event("cycle_started", serde_json::json!({"cycle_id": cycle_id}))?;
             let goal = self.loaded.read_goal()?;
-            self.output
-                .event("phase_started", serde_json::json!({"phase": "sensor"}))?;
             let phase_started = Instant::now();
             let observation = match self.runner.run_sensor(&self.loaded.config.sensor) {
                 Ok((observation, artifacts)) => {
@@ -122,8 +120,6 @@ impl Controller {
 
             let context = prompt::prior_context(self.state.latest_worker_completion.as_ref());
             let decider_prompt = prompt::decider_prompt(&goal, &observation, &context);
-            self.output
-                .event("phase_started", serde_json::json!({"phase": "decider"}))?;
             let phase_started = Instant::now();
             let (action, artifacts) = match self.runner.run_json::<DeciderAction>(
                 "decider",
@@ -193,15 +189,14 @@ impl Controller {
                 DeciderAction::RunTask { task } => {
                     let worker_prompt =
                         prompt::worker_prompt(&goal, &observation, &task, "$GOAL_RESULT_PATH");
-                    self.output.event(
-                        "phase_started",
-                        serde_json::json!({"phase": "worker", "task": task}),
-                    )?;
                     let phase_started = Instant::now();
-                    match self.runner.run_json::<WorkerCompletion>(
+                    let mut phase_details = serde_json::Map::new();
+                    phase_details.insert("task".into(), serde_json::json!(task));
+                    match self.runner.run_json_with_details::<WorkerCompletion>(
                         "worker",
                         &self.loaded.config.worker,
                         &worker_prompt,
+                        phase_details,
                     ) {
                         Ok((completion, artifacts)) => match completion.validate() {
                             Err(error) => {

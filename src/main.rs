@@ -154,8 +154,10 @@ DECIDER AND WORKER CONTRACT
 
 FAILURE ANALYSIS
   Runtime data lives under .goal/ beside the config file. Successful and failed
-  invocations retain prompts, results, stdout, stderr, and metadata under
-  .goal/runs/, and compact outcomes are appended to .goal/events.jsonl. Run
+  invocations retain prompts, results, stdout, stderr, outcome metadata, and an
+  exact launch.json (expanded argv, working directory, timeout, and prompt
+  delivery mode) under .goal/runs/. Compact outcomes are appended to
+  .goal/events.jsonl. Run
   `goal stats --since 24h` for outcome counts, worker success rate, and
   role-specific average, p50, and p95 durations. Run `goal analysis` for the
   current local calendar day, `goal analysis --date YYYY-MM-DD` for a past local
@@ -176,8 +178,10 @@ OUTPUT
   --output plain prints timestamped text. --output pretty indents child JSON up
   to 16 KiB as one terminal block and leaves larger diagnostics unformatted.
   stdout.log and stderr.log retain the exact received byte streams. For
-  controller runs, --output json emits strict JSONL envelopes on stdout. JSON
-  diagnostics over 16 KiB are summarized; inputs over 1 MiB use a bounded text
+  controller runs, --output json emits strict JSONL envelopes on stdout.
+  phase_started includes the run ID, expanded argv, working directory, timeout,
+  prompt/result paths, and prompt delivery mode; worker phases also include the
+  selected task. JSON diagnostics over 16 KiB are summarized; inputs over 1 MiB use a bounded text
   preview instead of being parsed for display. For stats and analysis, tui,
   plain, and pretty emit a human-readable report, while json emits one JSON
   report.

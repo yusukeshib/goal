@@ -12,7 +12,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use serde::de::DeserializeOwned;
+use serde::{Serialize, de::DeserializeOwned};
 use wait_timeout::ChildExt;
 
 use crate::{
@@ -25,6 +25,21 @@ use crate::{
 const MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CHILD_LINE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_STREAM_BYTES: usize = 64 * 1024 * 1024;
+const LAUNCH_FILE: &str = "launch.json";
+
+#[derive(Debug, Serialize)]
+struct LaunchRecord<'a> {
+    schema_version: u32,
+    run_id: &'a str,
+    role: &'a str,
+    command: &'a [String],
+    cwd: &'a Path,
+    timeout_seconds: u64,
+    prompt_path: &'a Path,
+    result_path: &'a Path,
+    prompt_delivery: &'static str,
+    phase_details: &'a serde_json::Map<String, serde_json::Value>,
+}
 
 #[derive(Debug)]
 pub struct RunArtifacts {
@@ -117,11 +132,24 @@ impl Runner {
     where
         T: DeserializeOwned,
     {
+        self.run_json_with_details(role, config, prompt, serde_json::Map::new())
+    }
+
+    pub fn run_json_with_details<T>(
+        &self,
+        role: &str,
+        config: &CommandConfig,
+        prompt: &str,
+        phase_details: serde_json::Map<String, serde_json::Value>,
+    ) -> RunResult<T>
+    where
+        T: DeserializeOwned,
+    {
         let artifacts = match self.create_artifacts(role, prompt) {
             Ok(value) => value,
             Err(error) => return Err((RunError::Infrastructure(error), None)),
         };
-        match self.run_child(role, config, &artifacts, Some(prompt)) {
+        match self.run_child(role, config, &artifacts, Some(prompt), phase_details) {
             Ok(_) => {}
             Err(error) => return Err((error, Some(Box::new(artifacts)))),
         }
@@ -194,7 +222,13 @@ impl Runner {
             Ok(value) => value,
             Err(error) => return Err((RunError::Infrastructure(error), None)),
         };
-        let (stdout, _) = match self.run_child("sensor", config, &artifacts, None) {
+        let (stdout, _) = match self.run_child(
+            "sensor",
+            config,
+            &artifacts,
+            None,
+            serde_json::Map::new(),
+        ) {
             Ok(output) => output,
             Err(error) => return Err((error, Some(Box::new(artifacts)))),
         };
@@ -221,6 +255,7 @@ impl Runner {
         config: &CommandConfig,
         artifacts: &RunArtifacts,
         prompt: Option<&str>,
+        mut phase_details: serde_json::Map<String, serde_json::Value>,
     ) -> std::result::Result<(Vec<u8>, Vec<u8>), RunError> {
         let uses_placeholder =
             prompt.is_some() && config.command.iter().any(|arg| arg.contains("{prompt}"));
@@ -244,6 +279,54 @@ impl Runner {
                 "child command must not be empty"
             )));
         };
+        let prompt_delivery = if prompt.is_none() {
+            "none"
+        } else if uses_placeholder {
+            "path_argument"
+        } else {
+            "stdin"
+        };
+        let launch = LaunchRecord {
+            schema_version: 1,
+            run_id: &artifacts.id,
+            role,
+            command: &argv,
+            cwd: &self.project_dir,
+            timeout_seconds: config.timeout_seconds,
+            prompt_path: &artifacts.prompt_path,
+            result_path: &artifacts.result_path,
+            prompt_delivery,
+            phase_details: &phase_details,
+        };
+        let launch_bytes = serde_json::to_vec_pretty(&launch)
+            .map_err(|error| RunError::Infrastructure(error.into()))?;
+        atomic_write(&artifacts.dir.join(LAUNCH_FILE), &launch_bytes)
+            .map_err(RunError::Infrastructure)?;
+
+        phase_details.insert("phase".into(), serde_json::json!(role));
+        phase_details.insert("run_id".into(), serde_json::json!(artifacts.id));
+        phase_details.insert("command".into(), serde_json::json!(&argv));
+        phase_details.insert("cwd".into(), serde_json::json!(&self.project_dir));
+        phase_details.insert(
+            "timeout_seconds".into(),
+            serde_json::json!(config.timeout_seconds),
+        );
+        phase_details.insert(
+            "prompt_path".into(),
+            serde_json::json!(&artifacts.prompt_path),
+        );
+        phase_details.insert(
+            "result_path".into(),
+            serde_json::json!(&artifacts.result_path),
+        );
+        phase_details.insert(
+            "prompt_delivery".into(),
+            serde_json::json!(prompt_delivery),
+        );
+        self.output
+            .event("phase_started", serde_json::Value::Object(phase_details))
+            .map_err(RunError::Infrastructure)?;
+
         let mut command = Command::new(program);
         command
             .args(&argv[1..])
@@ -646,7 +729,17 @@ mod tests {
             .run_json::<serde_json::Value>("test", &config, "hello")
             .unwrap();
         assert_eq!(value, serde_json::json!({"ok": true}));
-        assert_eq!(fs::read_to_string(artifacts.prompt_path).unwrap(), "hello");
+        assert_eq!(fs::read_to_string(&artifacts.prompt_path).unwrap(), "hello");
+
+        let launch: serde_json::Value = serde_json::from_slice(
+            &fs::read(artifacts.dir.join(LAUNCH_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(launch["role"], "test");
+        assert_eq!(launch["command"][4], artifacts.prompt_path.to_str().unwrap());
+        assert_eq!(launch["cwd"], dir.path().to_str().unwrap());
+        assert_eq!(launch["timeout_seconds"], 1);
+        assert_eq!(launch["prompt_delivery"], "path_argument");
     }
 
     #[test]

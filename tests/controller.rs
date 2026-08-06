@@ -206,6 +206,29 @@ fn json_output_is_strict_jsonl_with_one_common_envelope() {
     }
     assert!(lines.iter().any(|line| line["type"] == "wait"));
     assert!(lines.iter().any(|line| line["type"] == "complete"));
+    let phase_starts: Vec<_> = lines
+        .iter()
+        .filter(|line| line["type"] == "phase_started")
+        .collect();
+    assert!(!phase_starts.is_empty());
+    for event in phase_starts {
+        let details = &event["details"];
+        assert!(details["run_id"].is_string());
+        assert!(details["command"].is_array());
+        assert_eq!(details["cwd"], fixture.dir.path().to_str().unwrap());
+        assert_eq!(details["timeout_seconds"], 5);
+        assert!(details["prompt_path"].is_string());
+        assert!(details["result_path"].is_string());
+        assert!(details["prompt_delivery"].is_string());
+        if details["phase"] == "decider" {
+            assert_eq!(details["prompt_delivery"], "path_argument");
+            assert!(details["command"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|argument| argument != "{prompt}"));
+        }
+    }
     assert!(
         lines
             .iter()
