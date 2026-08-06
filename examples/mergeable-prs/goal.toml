@@ -10,7 +10,7 @@ timeout_seconds = 180
 # publish result.json; the injected contract forbids every other modification.
 [decider]
 command = [
-  "../../utils/goal-runner-pi",
+  "./goal-runner-pi",
   "--thinking", "medium",
   "--tools", "write",
   "--", "{prompt}",
@@ -21,7 +21,7 @@ timeout_seconds = 300
 # tools. It must return failure instead of requesting human input or approval.
 [worker]
 command = [
-  "../../utils/goal-runner-pi",
+  "./goal-runner-pi",
   "--thinking", "medium",
   "--tools", "read,bash,edit,write,grep,find,ls",
   "--", "{prompt}",
