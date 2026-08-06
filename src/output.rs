@@ -78,6 +78,20 @@ impl Output {
         }
     }
 
+    pub fn marker(&self, text: &str) -> Result<()> {
+        match self.mode {
+            OutputMode::Tui => self.send_activity(Activity::Marker {
+                timestamp: unix_timestamp(),
+                text: text.to_owned(),
+            }),
+            OutputMode::Plain | OutputMode::Pretty => {
+                self.write_plain(false, format!("{text}\n").as_bytes())?;
+            }
+            OutputMode::Json => {}
+        }
+        Ok(())
+    }
+
     pub fn plain_stdout(&self, message: &str) -> Result<()> {
         if self.mode == OutputMode::Tui {
             self.send_notice(NoticeLevel::Info, message);

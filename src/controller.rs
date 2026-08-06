@@ -76,6 +76,7 @@ impl Controller {
         loop {
             self.ensure_running()?;
             let cycle_id = self.begin_cycle()?;
+            self.output.marker("↓")?;
             self.output
                 .event("cycle_started", serde_json::json!({"cycle_id": cycle_id}))?;
             let goal = self.loaded.read_goal()?;

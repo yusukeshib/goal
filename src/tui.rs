@@ -77,6 +77,10 @@ pub enum Activity {
         level: NoticeLevel,
         text: String,
     },
+    Marker {
+        timestamp: u64,
+        text: String,
+    },
 }
 
 /// Produce a schema-independent, single-line and bounded description.
@@ -449,7 +453,7 @@ fn load_detail(activity: &Activity) -> Result<String> {
     else {
         return Ok(match activity {
             Activity::Controller { details, .. } => serde_json::to_string_pretty(details)?,
-            Activity::Notice { text, .. } => text.clone(),
+            Activity::Notice { text, .. } | Activity::Marker { text, .. } => text.clone(),
             _ => unreachable!(),
         });
     };
@@ -1588,6 +1592,9 @@ fn card_parts(activity: &Activity) -> (u64, String, String, Color) {
                 NoticeLevel::Error => Color::Red,
             },
         ),
+        Activity::Marker { timestamp, text } => {
+            (*timestamp, "GOAL".into(), text.clone(), Color::Cyan)
+        },
     }
 }
 
