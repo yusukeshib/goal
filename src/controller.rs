@@ -22,6 +22,8 @@ use crate::{
 
 const FAILURE_INITIAL_BACKOFF_SECONDS: u64 = 5;
 const FAILURE_MAX_BACKOFF_SECONDS: u64 = 60;
+const SENSOR_RETRY_HINT_MARKER: &str = "goal-retry-after-seconds=";
+const SENSOR_RETRY_HINT_MAX_SECONDS: u64 = 2 * 60 * 60;
 
 #[derive(Default)]
 struct FailureBackoff {
@@ -100,17 +102,22 @@ impl Controller {
                 }
                 Err((error, artifacts)) => {
                     finish_run_error(artifacts.as_deref(), &error)?;
+                    let retry_hint_seconds = artifacts
+                        .as_deref()
+                        .and_then(sensor_retry_after_hint);
                     let run_id = artifacts.as_ref().map(|artifact| artifact.id.clone());
                     let reason = error.to_string();
                     let retry_after_seconds = self
                         .loaded
                         .config
                         .interval_seconds
-                        .max(sensor_failure_backoff.next_delay());
+                        .max(sensor_failure_backoff.next_delay())
+                        .max(retry_hint_seconds.unwrap_or(0));
                     let details = serde_json::json!({
                         "run_id": run_id,
                         "error": reason,
                         "retry_after_seconds": retry_after_seconds,
+                        "sensor_retry_hint_seconds": retry_hint_seconds,
                     });
                     self.store.event("sense_failed", details.clone())?;
                     self.output.event("sense_failed", details)?;
@@ -398,9 +405,23 @@ fn cap_wait(requested: u64, maximum: u64) -> u64 {
     requested.min(maximum)
 }
 
+fn sensor_retry_after_hint(artifacts: &RunArtifacts) -> Option<u64> {
+    let stderr = std::fs::read_to_string(artifacts.dir.join("stderr.log")).ok()?;
+    parse_sensor_retry_after_hint(&stderr)
+}
+
+fn parse_sensor_retry_after_hint(stderr: &str) -> Option<u64> {
+    stderr
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix(SENSOR_RETRY_HINT_MARKER))
+        .filter_map(|value| value.parse::<u64>().ok())
+        .max()
+        .map(|seconds| seconds.min(SENSOR_RETRY_HINT_MAX_SECONDS))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{FailureBackoff, cap_wait};
+    use super::{FailureBackoff, cap_wait, parse_sensor_retry_after_hint};
 
     #[test]
     fn wait_duration_is_capped() {
@@ -429,5 +450,18 @@ mod tests {
         backoff.reset();
 
         assert_eq!(backoff.next_delay(), 5);
+    }
+
+    #[test]
+    fn sensor_retry_hint_is_parsed_and_bounded() {
+        assert_eq!(
+            parse_sensor_retry_after_hint("diagnostic\ngoal-retry-after-seconds=125\n"),
+            Some(125)
+        );
+        assert_eq!(
+            parse_sensor_retry_after_hint("goal-retry-after-seconds=999999\n"),
+            Some(7200)
+        );
+        assert_eq!(parse_sensor_retry_after_hint("diagnostic only\n"), None);
     }
 }

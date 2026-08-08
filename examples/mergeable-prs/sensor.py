@@ -3,8 +3,10 @@
 
 import json
 import os
+import re
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -76,6 +78,30 @@ query($id: ID!, $cursor: String) {
 }
 """
 
+HISTORY_TASK_MAX_CHARS = 2_000
+HISTORY_REASON_MAX_CHARS = 4_000
+HEAD_OID_PATTERN = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{40}(?![0-9a-fA-F])")
+RATE_LIMIT_RETRY_MARKER = "goal-retry-after-seconds="
+
+
+def _emit_rate_limit_retry_hint(message):
+    """Tell the controller when GitHub's primary GraphQL limit resets."""
+    if "rate limit" not in message.lower():
+        return
+    process = subprocess.run(
+        ["gh", "api", "rate_limit", "--jq", ".resources.graphql.reset"],
+        text=True,
+        capture_output=True,
+    )
+    if process.returncode != 0:
+        return
+    try:
+        reset_at = int(process.stdout.strip())
+    except ValueError:
+        return
+    retry_after_seconds = max(1, reset_at - int(time.time()) + 5)
+    print(f"{RATE_LIMIT_RETRY_MARKER}{retry_after_seconds}", file=sys.stderr)
+
 
 def graphql(query, **variables):
     command = ["gh", "api", "graphql", "-f", f"query={query}"]
@@ -86,10 +112,13 @@ def graphql(query, **variables):
     if process.stderr:
         sys.stderr.write(process.stderr)
     if process.returncode != 0:
+        _emit_rate_limit_retry_hint(process.stderr)
         raise RuntimeError(f"gh api graphql exited {process.returncode}")
     payload = json.loads(process.stdout)
     if payload.get("errors"):
-        raise RuntimeError(json.dumps(payload["errors"], ensure_ascii=False))
+        errors = json.dumps(payload["errors"], ensure_ascii=False)
+        _emit_rate_limit_retry_hint(errors)
+        raise RuntimeError(errors)
     return payload["data"]
 
 
@@ -141,8 +170,14 @@ def add_local_checkout_candidates(pr, checkout_roots=None):
     ]
 
 
-def add_prior_worker_failures(pull_requests, events_path=None, limit_per_pr=5):
-    """Attach bounded failure history so stable external blockers are not retried."""
+def _truncate_history_text(text, maximum):
+    if len(text) <= maximum:
+        return text
+    return text[: maximum - 1].rstrip() + "…"
+
+
+def add_prior_worker_failures(pull_requests, events_path=None, limit_per_pr=2):
+    """Attach the latest bounded failure for each recently observed PR head."""
     if events_path is None:
         default_project_dir = Path(__file__).resolve().parent
         project_dir = Path(os.environ.get("GOAL_PROJECT_DIR", default_project_dir))
@@ -150,7 +185,7 @@ def add_prior_worker_failures(pull_requests, events_path=None, limit_per_pr=5):
     else:
         events_path = Path(events_path)
 
-    failures_by_url = {pr.get("url"): [] for pr in pull_requests if pr.get("url")}
+    failures_by_url = {pr.get("url"): {} for pr in pull_requests if pr.get("url")}
     pending_action = None
     if events_path.exists():
         with events_path.open(encoding="utf-8") as events:
@@ -173,20 +208,26 @@ def add_prior_worker_failures(pull_requests, events_path=None, limit_per_pr=5):
                 if completion.get("type") != "failure":
                     continue
                 task = action.get("task") or ""
-                for url, failures in failures_by_url.items():
+                for url, failures_by_head in failures_by_url.items():
                     if url not in task:
                         continue
-                    failures.append(
-                        {
-                            "recordedAt": event.get("timestamp"),
-                            "assignedTask": task,
-                            "reason": completion.get("reason") or "",
-                        }
-                    )
-                    del failures[:-limit_per_pr]
+                    head_match = HEAD_OID_PATTERN.search(task)
+                    head_oid = head_match.group(0).lower() if head_match else "unknown"
+                    failures_by_head[head_oid] = {
+                        "recordedAt": event.get("timestamp"),
+                        "headRefOid": None if head_oid == "unknown" else head_oid,
+                        "assignedTask": _truncate_history_text(
+                            task, HISTORY_TASK_MAX_CHARS
+                        ),
+                        "reason": _truncate_history_text(
+                            completion.get("reason") or "", HISTORY_REASON_MAX_CHARS
+                        ),
+                    }
 
     for pr in pull_requests:
-        pr["priorWorkerFailures"] = failures_by_url.get(pr.get("url"), [])
+        failures = list(failures_by_url.get(pr.get("url"), {}).values())
+        failures.sort(key=lambda failure: failure.get("recordedAt") or 0)
+        pr["priorWorkerFailures"] = failures[-limit_per_pr:]
 
 
 def main():
