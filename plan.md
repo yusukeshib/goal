@@ -191,6 +191,8 @@ Configuration
     goal_file = "GOAL.md"
     interval_seconds = 60
     max_wait_seconds = 3600
+    worker_observation = "full" # or "none" for self-contained tasks
+    max_completed_runs = 200    # optional finished-run retention
 
     [sensor]
     command = ["./sensor.sh"]

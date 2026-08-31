@@ -21,7 +21,7 @@ cd /path/to/goal && goal
 GOAL_DIR=/path/to/goal goal
 ```
 
-`GOAL_DIR` defaults to the current directory, which is also the child working directory. The configured goal file is reloaded at the start of every cycle, and the decider and any dispatched worker receive the same per-cycle snapshot. Run `goal --help` for the complete configuration and protocol reference.
+`GOAL_DIR` defaults to the current directory, which is also the child working directory. The configured goal file is reloaded at the start of every cycle. The decider always receives the full per-cycle observation; workers receive it by default, or only their assigned task when `worker_observation = "none"`. Run `goal --help` for the complete configuration and protocol reference.
 
 A minimal `goal.toml`:
 
@@ -29,6 +29,8 @@ A minimal `goal.toml`:
 goal_file = "GOAL.md"
 interval_seconds = 60
 max_wait_seconds = 3600
+worker_observation = "full" # or "none" when the task is self-contained
+max_completed_runs = 200    # optional; prunes only finished run directories
 
 [sensor]
 command = ["./sensor.sh"]
@@ -68,7 +70,7 @@ goal analysis --date 2026-08-03
 
 TUI: `↑/↓` or `j/k` selects, `PgUp/PgDn` scrolls details, `End` follows, and `q` stops. Redirection automatically falls back to plain output.
 
-State, events, prompts, results, exact child logs, and run metadata are stored under `.goal/`. `stats` and `analysis` inspect these artifacts without starting children.
+State, events, prompts, results, exact child logs, and run metadata are stored under `.goal/`. `stats` and `analysis` inspect these artifacts without starting children. When `max_completed_runs` is set, the controller retains the newest finished run directories and never prunes running, malformed, state, or event artifacts.
 
 ## Examples
 

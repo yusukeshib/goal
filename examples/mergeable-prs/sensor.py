@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Read-only, paginated GitHub observation for authored open pull requests."""
 
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -82,6 +84,18 @@ HISTORY_TASK_MAX_CHARS = 2_000
 HISTORY_REASON_MAX_CHARS = 4_000
 HEAD_OID_PATTERN = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{40}(?![0-9a-fA-F])")
 RATE_LIMIT_RETRY_MARKER = "goal-retry-after-seconds="
+API_LOCK_PATH = Path.home() / ".cache" / "goal" / "github-api.lock"
+
+
+@contextlib.contextmanager
+def api_lock():
+    API_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with API_LOCK_PATH.open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def _emit_rate_limit_retry_hint(message):
@@ -108,7 +122,8 @@ def graphql(query, **variables):
     for name, value in variables.items():
         if value is not None:
             command.extend(["-F", f"{name}={value}"])
-    process = subprocess.run(command, text=True, capture_output=True)
+    with api_lock():
+        process = subprocess.run(command, text=True, capture_output=True)
     if process.stderr:
         sys.stderr.write(process.stderr)
     if process.returncode != 0:

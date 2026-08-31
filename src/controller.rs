@@ -12,7 +12,7 @@ use anyhow::Result;
 use crate::{
     analytics::RunOutcome,
     cancel::Interrupted,
-    config::LoadedConfig,
+    config::{LoadedConfig, WorkerObservation},
     model::{DeciderAction, WorkerCompletion},
     output::Output,
     prompt,
@@ -59,7 +59,12 @@ impl Controller {
         let controller_lock = ControllerLock::acquire(&loaded.project_dir)?;
         let store = StateStore::new(&loaded.project_dir)?;
         let state = store.load()?;
-        let runner = Runner::new(&loaded.project_dir, Arc::clone(&cancelled), output.clone())?;
+        let runner = Runner::new(
+            &loaded.project_dir,
+            Arc::clone(&cancelled),
+            output.clone(),
+            loaded.config.max_completed_runs,
+        )?;
         Ok(Self {
             loaded,
             _lock: controller_lock,
@@ -195,8 +200,16 @@ impl Controller {
 
             match action {
                 DeciderAction::RunTask { task } => {
-                    let worker_prompt =
-                        prompt::worker_prompt(&goal, &observation, &task, "$GOAL_RESULT_PATH");
+                    let worker_observation = match self.loaded.config.worker_observation {
+                        WorkerObservation::Full => Some(&observation),
+                        WorkerObservation::None => None,
+                    };
+                    let worker_prompt = prompt::worker_prompt(
+                        &goal,
+                        worker_observation,
+                        &task,
+                        "$GOAL_RESULT_PATH",
+                    );
                     let phase_started = Instant::now();
                     let mut phase_details = serde_json::Map::new();
                     phase_details.insert("task".into(), serde_json::json!(task));

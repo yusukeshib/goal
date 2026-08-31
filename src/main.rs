@@ -59,6 +59,8 @@ const RUN_HELP: &str = r#"CONFIGURATION
     goal_file = "GOAL.md"
     interval_seconds = 60
     max_wait_seconds = 3600
+    worker_observation = "full" # optional: "none" for self-contained tasks
+    max_completed_runs = 200    # optional: retain newest finished runs
 
     [sensor]
     command = ["./sensor.sh"]
@@ -78,7 +80,9 @@ const RUN_HELP: &str = r#"CONFIGURATION
 GOAL SEMANTICS
   GOAL.md must define what success means and whether the goal is finite or
   continuous. It is reloaded at the start of every cycle; the decider and any
-  worker dispatched in that cycle receive the same goal snapshot.
+  worker dispatched in that cycle receive the same goal snapshot. The decider
+  always receives the full observation. Set worker_observation = "none" only
+  when every worker task is self-contained and carries all required identity.
 
   For a finite goal, the decider may return `complete` after a fresh observation
   proves the success conditions are satisfied.

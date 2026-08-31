@@ -13,9 +13,21 @@ pub struct Config {
     pub interval_seconds: u64,
     #[serde(default = "default_max_wait")]
     pub max_wait_seconds: u64,
+    #[serde(default)]
+    pub worker_observation: WorkerObservation,
+    #[serde(default)]
+    pub max_completed_runs: Option<usize>,
     pub sensor: CommandConfig,
     pub decider: CommandConfig,
     pub worker: CommandConfig,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerObservation {
+    #[default]
+    Full,
+    None,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -89,6 +101,9 @@ impl Config {
         if self.max_wait_seconds == 0 {
             bail!("max_wait_seconds must be greater than zero");
         }
+        if self.max_completed_runs == Some(0) {
+            bail!("max_completed_runs must be greater than zero when set");
+        }
         validate_command("sensor", &self.sensor)?;
         validate_command("decider", &self.decider)?;
         validate_command("worker", &self.worker)?;
@@ -135,7 +150,23 @@ timeout_seconds = 1
             let loaded = LoadedConfig::load(path).unwrap();
             assert_eq!(loaded.read_goal().unwrap(), "Ship the feature");
             assert_eq!(loaded.project_dir, fs::canonicalize(dir.path()).unwrap());
+            assert_eq!(loaded.config.worker_observation, WorkerObservation::Full);
+            assert_eq!(loaded.config.max_completed_runs, None);
         }
+    }
+
+    #[test]
+    fn loads_worker_observation_and_retention_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = valid().replace(
+            "max_wait_seconds = 10",
+            "max_wait_seconds = 10\nworker_observation = \"none\"\nmax_completed_runs = 25",
+        );
+        fs::write(dir.path().join("goal.toml"), text).unwrap();
+        fs::write(dir.path().join("GOAL.md"), "Ship the feature").unwrap();
+        let loaded = LoadedConfig::load(dir.path()).unwrap();
+        assert_eq!(loaded.config.worker_observation, WorkerObservation::None);
+        assert_eq!(loaded.config.max_completed_runs, Some(25));
     }
 
     #[test]
@@ -151,6 +182,8 @@ timeout_seconds = 1
             valid().replace("command = [\"sensor\"]", "command = []"),
             valid().replace("timeout_seconds = 1", "timeout_seconds = 0"),
             valid().replace("max_wait_seconds = 10", "max_wait_seconds = 0"),
+            valid().replace("max_wait_seconds = 10", "max_wait_seconds = 10\nmax_completed_runs = 0"),
+            valid().replace("max_wait_seconds = 10", "max_wait_seconds = 10\nworker_observation = \"selected\""),
         ];
         for (index, text) in invalid.iter().enumerate() {
             let dir = tempfile::tempdir().unwrap();

@@ -114,18 +114,27 @@ pub struct Runner {
     runs_dir: PathBuf,
     cancelled: Arc<AtomicBool>,
     output: Output,
+    max_completed_runs: Option<usize>,
 }
 
 impl Runner {
-    pub fn new(project_dir: &Path, cancelled: Arc<AtomicBool>, output: Output) -> Result<Self> {
+    pub fn new(
+        project_dir: &Path,
+        cancelled: Arc<AtomicBool>,
+        output: Output,
+        max_completed_runs: Option<usize>,
+    ) -> Result<Self> {
         let runs_dir = project_dir.join(".goal/runs");
         fs::create_dir_all(&runs_dir).context("create runs directory")?;
-        Ok(Self {
+        let runner = Self {
             project_dir: project_dir.to_owned(),
             runs_dir,
             cancelled,
             output,
-        })
+            max_completed_runs,
+        };
+        runner.prune_completed_runs()?;
+        Ok(runner)
     }
 
     pub fn run_json<T>(&self, role: &str, config: &CommandConfig, prompt: &str) -> RunResult<T>
@@ -177,6 +186,7 @@ impl Runner {
     }
 
     fn create_artifacts(&self, role: &str, prompt: &str) -> Result<RunArtifacts> {
+        self.prune_completed_runs()?;
         let started = SystemTime::now().duration_since(UNIX_EPOCH)?;
         let nonce = started.as_nanos();
         let started_at_ms = started.as_millis() as u64;
@@ -212,6 +222,43 @@ impl Runner {
             role: role.to_owned(),
             started_at_ms,
         })
+    }
+
+    fn prune_completed_runs(&self) -> Result<()> {
+        let Some(max_completed_runs) = self.max_completed_runs else {
+            return Ok(());
+        };
+        let mut completed = Vec::new();
+        for entry in fs::read_dir(&self.runs_dir).context("read runs directory")? {
+            let entry = entry.context("read run directory entry")?;
+            let file_type = entry.file_type().context("read run entry type")?;
+            if !file_type.is_dir() {
+                continue;
+            }
+            let path = entry.path();
+            let metadata = match fs::read(path.join(METADATA_FILE))
+                .ok()
+                .and_then(|bytes| RunMetadata::from_slice(&bytes).ok())
+            {
+                Some(metadata) => metadata,
+                None => continue,
+            };
+            if metadata.outcome == RunOutcome::Running {
+                continue;
+            }
+            let Some(finished_at_ms) = metadata.finished_at_ms else {
+                continue;
+            };
+            completed.push((finished_at_ms, metadata.started_at_ms, path));
+        }
+        completed.sort_by_key(|(finished_at_ms, started_at_ms, _)| {
+            std::cmp::Reverse((*finished_at_ms, *started_at_ms))
+        });
+        for (_, _, path) in completed.into_iter().skip(max_completed_runs) {
+            fs::remove_dir_all(&path)
+                .with_context(|| format!("remove retained run directory {}", path.display()))?;
+        }
+        Ok(())
     }
 
     pub fn run_sensor(&self, config: &CommandConfig) -> RunResult<serde_json::Value> {
@@ -702,6 +749,7 @@ mod tests {
             dir,
             Arc::new(AtomicBool::new(false)),
             Output::new(crate::output::OutputMode::Plain),
+            None,
         )
         .unwrap()
     }
@@ -777,6 +825,7 @@ mod tests {
             dir.path(),
             Arc::new(AtomicBool::new(false)),
             Output::new(crate::output::OutputMode::Json),
+            None,
         )
         .unwrap();
         let (_, artifacts) = quiet_runner
@@ -835,6 +884,34 @@ mod tests {
             )
             .unwrap();
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn retention_prunes_only_oldest_completed_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let retained = Runner::new(
+            dir.path(),
+            Arc::new(AtomicBool::new(false)),
+            Output::new(crate::output::OutputMode::Plain),
+            Some(2),
+        )
+        .unwrap();
+        let mut completed_paths = Vec::new();
+        for role in ["first", "second", "third"] {
+            let artifacts = retained.create_artifacts(role, "prompt").unwrap();
+            artifacts
+                .finish(RunOutcome::Success, None, Some("done"), None)
+                .unwrap();
+            completed_paths.push(artifacts.dir);
+        }
+
+        let active = retained.create_artifacts("active", "prompt").unwrap();
+        assert!(!completed_paths[0].exists());
+        assert!(completed_paths[1].exists());
+        assert!(completed_paths[2].exists());
+        assert!(active.dir.exists());
+        retained.prune_completed_runs().unwrap();
+        assert!(active.dir.exists());
     }
 
     #[test]
