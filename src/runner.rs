@@ -38,6 +38,8 @@ struct LaunchRecord<'a> {
     prompt_path: &'a Path,
     result_path: &'a Path,
     prompt_delivery: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    work_dir: Option<&'a Path>,
     phase_details: &'a serde_json::Map<String, serde_json::Value>,
 }
 
@@ -333,6 +335,21 @@ impl Runner {
         } else {
             "stdin"
         };
+        let worker_work_dir = if role == "worker" {
+            Some(
+                tempfile::Builder::new()
+                    .prefix(&format!("goal-{}-", artifacts.id))
+                    .tempdir()
+                    .map_err(|error| {
+                        RunError::Infrastructure(
+                            anyhow!(error).context("create disposable worker directory"),
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
+        let work_dir = worker_work_dir.as_ref().map(|directory| directory.path());
         let launch = LaunchRecord {
             schema_version: 1,
             run_id: &artifacts.id,
@@ -343,6 +360,7 @@ impl Runner {
             prompt_path: &artifacts.prompt_path,
             result_path: &artifacts.result_path,
             prompt_delivery,
+            work_dir,
             phase_details: &phase_details,
         };
         let launch_bytes = serde_json::to_vec_pretty(&launch)
@@ -370,6 +388,9 @@ impl Runner {
             "prompt_delivery".into(),
             serde_json::json!(prompt_delivery),
         );
+        if let Some(work_dir) = work_dir {
+            phase_details.insert("work_dir".into(), serde_json::json!(work_dir));
+        }
         self.output
             .event("phase_started", serde_json::Value::Object(phase_details))
             .map_err(RunError::Infrastructure)?;
@@ -389,6 +410,9 @@ impl Runner {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some(work_dir) = work_dir {
+            command.env("GOAL_WORK_DIR", work_dir);
+        }
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
@@ -912,6 +936,58 @@ mod tests {
         assert!(active.dir.exists());
         retained.prune_completed_runs().unwrap();
         assert!(active.dir.exists());
+    }
+
+    #[test]
+    fn gives_workers_a_disposable_work_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, artifacts) = runner(dir.path())
+            .run_json::<serde_json::Value>(
+                "worker",
+                &command(
+                    "test -d \"$GOAL_WORK_DIR\"; printf '%s' \"$GOAL_WORK_DIR\" > work-dir-path; touch \"$GOAL_WORK_DIR/marker\"; printf '{\"ok\":true}' > \"$GOAL_RESULT_PATH\"",
+                ),
+                "",
+            )
+            .unwrap();
+        let work_dir = PathBuf::from(fs::read_to_string(dir.path().join("work-dir-path")).unwrap());
+        assert!(!work_dir.exists());
+
+        let launch: serde_json::Value = serde_json::from_slice(
+            &fs::read(artifacts.dir.join(LAUNCH_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(launch["work_dir"], work_dir.to_str().unwrap());
+    }
+
+    #[test]
+    fn cleans_worker_work_directory_after_process_failure_and_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let failed = runner(dir.path())
+            .run_json::<serde_json::Value>(
+                "worker",
+                &command("printf '%s' \"$GOAL_WORK_DIR\" > failed-work-dir; exit 7"),
+                "",
+            )
+            .unwrap_err()
+            .0;
+        assert!(matches!(failed, RunError::NonZero(_)));
+        let failed_work_dir =
+            PathBuf::from(fs::read_to_string(dir.path().join("failed-work-dir")).unwrap());
+        assert!(!failed_work_dir.exists());
+
+        let timed_out = runner(dir.path())
+            .run_json::<serde_json::Value>(
+                "worker",
+                &command("printf '%s' \"$GOAL_WORK_DIR\" > timed-out-work-dir; sleep 2"),
+                "",
+            )
+            .unwrap_err()
+            .0;
+        assert!(matches!(timed_out, RunError::Timeout));
+        let timed_out_work_dir =
+            PathBuf::from(fs::read_to_string(dir.path().join("timed-out-work-dir")).unwrap());
+        assert!(!timed_out_work_dir.exists());
     }
 
     #[test]

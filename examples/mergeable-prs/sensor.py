@@ -82,6 +82,7 @@ query($id: ID!, $cursor: String) {
 
 HISTORY_TASK_MAX_CHARS = 2_000
 HISTORY_REASON_MAX_CHARS = 4_000
+HISTORY_ACTIVITY_LIMIT = 10
 HEAD_OID_PATTERN = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{40}(?![0-9a-fA-F])")
 RATE_LIMIT_RETRY_MARKER = "goal-retry-after-seconds="
 API_LOCK_PATH = Path.home() / ".cache" / "goal" / "github-api.lock"
@@ -191,8 +192,22 @@ def _truncate_history_text(text, maximum):
     return text[: maximum - 1].rstrip() + "…"
 
 
-def add_prior_worker_failures(pull_requests, events_path=None, limit_per_pr=2):
-    """Attach the latest bounded failure for each recently observed PR head."""
+def _history_timestamp_utc(timestamp):
+    if not isinstance(timestamp, (int, float)):
+        return None
+    try:
+        return datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def add_prior_worker_failures(
+    pull_requests,
+    events_path=None,
+    limit_per_pr=2,
+    activity_limit_per_pr=HISTORY_ACTIVITY_LIMIT,
+):
+    """Attach bounded worker failures and recent dispatch activity to each PR."""
     if events_path is None:
         default_project_dir = Path(__file__).resolve().parent
         project_dir = Path(os.environ.get("GOAL_PROJECT_DIR", default_project_dir))
@@ -201,6 +216,7 @@ def add_prior_worker_failures(pull_requests, events_path=None, limit_per_pr=2):
         events_path = Path(events_path)
 
     failures_by_url = {pr.get("url"): {} for pr in pull_requests if pr.get("url")}
+    activity_by_url = {url: [] for url in failures_by_url}
     pending_action = None
     if events_path.exists():
         with events_path.open(encoding="utf-8") as events:
@@ -210,39 +226,69 @@ def add_prior_worker_failures(pull_requests, events_path=None, limit_per_pr=2):
                 except json.JSONDecodeError:
                     continue
 
-                if event.get("type") == "decision":
+                event_type = event.get("type")
+                if event_type == "decision":
                     action = (event.get("details") or {}).get("action") or {}
                     pending_action = action if action.get("type") == "run_task" else None
                     continue
-                if event.get("type") != "worker_completed" or pending_action is None:
+                if event_type not in {"worker_completed", "worker_failed"}:
+                    continue
+                if pending_action is None:
                     continue
 
                 action = pending_action
                 pending_action = None
-                completion = (event.get("details") or {}).get("completion") or {}
-                if completion.get("type") != "failure":
+                details = event.get("details") or {}
+                completion = details.get("completion") or {}
+                completion_type = completion.get("type")
+                if event_type == "worker_failed":
+                    completion_type = "failure"
+                if completion_type not in {"done", "failure"}:
                     continue
+
                 task = action.get("task") or ""
+                head_match = HEAD_OID_PATTERN.search(task)
+                head_oid = head_match.group(0).lower() if head_match else "unknown"
+                recorded_at = event.get("timestamp")
+                summary_or_reason = (
+                    completion.get("summary")
+                    if completion_type == "done"
+                    else completion.get("reason") or details.get("error") or ""
+                )
                 for url, failures_by_head in failures_by_url.items():
                     if url not in task:
                         continue
-                    head_match = HEAD_OID_PATTERN.search(task)
-                    head_oid = head_match.group(0).lower() if head_match else "unknown"
-                    failures_by_head[head_oid] = {
-                        "recordedAt": event.get("timestamp"),
+                    activity = {
+                        "recordedAt": recorded_at,
+                        "recordedAtUtc": _history_timestamp_utc(recorded_at),
                         "headRefOid": None if head_oid == "unknown" else head_oid,
                         "assignedTask": _truncate_history_text(
                             task, HISTORY_TASK_MAX_CHARS
                         ),
-                        "reason": _truncate_history_text(
-                            completion.get("reason") or "", HISTORY_REASON_MAX_CHARS
-                        ),
+                        "completionType": completion_type,
                     }
+                    activity["summary" if completion_type == "done" else "reason"] = (
+                        _truncate_history_text(
+                            summary_or_reason, HISTORY_REASON_MAX_CHARS
+                        )
+                    )
+                    activity_by_url[url].append(activity)
+                    if completion_type == "failure":
+                        failures_by_head[head_oid] = {
+                            "recordedAt": recorded_at,
+                            "headRefOid": activity["headRefOid"],
+                            "assignedTask": activity["assignedTask"],
+                            "reason": activity["reason"],
+                        }
 
     for pr in pull_requests:
-        failures = list(failures_by_url.get(pr.get("url"), {}).values())
+        url = pr.get("url")
+        failures = list(failures_by_url.get(url, {}).values())
         failures.sort(key=lambda failure: failure.get("recordedAt") or 0)
         pr["priorWorkerFailures"] = failures[-limit_per_pr:]
+        activity = activity_by_url.get(url, [])
+        activity.sort(key=lambda item: item.get("recordedAt") or 0)
+        pr["recentWorkerActivity"] = activity[-activity_limit_per_pr:]
 
 
 def main():

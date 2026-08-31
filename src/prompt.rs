@@ -56,7 +56,9 @@ Rules:
 - If completion requires a human-only decision, unavailable authority, missing credentials, or an operation you cannot perform safely and automatically, do not perform it; return failure with a specific reason.
 - A failure reason must include concrete evidence and enough context to diagnose the run and improve future goals or automation.
 - Write exactly one structured completion atomically when practical to `{result_path}`, then exit.
+- Put every disposable checkout and temporary work artifact under `$GOAL_WORK_DIR`; never create one elsewhere. The runtime owns and removes that directory after this invocation.
 - Do not claim success based only on commands attempted; describe what actually changed or was verified.
+- Report every prescribed verification command that failed. Return done only when required checks pass, or when each remaining failure is proven pre-existing by an explicit comparison with the untouched base and disclosed in the summary.
 - Stdout and stderr are diagnostics, not protocol output.
 {observation_contract}
 Valid completions use a `type` tag:
@@ -107,6 +109,8 @@ mod tests {
         );
         assert!(worker.contains("Perform only the one assigned task"));
         assert!(worker.contains("Never request human approval"));
+        assert!(worker.contains("$GOAL_WORK_DIR"));
+        assert!(worker.contains("explicit comparison with the untouched base"));
         assert!(worker.contains("untrusted data"));
         assert!(worker.contains(r#"{"type":"failure""#));
         assert!(!worker.contains("needs_input"));

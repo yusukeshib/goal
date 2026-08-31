@@ -120,7 +120,86 @@ class SensorNormalizationTests(unittest.TestCase):
             ["external blocker 0", "external blocker 2"],
         )
         self.assertEqual([failure["headRefOid"] for failure in failures], heads[:2])
+        self.assertEqual(
+            [item["completionType"] for item in pull_requests[0]["recentWorkerActivity"]],
+            ["failure", "failure", "failure"],
+        )
         self.assertEqual(pull_requests[1]["priorWorkerFailures"], [])
+        self.assertEqual(pull_requests[1]["recentWorkerActivity"], [])
+
+    def test_worker_failed_is_failure_history_and_activity_is_bounded(self):
+        url = "https://github.com/owner/repo/pull/1"
+        heads = [character * 40 for character in "abc"]
+        events = []
+        completions = [
+            (
+                "worker_completed",
+                {"completion": {"type": "done", "summary": "first pass"}},
+            ),
+            (
+                "worker_failed",
+                {
+                    "error": "process timed out",
+                    "completion": {
+                        "type": "failure",
+                        "reason": "invocation may have changed external state",
+                    },
+                },
+            ),
+            (
+                "worker_completed",
+                {"completion": {"type": "done", "summary": "third pass"}},
+            ),
+        ]
+        for index, ((event_type, details), head) in enumerate(
+            zip(completions, heads, strict=True), start=1
+        ):
+            events.extend(
+                [
+                    {
+                        "type": "decision",
+                        "details": {
+                            "action": {
+                                "type": "run_task",
+                                "task": f"Fix {url} at observed head {head}",
+                            }
+                        },
+                    },
+                    {
+                        "type": event_type,
+                        "timestamp": index,
+                        "details": details,
+                    },
+                ]
+            )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            events_path = Path(temporary_directory) / "events.jsonl"
+            events_path.write_text(
+                "\n".join(json.dumps(event) for event in events), encoding="utf-8"
+            )
+            pull_requests = [{"url": url}]
+            add_prior_worker_failures(
+                pull_requests,
+                events_path=events_path,
+                activity_limit_per_pr=2,
+            )
+
+        self.assertEqual(
+            pull_requests[0]["priorWorkerFailures"],
+            [
+                {
+                    "recordedAt": 2,
+                    "headRefOid": heads[1],
+                    "assignedTask": f"Fix {url} at observed head {heads[1]}",
+                    "reason": "invocation may have changed external state",
+                }
+            ],
+        )
+        activity = pull_requests[0]["recentWorkerActivity"]
+        self.assertEqual([item["completionType"] for item in activity], ["failure", "done"])
+        self.assertEqual(activity[0]["recordedAtUtc"], "1970-01-01T00:00:02+00:00")
+        self.assertEqual(activity[1]["summary"], "third pass")
 
     def test_add_prior_worker_failures_truncates_large_reasons(self):
         url = "https://github.com/owner/repo/pull/1"

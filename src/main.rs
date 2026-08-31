@@ -118,6 +118,10 @@ DECIDER AND WORKER CONTRACT
     GOAL_RESULT_PATH    required result.json path
     GOAL_PROJECT_DIR    absolute project directory
 
+  Worker invocations also receive GOAL_WORK_DIR, a fresh disposable directory
+  for checkouts and temporary artifacts. It is removed after the worker exits,
+  fails, times out, or is cancelled.
+
   If any argv element contains {prompt}, it is replaced with GOAL_PROMPT_PATH
   and child stdin is closed. Otherwise prompt.md is piped to stdin and closed.
   The child must atomically write exactly one tagged JSON object to

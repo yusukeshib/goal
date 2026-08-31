@@ -43,6 +43,7 @@ if (($# != 1)); then
 fi
 
 prompt_path=$1
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 if [[ ! -r $prompt_path ]]; then
   echo "goal-runner-pi: prompt is not readable: $prompt_path" >&2
@@ -67,10 +68,5 @@ fi
   --no-skills \
   --no-prompt-templates \
   "@$prompt_path" |
-  jq --compact-output --unbuffered '
-    select(.type != "message_update" and .type != "tool_execution_update")
-    | if .type == "turn_end" then del(.message, .toolResults)
-      elif .type == "agent_end" then del(.messages)
-      else .
-      end
-  '
+  jq --compact-output --unbuffered \
+    --from-file "$script_dir/goal-runner-filter.jq"
