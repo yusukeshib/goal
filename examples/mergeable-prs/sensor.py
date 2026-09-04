@@ -86,13 +86,27 @@ HISTORY_ACTIVITY_LIMIT = 10
 HEAD_OID_PATTERN = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{40}(?![0-9a-fA-F])")
 RATE_LIMIT_RETRY_MARKER = "goal-retry-after-seconds="
 API_LOCK_PATH = Path.home() / ".cache" / "goal" / "github-api.lock"
+API_LOCK_TIMEOUT_SECONDS = 30
+API_CALL_TIMEOUT_SECONDS = 120
+RATE_LIMIT_CALL_TIMEOUT_SECONDS = 15
+LOCK_POLL_SECONDS = 0.1
 
 
 @contextlib.contextmanager
 def api_lock():
     API_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
     with API_LOCK_PATH.open("a+") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        deadline = time.monotonic() + API_LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"timed out waiting {API_LOCK_TIMEOUT_SECONDS}s for GitHub API lock"
+                    )
+                time.sleep(LOCK_POLL_SECONDS)
         try:
             yield
         finally:
@@ -103,11 +117,15 @@ def _emit_rate_limit_retry_hint(message):
     """Tell the controller when GitHub's primary GraphQL limit resets."""
     if "rate limit" not in message.lower():
         return
-    process = subprocess.run(
-        ["gh", "api", "rate_limit", "--jq", ".resources.graphql.reset"],
-        text=True,
-        capture_output=True,
-    )
+    try:
+        process = subprocess.run(
+            ["gh", "api", "rate_limit", "--jq", ".resources.graphql.reset"],
+            text=True,
+            capture_output=True,
+            timeout=RATE_LIMIT_CALL_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return
     if process.returncode != 0:
         return
     try:
@@ -123,8 +141,18 @@ def graphql(query, **variables):
     for name, value in variables.items():
         if value is not None:
             command.extend(["-F", f"{name}={value}"])
-    with api_lock():
-        process = subprocess.run(command, text=True, capture_output=True)
+    try:
+        with api_lock():
+            process = subprocess.run(
+                command,
+                text=True,
+                capture_output=True,
+                timeout=API_CALL_TIMEOUT_SECONDS,
+            )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(
+            f"gh api graphql timed out after {API_CALL_TIMEOUT_SECONDS}s"
+        ) from error
     if process.stderr:
         sys.stderr.write(process.stderr)
     if process.returncode != 0:

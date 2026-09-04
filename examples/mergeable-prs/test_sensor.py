@@ -1,7 +1,8 @@
 import json
+import subprocess
 import tempfile
 import unittest
-from contextlib import redirect_stderr
+from contextlib import nullcontext, redirect_stderr
 from io import StringIO
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -11,12 +12,47 @@ from sensor import (
     RATE_LIMIT_RETRY_MARKER,
     _emit_rate_limit_retry_hint,
     add_local_checkout_candidates,
+    api_lock,
     add_prior_worker_failures,
+    graphql,
     remove_resolved_review_threads,
 )
 
 
 class SensorNormalizationTests(unittest.TestCase):
+    def test_api_lock_wait_has_bounded_timeout(self):
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "sensor.API_LOCK_PATH", Path(directory) / "api.lock"
+        ), patch(
+            "sensor.fcntl.flock", side_effect=BlockingIOError
+        ), patch(
+            "sensor.time.monotonic", side_effect=[0, 31]
+        ), patch(
+            "sensor.time.sleep"
+        ), self.assertRaisesRegex(RuntimeError, "timed out waiting 30s"):
+            with api_lock():
+                self.fail("lock should not have been acquired")
+
+    def test_graphql_api_call_has_bounded_timeout(self):
+        process = Mock(
+            returncode=0,
+            stdout='{"data":{"ok":true}}',
+            stderr="",
+        )
+        with patch("sensor.api_lock", return_value=nullcontext()), patch(
+            "sensor.subprocess.run", return_value=process
+        ) as run:
+            self.assertEqual(graphql("query { ok }"), {"ok": True})
+
+        self.assertEqual(run.call_args.kwargs["timeout"], 120)
+
+    def test_graphql_api_timeout_is_reported(self):
+        timeout = subprocess.TimeoutExpired(["gh", "api"], 120)
+        with patch("sensor.api_lock", return_value=nullcontext()), patch(
+            "sensor.subprocess.run", side_effect=timeout
+        ), self.assertRaisesRegex(RuntimeError, "timed out after 120s"):
+            graphql("query { ok }")
+
     def test_remove_resolved_review_threads_keeps_only_explicitly_unresolved(self):
         pull_request = {
             "reviewThreads": {
