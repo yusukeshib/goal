@@ -2,6 +2,9 @@ goal_file = "GOAL.md"
 interval_seconds = 0
 max_wait_seconds = 300
 worker_observation = "none"
+# Preserve more than 24h at the fastest 60s monitoring cadence while bounding
+# high-volume model artifacts on this continuous service.
+max_completed_runs = 4096
 
 [sensor]
 command = ["python3", "./sensor.py"]
