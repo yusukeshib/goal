@@ -237,6 +237,49 @@ class SensorNormalizationTests(unittest.TestCase):
         self.assertEqual(activity[0]["recordedAtUtc"], "1970-01-01T00:00:02+00:00")
         self.assertEqual(activity[1]["summary"], "third pass")
 
+    def test_recent_worker_activity_excludes_entries_before_rolling_hour(self):
+        url = "https://github.com/owner/repo/pull/1"
+        events = []
+        for recorded_at in (99, 100, 200):
+            events.extend(
+                [
+                    {
+                        "type": "decision",
+                        "details": {
+                            "action": {
+                                "type": "run_task",
+                                "task": f"Fix {url} at observed head {'a' * 40}",
+                            }
+                        },
+                    },
+                    {
+                        "type": "worker_completed",
+                        "timestamp": recorded_at,
+                        "details": {
+                            "completion": {
+                                "type": "done",
+                                "summary": f"completion at {recorded_at}",
+                            }
+                        },
+                    },
+                ]
+            )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            events_path = Path(temporary_directory) / "events.jsonl"
+            events_path.write_text(
+                "\n".join(json.dumps(event) for event in events), encoding="utf-8"
+            )
+            pull_requests = [{"url": url}]
+            add_prior_worker_failures(
+                pull_requests, events_path=events_path, activity_since=100
+            )
+
+        self.assertEqual(
+            [item["recordedAt"] for item in pull_requests[0]["recentWorkerActivity"]],
+            [100, 200],
+        )
+
     def test_add_prior_worker_failures_truncates_large_reasons(self):
         url = "https://github.com/owner/repo/pull/1"
         head = "a" * 40

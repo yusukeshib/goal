@@ -83,6 +83,7 @@ query($id: ID!, $cursor: String) {
 HISTORY_TASK_MAX_CHARS = 2_000
 HISTORY_REASON_MAX_CHARS = 4_000
 HISTORY_ACTIVITY_LIMIT = 10
+HISTORY_ACTIVITY_WINDOW_SECONDS = 60 * 60
 HEAD_OID_PATTERN = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{40}(?![0-9a-fA-F])")
 RATE_LIMIT_RETRY_MARKER = "goal-retry-after-seconds="
 API_LOCK_PATH = Path.home() / ".cache" / "goal" / "github-api.lock"
@@ -234,6 +235,7 @@ def add_prior_worker_failures(
     events_path=None,
     limit_per_pr=2,
     activity_limit_per_pr=HISTORY_ACTIVITY_LIMIT,
+    activity_since=None,
 ):
     """Attach bounded worker failures and recent dispatch activity to each PR."""
     if events_path is None:
@@ -315,6 +317,13 @@ def add_prior_worker_failures(
         failures.sort(key=lambda failure: failure.get("recordedAt") or 0)
         pr["priorWorkerFailures"] = failures[-limit_per_pr:]
         activity = activity_by_url.get(url, [])
+        if activity_since is not None:
+            activity = [
+                item
+                for item in activity
+                if isinstance(item.get("recordedAt"), (int, float))
+                and item["recordedAt"] >= activity_since
+            ]
         activity.sort(key=lambda item: item.get("recordedAt") or 0)
         pr["recentWorkerActivity"] = activity[-activity_limit_per_pr:]
 
@@ -353,7 +362,10 @@ def main():
         remove_resolved_review_threads(pr)
         add_local_checkout_candidates(pr)
 
-    add_prior_worker_failures(pull_requests)
+    add_prior_worker_failures(
+        pull_requests,
+        activity_since=observed_at.timestamp() - HISTORY_ACTIVITY_WINDOW_SECONDS,
+    )
 
     observation = {
         "observed_at": observed_at.isoformat(),
