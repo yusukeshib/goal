@@ -219,8 +219,8 @@ EXAMPLES
   goal analysis ./goals/ci/goal.toml --date 2026-08-03 --output json
   goal up ./goals/ci/goal.toml --foreground --output json | jq --unbuffered -C .
 
-  See examples/fake for a deterministic full cycle and
-  examples/mergeable-prs for a real read-only GitHub sensor."#;
+  See examples/fake for a deterministic full cycle. Keep operational goal
+  configurations outside this source checkout, for example under ~/goals/."#;
 
 #[derive(Parser)]
 #[command(
