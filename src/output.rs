@@ -133,11 +133,15 @@ impl Output {
         if self.mode != OutputMode::Json {
             if self.mode == OutputMode::Pretty && stream == "stdout" {
                 let rendered = prettify_json_line(line)?;
-                let prefix = format!("[{}] [{role}] ", Local::now().format("%Y-%m-%d %H:%M:%S"));
+                let prefix = format!(
+                    "[{}] {}",
+                    Local::now().format("%Y-%m-%d %H:%M:%S"),
+                    child_prefix(role, run_id)
+                );
                 let tagged = prefix_block(&rendered, prefix.as_bytes());
                 return self.write_bytes(false, &tagged);
             }
-            let tagged = prefix_lines(line, format!("[{role}] ").as_bytes());
+            let tagged = prefix_lines(line, child_prefix(role, run_id).as_bytes());
             return self.write_plain(stream == "stderr", &tagged);
         }
 
@@ -218,6 +222,14 @@ impl Output {
             writer.flush().context("flush stdout")?;
         }
         Ok(())
+    }
+}
+
+fn child_prefix(role: &str, run_id: &str) -> String {
+    if role == "worker" {
+        format!("[worker] [{run_id}] ")
+    } else {
+        format!("[{role}] ")
     }
 }
 
@@ -309,6 +321,13 @@ mod tests {
             prefix_lines(b"first\nsecond\n", b"[timestamp] "),
             b"[timestamp] first\n[timestamp] second\n"
         );
+    }
+
+    #[test]
+    fn worker_prefix_includes_run_id_without_changing_other_roles() {
+        assert_eq!(child_prefix("worker", "run-42"), "[worker] [run-42] ");
+        assert_eq!(child_prefix("sensor", "run-1"), "[sensor] ");
+        assert_eq!(child_prefix("decider", "run-2"), "[decider] ");
     }
 
     #[test]

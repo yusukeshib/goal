@@ -60,6 +60,39 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 127
 fi
 
+if [[ ${GOAL_RUN_ID:-} == *-worker ]]; then
+  if [[ -z ${GOAL_WORK_DIR:-} || ! -d $GOAL_WORK_DIR ]]; then
+    echo "goal-runner-pi: worker GOAL_WORK_DIR is unavailable" >&2
+    exit 2
+  fi
+  pr_tools="$PWD/pr_tools.py"
+  if [[ ! -r $pr_tools ]]; then
+    echo "goal-runner-pi: PR helper is not readable: $pr_tools" >&2
+    exit 2
+  fi
+  real_git=$(command -v git || true)
+  if [[ -z $real_git ]]; then
+    echo "goal-runner-pi: git is required" >&2
+    exit 127
+  fi
+  guard_bin="$GOAL_WORK_DIR/goal-guard-bin"
+  mkdir -p "$guard_bin"
+  cat >"$guard_bin/git" <<'SH'
+#!/bin/bash
+for argument in "$@"; do
+  if [[ $argument == push ]]; then
+    echo "goal-runner-pi: raw git push is blocked; use GOAL_PR_TOOLS guarded-push" >&2
+    exit 2
+  fi
+done
+exec "$GOAL_REAL_GIT" "$@"
+SH
+  chmod 700 "$guard_bin/git"
+  export GOAL_REAL_GIT=$real_git
+  export GOAL_PR_TOOLS=$pr_tools
+  export PATH="$guard_bin:$PATH"
+fi
+
 "${pi_command[@]}" \
   --mode json \
   --no-session \

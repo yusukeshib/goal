@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, ExitStatus, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -117,6 +117,7 @@ pub struct Runner {
     cancelled: Arc<AtomicBool>,
     output: Output,
     max_completed_runs: Option<usize>,
+    artifact_nonce: Mutex<u128>,
 }
 
 impl Runner {
@@ -134,6 +135,7 @@ impl Runner {
             cancelled,
             output,
             max_completed_runs,
+            artifact_nonce: Mutex::new(0),
         };
         runner.prune_completed_runs()?;
         Ok(runner)
@@ -188,9 +190,14 @@ impl Runner {
     }
 
     fn create_artifacts(&self, role: &str, prompt: &str) -> Result<RunArtifacts> {
+        // Serialize pruning and publication: concurrent invocations must not
+        // delete the same retained directory or reuse a coarse-clock run ID.
+        let mut last_nonce = self.artifact_nonce.lock()
+            .map_err(|_| anyhow!("artifact creation lock poisoned"))?;
         self.prune_completed_runs()?;
         let started = SystemTime::now().duration_since(UNIX_EPOCH)?;
-        let nonce = started.as_nanos();
+        let nonce = started.as_nanos().max(*last_nonce + 1);
+        *last_nonce = nonce;
         let started_at_ms = started.as_millis() as u64;
         let id = format!("{nonce}-{role}");
         let dir = self.runs_dir.join(&id);
@@ -306,6 +313,9 @@ impl Runner {
         prompt: Option<&str>,
         mut phase_details: serde_json::Map<String, serde_json::Value>,
     ) -> std::result::Result<(Vec<u8>, Vec<u8>), RunError> {
+        if self.cancelled.load(Ordering::SeqCst) {
+            return Err(RunError::Cancelled);
+        }
         let uses_placeholder =
             prompt.is_some() && config.command.iter().any(|arg| arg.contains("{prompt}"));
         let prompt_path = if uses_placeholder {
@@ -417,6 +427,9 @@ impl Runner {
         {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
+        }
+        if self.cancelled.load(Ordering::SeqCst) {
+            return Err(RunError::Cancelled);
         }
         let mut child = command.spawn().map_err(|error| {
             RunError::Infrastructure(anyhow!(error).context(format!("spawn {program}")))
@@ -936,6 +949,49 @@ mod tests {
         assert!(active.dir.exists());
         retained.prune_completed_runs().unwrap();
         assert!(active.dir.exists());
+    }
+
+    #[test]
+    fn concurrent_artifact_creation_is_unique_and_preserves_active_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let retained = Runner::new(
+            dir.path(),
+            Arc::new(AtomicBool::new(false)),
+            Output::new(crate::output::OutputMode::Plain),
+            Some(1),
+        ).unwrap();
+        for _ in 0..3 {
+            retained.create_artifacts("worker", "old").unwrap()
+                .finish(RunOutcome::Success, None, Some("done"), None).unwrap();
+        }
+        // Force the monotonic fallback rather than relying on clock resolution.
+        *retained.artifact_nonce.lock().unwrap() = u128::MAX / 2;
+        let artifacts = thread::scope(|scope| {
+            let handles: Vec<_> = (0..8).map(|_| {
+                scope.spawn(|| retained.create_artifacts("worker", "active").unwrap())
+            }).collect();
+            handles.into_iter().map(|handle| handle.join().unwrap()).collect::<Vec<_>>()
+        });
+        let ids: std::collections::HashSet<_> = artifacts.iter().map(|run| &run.id).collect();
+        assert_eq!(ids.len(), 8);
+        for run in &artifacts {
+            assert!(run.dir.exists());
+            assert!(run.id.ends_with("-worker"));
+            assert_eq!(fs::read_to_string(&run.prompt_path).unwrap(), "active");
+        }
+        assert_eq!(fs::read_dir(&retained.runs_dir).unwrap().count(), 9);
+    }
+
+    #[test]
+    fn cancelled_runner_does_not_launch_a_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = runner(dir.path());
+        runner.cancelled.store(true, Ordering::SeqCst);
+        let result = runner.run_json::<serde_json::Value>(
+            "worker", &command("touch should-not-exist"), "task",
+        );
+        assert!(matches!(result, Err((RunError::Cancelled, _))));
+        assert!(!dir.path().join("should-not-exist").exists());
     }
 
     #[test]

@@ -4,14 +4,14 @@ goal — design
 Purpose
 -------
 
-`goal` is a small foreground controller that continuously pursues one natural-
+`goal` is a small service controller that continuously pursues one natural-
 language goal:
 
     sense -> decide -> act -> sense -> ...
 
-A one-shot read-only decider chooses one typed action. At most one disposable
-worker performs one bounded task. Neither process can ask for human input,
-approval, or intervention.
+A one-shot read-only decider chooses one typed action: one bounded task or a
+fixed batch of independent tasks executed with bounded concurrency. Each worker
+is disposable. Neither process can ask for human input, approval, or intervention.
 
 Confirmed design
 ----------------
@@ -19,7 +19,9 @@ Confirmed design
 1. There is exactly one natural-language goal.
 2. Every cycle senses current reality before deciding.
 3. The decider is read-only and returns one typed action.
-4. At most one non-TUI worker runs at a time.
+4. Non-TUI workers run up to the requested concurrency, capped by
+   `max_concurrency` (default 1) and task count. All batch results are collected
+   before the next observation; failures do not stop independent siblings.
 5. A worker receives exactly one task, writes one structured completion, and
    exits.
 6. Worker claims do not prove convergence. After `done`, the controller senses
@@ -38,9 +40,11 @@ Confirmed design
    re-sensed without infrastructure backoff. Because a failed worker may have modified external state,
    its failure context tells the next decider not to repeat the task unless the
    newly observed reality materially changed.
-10. No daemon, child PTY, worker pool, parallel workers, scheduler, workflow DAG,
-    or persistent agent conversation is part of the controller. A bounded,
-    observational TUI may render controller and child activity.
+10. The controller can run as a detached service or in the foreground. A bounded
+    worker pool executes only the fixed batch selected for that cycle. There is
+    no rolling admission of newly discovered tasks, durable queue, workflow DAG,
+    child PTY, or persistent agent conversation. A bounded observational TUI is
+    available only for foreground operation.
 
 State machine
 -------------
@@ -54,11 +58,13 @@ State machine
       |                          |
       |                          +-- failure --> RECORD --> SENSE
       |
+      +-- run_tasks --> RUN BOUNDED BATCH --> COLLECT ALL --> SENSE
+      |
       +-- wait -------------------------------> SLEEP --> SENSE
       |
       +-- complete ---------------------------> RECORD --> EXIT 0
       |
-      +-- failure ----------------------------> RECORD --> EXIT 1
+      +-- failure ----------------------------> RECORD --> BACKOFF --> SENSE
 
 Protocol
 --------
@@ -66,6 +72,7 @@ Protocol
 Decider actions use serde's `type` tag:
 
     {"type":"run_task","task":"one bounded task"}
+    {"type":"run_tasks","tasks":["independent A","independent B"],"concurrency":2}
     {"type":"wait","reason":"temporary reason","retry_after_seconds":60}
     {"type":"complete","summary":"fresh evidence of convergence"}
     {"type":"failure","reason":"why this decision cycle cannot progress"}
@@ -76,6 +83,11 @@ Worker completions:
     {"type":"failure","reason":"why automatic completion is impossible"}
 
 Every text field must be non-empty. Unknown and extra fields are rejected.
+A batch requires a nonempty task list and positive concurrency. Workers share
+the project directory and external resources; independence is the decider's
+responsibility, not a sandbox guarantee. Invocation failures cause one backoff
+per batch after results are collected. Cancellation stops queued admission and
+drains active workers; incomplete batches are re-observed, never auto-replayed.
 `failure` reasons must contain concrete evidence useful for diagnosing the run
 and improving future goals or automation.
 
@@ -162,12 +174,12 @@ The artifacts must distinguish:
 * recoverable sensor, decider, and worker infrastructure failures;
 * terminal controller and cancellation failures.
 
-Target selection is shared by run and analysis commands: `GOAL_DIR` selects the
-goal directory, otherwise the current directory is used. `goal stats --since
-24h` scans metadata without starting child processes and reports role-specific
-outcomes, worker success rate, failure kinds, and average/p50/p95 durations.
-Legacy run directories without metadata are counted across all time but excluded
-from filtered rates and durations.
+Every command that operates on one goal requires an explicit path to its
+`goal.toml`; neither the current directory nor `GOAL_DIR` implicitly selects a
+goal. `goal stats GOAL_FILE --since 24h` scans metadata without starting child
+processes and reports role-specific outcomes, worker success rate, failure kinds,
+and average/p50/p95 durations. Legacy run directories without metadata are
+counted across all time and excluded from filtered rates and durations.
 
 Daily goal improvement
 ----------------------

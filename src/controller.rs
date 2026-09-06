@@ -1,22 +1,22 @@
 use std::{
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, mpsc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::Result;
+use anyhow::{Result, anyhow, bail};
 
 use crate::{
     analytics::RunOutcome,
     cancel::Interrupted,
     config::{LoadedConfig, WorkerObservation},
-    model::{DeciderAction, WorkerCompletion},
+    model::{DeciderAction, WorkerBatchCompletion, WorkerCompletion, WorkerTaskResult},
     output::Output,
     prompt,
-    runner::{RunArtifacts, RunError, Runner},
+    runner::{RunArtifacts, RunError, RunResult, Runner},
     state::{ControllerLock, PersistentState, StateStore, unix_timestamp},
 };
 
@@ -47,7 +47,7 @@ impl FailureBackoff {
 pub struct Controller {
     loaded: LoadedConfig,
     _lock: ControllerLock,
-    runner: Runner,
+    runner: Arc<Runner>,
     store: StateStore,
     state: PersistentState,
     cancelled: Arc<AtomicBool>,
@@ -56,7 +56,7 @@ pub struct Controller {
 
 impl Controller {
     pub fn new(loaded: LoadedConfig, cancelled: Arc<AtomicBool>, output: Output) -> Result<Self> {
-        let controller_lock = ControllerLock::acquire(&loaded.project_dir)?;
+        let controller_lock = ControllerLock::acquire(&loaded.project_dir, &loaded.config_path)?;
         let store = StateStore::new(&loaded.project_dir)?;
         let state = store.load()?;
         let runner = Runner::new(
@@ -68,7 +68,7 @@ impl Controller {
         Ok(Self {
             loaded,
             _lock: controller_lock,
-            runner,
+            runner: Arc::new(runner),
             store,
             state,
             cancelled,
@@ -131,8 +131,16 @@ impl Controller {
                 }
             };
 
-            let context = prompt::prior_context(self.state.latest_worker_completion.as_ref());
-            let decider_prompt = prompt::decider_prompt(&goal, &observation, &context);
+            let context = prompt::prior_context(
+                self.state.latest_worker_completion.as_ref(),
+                self.state.latest_worker_batch.as_ref(),
+            );
+            let decider_prompt = prompt::decider_prompt(
+                &goal,
+                &observation,
+                &context,
+                self.loaded.config.max_concurrency,
+            );
             let phase_started = Instant::now();
             let (action, artifacts) = match self.runner.run_json::<DeciderAction>(
                 "decider",
@@ -171,6 +179,7 @@ impl Controller {
             }
             let (outcome, failure_kind, result_type, failure_reason) = match &action {
                 DeciderAction::RunTask { .. } => (RunOutcome::Success, None, "run_task", None),
+                DeciderAction::RunTasks { .. } => (RunOutcome::Success, None, "run_tasks", None),
                 DeciderAction::Wait { .. } => (RunOutcome::Success, None, "wait", None),
                 DeciderAction::Complete { .. } => (RunOutcome::Success, None, "complete", None),
                 DeciderAction::Failure { reason } => (
@@ -200,6 +209,9 @@ impl Controller {
 
             match action {
                 DeciderAction::RunTask { task } => {
+                    if self.state.latest_worker_batch.take().is_some() {
+                        self.store.save(&self.state)?;
+                    }
                     let worker_observation = match self.loaded.config.worker_observation {
                         WorkerObservation::Full => Some(&observation),
                         WorkerObservation::None => None,
@@ -302,6 +314,19 @@ impl Controller {
                         }
                     }
                 }
+                DeciderAction::RunTasks { tasks, concurrency } => {
+                    if let Some(delay) = self.run_worker_batch(
+                        &goal,
+                        &observation,
+                        &tasks,
+                        concurrency,
+                        &cycle_id,
+                        &mut worker_failure_backoff,
+                    )? {
+                        self.sleep(delay)?;
+                        continue;
+                    }
+                }
                 DeciderAction::Wait {
                     reason,
                     retry_after_seconds,
@@ -343,6 +368,228 @@ impl Controller {
         }
     }
 
+    fn run_worker_batch(
+        &mut self,
+        goal: &str,
+        observation: &serde_json::Value,
+        tasks: &[String],
+        requested_concurrency: usize,
+        batch_id: &str,
+        backoff: &mut FailureBackoff,
+    ) -> Result<Option<u64>> {
+        self.ensure_running()?;
+        let concurrency = requested_concurrency
+            .min(self.loaded.config.max_concurrency)
+            .min(tasks.len());
+        self.state.latest_worker_completion = None;
+        self.state.latest_worker_batch = Some(WorkerBatchCompletion {
+            batch_id: batch_id.to_owned(),
+            task_count: tasks.len(),
+            results: Vec::new(),
+        });
+        self.store.save(&self.state)?;
+        let details = serde_json::json!({
+            "batch_id": batch_id,
+            "task_count": tasks.len(),
+            "requested_concurrency": requested_concurrency,
+            "concurrency": concurrency,
+        });
+        self.store.event("worker_batch_started", details.clone())?;
+        self.output.event("worker_batch_started", details)?;
+
+        let runner = Arc::clone(&self.runner);
+        let cancelled = Arc::clone(&self.cancelled);
+        let config = self.loaded.config.worker.clone();
+        let worker_observation = match self.loaded.config.worker_observation {
+            WorkerObservation::Full => Some(observation),
+            WorkerObservation::None => None,
+        };
+        let next_index = AtomicUsize::new(0);
+        let (sender, receiver) = mpsc::sync_channel(concurrency);
+        let mut retry_delay = None;
+        thread::scope(|scope| -> Result<()> {
+            let mut handles = Vec::new();
+            let mut fatal_error = None;
+            for slot in 0..concurrency {
+                let sender = sender.clone();
+                let runner = &runner;
+                let cancelled = &cancelled;
+                let config = &config;
+                let next_index = &next_index;
+                let handle = thread::Builder::new()
+                    .name(format!("goal-worker-{slot}"))
+                    .spawn_scoped(scope, move || {
+                        while !cancelled.load(Ordering::SeqCst) {
+                            let index = next_index.fetch_add(1, Ordering::SeqCst);
+                            let Some(task) = tasks.get(index) else {
+                                break;
+                            };
+                            if cancelled.load(Ordering::SeqCst) {
+                                break;
+                            }
+                            let worker_prompt = prompt::worker_prompt(
+                                goal,
+                                worker_observation,
+                                task,
+                                "$GOAL_RESULT_PATH",
+                            );
+                            let mut details = serde_json::Map::new();
+                            details.insert("task".into(), serde_json::json!(task));
+                            details.insert("task_index".into(), serde_json::json!(index));
+                            details.insert("batch_id".into(), serde_json::json!(batch_id));
+                            let started = Instant::now();
+                            let result = runner.run_json_with_details::<WorkerCompletion>(
+                                "worker",
+                                config,
+                                &worker_prompt,
+                                details,
+                            );
+                            let duration_ms = started.elapsed().as_millis() as u64;
+                            if sender.send((index, result, duration_ms)).is_err() {
+                                break;
+                            }
+                        }
+                    });
+                match handle {
+                    Ok(handle) => handles.push(handle),
+                    Err(error) => {
+                        cancelled.store(true, Ordering::SeqCst);
+                        fatal_error = Some(anyhow!(error).context("spawn batch worker"));
+                        break;
+                    }
+                }
+            }
+            drop(sender);
+            // State and event persistence stay on this thread. Even after a
+            // collector failure, drain every result and join all active workers.
+            for (index, result, duration_ms) in receiver {
+                let recorded = self
+                    .record_batch_worker_result(
+                        batch_id,
+                        index,
+                        &tasks[index],
+                        result,
+                        duration_ms,
+                        backoff,
+                        &mut retry_delay,
+                    )
+                    .and_then(|result| {
+                        let batch = self.state.latest_worker_batch.as_mut()
+                            .expect("batch initialized before dispatch");
+                        batch.results.push(result);
+                        batch.results.sort_by_key(|result| result.task_index);
+                        self.store.save(&self.state)
+                    });
+                if let Err(error) = recorded {
+                    cancelled.store(true, Ordering::SeqCst);
+                    fatal_error.get_or_insert(error);
+                }
+            }
+            for handle in handles {
+                if handle.join().is_err() {
+                    cancelled.store(true, Ordering::SeqCst);
+                    fatal_error.get_or_insert_with(|| anyhow!("batch worker thread panicked"));
+                }
+            }
+            if let Some(error) = fatal_error {
+                return Err(error);
+            }
+            Ok(())
+        })?;
+        self.ensure_running()?;
+        let batch = self.state.latest_worker_batch.as_ref().expect("batch initialized");
+        if batch.results.len() != tasks.len() {
+            bail!("worker batch ended without collecting every task");
+        }
+        let failed = batch.results.iter()
+            .filter(|result| matches!(result.completion, WorkerCompletion::Failure { .. }))
+            .count();
+        let details = serde_json::json!({
+            "batch_id": batch_id,
+            "task_count": tasks.len(),
+            "completed": batch.results.len(),
+            "failed": failed,
+        });
+        self.store.event("worker_batch_finished", details.clone())?;
+        self.output.event("worker_batch_finished", details)?;
+        if retry_delay.is_none() {
+            backoff.reset();
+        }
+        Ok(retry_delay)
+    }
+
+    fn record_batch_worker_result(
+        &mut self,
+        batch_id: &str,
+        task_index: usize,
+        task: &str,
+        result: RunResult<WorkerCompletion>,
+        duration_ms: u64,
+        backoff: &mut FailureBackoff,
+        retry_delay: &mut Option<u64>,
+    ) -> Result<WorkerTaskResult> {
+        let result = result.and_then(|(completion, artifacts)| {
+            match completion.validate() {
+                Ok(()) => Ok((completion, artifacts)),
+                Err(error) => Err((
+                    RunError::Protocol(anyhow!("schema validation: {error:#}")),
+                    Some(Box::new(artifacts)),
+                )),
+            }
+        });
+        let (run_id, completion) = match result {
+            Ok((completion, artifacts)) => {
+                let (outcome, failure_kind, result_type, reason) = match &completion {
+                    WorkerCompletion::Done { .. } => (RunOutcome::Success, None, "done", None),
+                    WorkerCompletion::Failure { reason } => (
+                        RunOutcome::Failure, Some("logical"), "failure", Some(reason.as_str()),
+                    ),
+                };
+                artifacts.finish(outcome, failure_kind, Some(result_type), reason)?;
+                self.output.event("phase_finished", serde_json::json!({
+                    "phase": "worker", "run_id": artifacts.id,
+                    "batch_id": batch_id, "task_index": task_index,
+                    "duration_ms": duration_ms, "outcome": outcome,
+                }))?;
+                let details = serde_json::json!({
+                    "run_id": artifacts.id, "batch_id": batch_id,
+                    "task_index": task_index, "task": task, "completion": completion,
+                });
+                self.store.event("worker_completed", details.clone())?;
+                self.output.event("worker_completed", details)?;
+                (Some(artifacts.id), completion)
+            }
+            Err((error, artifacts)) => {
+                finish_run_error(artifacts.as_deref(), &error)?;
+                let run_id = artifacts.as_ref().map(|run| run.id.clone());
+                let completion = uncertain_worker_completion(&error.to_string());
+                let kind = if matches!(error, RunError::Cancelled) {
+                    "worker_cancelled"
+                } else {
+                    retry_delay.get_or_insert_with(|| {
+                        self.loaded.config.interval_seconds.max(backoff.next_delay())
+                    });
+                    "worker_failed"
+                };
+                let details = serde_json::json!({
+                    "run_id": run_id, "batch_id": batch_id,
+                    "task_index": task_index, "task": task,
+                    "error": error.to_string(), "completion": completion,
+                    "recovery": "resense", "retry_after_seconds": retry_delay,
+                });
+                self.store.event(kind, details.clone())?;
+                self.output.event(kind, details)?;
+                (run_id, completion)
+            }
+        };
+        Ok(WorkerTaskResult {
+            task_index,
+            task: task.to_owned(),
+            run_id,
+            completion,
+        })
+    }
+
     fn begin_cycle(&mut self) -> Result<String> {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let cycle_id = format!("cycle-{nonce}");
@@ -358,11 +605,7 @@ impl Controller {
         run_id: Option<String>,
         retry_after_seconds: u64,
     ) -> Result<()> {
-        let completion = WorkerCompletion::Failure {
-            reason: format!(
-                "Worker invocation failed after it may have modified external state: {error}. A fresh observation is required; do not repeat the same task unless reality materially changed."
-            ),
-        };
+        let completion = uncertain_worker_completion(&error);
         let details = serde_json::json!({
             "run_id": run_id,
             "error": error,
@@ -399,6 +642,14 @@ impl Controller {
             return Err(Interrupted.into());
         }
         Ok(())
+    }
+}
+
+fn uncertain_worker_completion(error: &str) -> WorkerCompletion {
+    WorkerCompletion::Failure {
+        reason: format!(
+            "Worker invocation failed after it may have modified external state: {error}. A fresh observation is required; do not repeat the same task unless reality materially changed."
+        ),
     }
 }
 

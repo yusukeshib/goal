@@ -4,7 +4,7 @@ use std::{
     fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
+    process::{Child, Command, ExitStatus, Output, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -55,7 +55,22 @@ timeout_seconds = 5
         let config = fs::read_to_string(&self.config).unwrap();
         fs::write(
             &self.config,
-            config.replace("interval_seconds = 0", &format!("interval_seconds = {seconds}")),
+            config.replace(
+                "interval_seconds = 0",
+                &format!("interval_seconds = {seconds}"),
+            ),
+        )
+        .unwrap();
+    }
+
+    fn set_max_concurrency(&self, concurrency: usize) {
+        let config = fs::read_to_string(&self.config).unwrap();
+        fs::write(
+            &self.config,
+            config.replace(
+                "max_wait_seconds = 1",
+                &format!("max_wait_seconds = 1\nmax_concurrency = {concurrency}"),
+            ),
         )
         .unwrap();
     }
@@ -82,7 +97,10 @@ timeout_seconds = 5
 fn command(config: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_goal"));
     command
-        .current_dir(config.parent().unwrap())
+        .arg("up")
+        .arg(config)
+        .arg("--foreground")
+        .env("GOAL_STATE_DIR", config.parent().unwrap().join("registry"))
         .env_remove("GOAL_DIR");
     command
 }
@@ -94,6 +112,86 @@ fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
     permissions.set_mode(0o755);
     fs::set_permissions(&path, permissions).unwrap();
     path
+}
+
+fn events(fixture: &Fixture) -> Vec<serde_json::Value> {
+    fs::read_to_string(fixture.dir.path().join(".goal/events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn state(fixture: &Fixture) -> serde_json::Value {
+    serde_json::from_slice(
+        &fs::read(fixture.dir.path().join(".goal/state.json")).unwrap(),
+    )
+    .unwrap()
+}
+
+fn wait_for(description: &str, timeout: Duration, mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + timeout;
+    while !condition() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(condition(), "timed out waiting for {description}");
+}
+
+fn process_exists(pid: &str) -> bool {
+    Command::new("kill")
+        .args(["-0", pid])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+struct ChildGuard(Option<Child>);
+
+impl ChildGuard {
+    fn new(child: Child) -> Self {
+        Self(Some(child))
+    }
+
+    fn interrupt(&self) {
+        let child = self.0.as_ref().unwrap();
+        let status = Command::new("kill")
+            .args(["-INT", &child.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    fn wait(&mut self) -> ExitStatus {
+        use wait_timeout::ChildExt;
+        let status = self.0.as_mut().unwrap()
+            .wait_timeout(Duration::from_secs(10)).unwrap()
+            .expect("controller did not stop within 10 seconds");
+        self.0.take();
+        status
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let Some(mut child) = self.0.take() else {
+            return;
+        };
+        let _ = Command::new("kill")
+            .args(["-INT", &child.id().to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if child.try_wait().ok().flatten().is_some() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
 
 const COUNT_SENSOR: &str = r#"n=0; test ! -f sensor-count || n=$(cat sensor-count); n=$((n+1)); echo "$n" > sensor-count; printf '{"sense":%s}\n' "$n""#;
@@ -108,11 +206,12 @@ fn help_fully_describes_configuration_and_process_contracts() {
     let root = String::from_utf8(root.stdout).unwrap();
     for expected in [
         "sense -> decide -> act -> sense",
-        "multiple goals",
+        "goal up GOAL_FILE",
         ".goal/",
-        "goal run",
-        "GOAL_DIR=goals/ci goal",
-        "GOAL_DIR",
+        "goal down GOAL_FILE",
+        "goal list",
+        "goal tail GOAL_FILE --follow",
+        "current directory or GOAL_DIR",
         "stats",
         "analysis",
     ] {
@@ -142,6 +241,8 @@ fn help_fully_describes_configuration_and_process_contracts() {
         "implement pagination",
         "{prompt}",
         "run_task",
+        "run_tasks",
+        "max_concurrency",
         "failure",
         "Neither process may request human input",
         "captured sensor stdout",
@@ -155,11 +256,20 @@ fn help_fully_describes_configuration_and_process_contracts() {
 }
 
 #[test]
-fn removed_explicit_goal_selectors_are_rejected() {
-    for args in [["some-goal", ""], ["-C", "some-goal"]] {
-        let args = args.into_iter().filter(|arg| !arg.is_empty());
+fn commands_never_infer_a_goal_from_the_current_directory_or_environment() {
+    let fixture = Fixture::new(COUNT_SENSOR, r#"exit 99"#, r#"exit 99"#);
+    for args in [
+        Vec::<&str>::new(),
+        vec!["up"],
+        vec!["down"],
+        vec!["tail"],
+        vec!["stats"],
+        vec!["analysis"],
+    ] {
         let output = Command::new(env!("CARGO_BIN_EXE_goal"))
             .args(args)
+            .current_dir(fixture.dir.path())
+            .env("GOAL_DIR", fixture.dir.path())
             .output()
             .unwrap();
         assert!(!output.status.success());
@@ -173,10 +283,8 @@ fn json_output_is_strict_jsonl_with_one_common_envelope() {
         r#"echo '{"pi_event":"diagnostic"}'; echo plain-diagnostic >&2; if test -f decider-once; then r='{"type":"complete","summary":"JSON complete"}'; else touch decider-once; r='{"type":"wait","reason":"observe JSON wait","retry_after_seconds":0}'; fi; printf '%s' "$r" > "$GOAL_RESULT_PATH""#,
         r#"exit 99"#,
     );
-    let output = Command::new(env!("CARGO_BIN_EXE_goal"))
+    let output = command(&fixture.config)
         .args(["--output", "json"])
-        .current_dir(fixture.dir.path())
-        .env_remove("GOAL_DIR")
         .output()
         .unwrap();
     assert!(
@@ -222,11 +330,13 @@ fn json_output_is_strict_jsonl_with_one_common_envelope() {
         assert!(details["prompt_delivery"].is_string());
         if details["phase"] == "decider" {
             assert_eq!(details["prompt_delivery"], "path_argument");
-            assert!(details["command"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|argument| argument != "{prompt}"));
+            assert!(
+                details["command"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|argument| argument != "{prompt}")
+            );
         }
     }
     assert!(
@@ -295,6 +405,122 @@ fn rejects_a_second_controller_for_the_same_config_and_releases_after_exit() {
     );
     after_exit.kill().unwrap();
     after_exit.wait().unwrap();
+}
+
+#[test]
+fn background_service_can_be_listed_tailed_and_stopped() {
+    let fixture = Fixture::new(
+        COUNT_SENSOR,
+        r#"printf '{"type":"wait","reason":"keep service running","retry_after_seconds":1}' > "$GOAL_RESULT_PATH""#,
+        r#"exit 99"#,
+    );
+    let registry = fixture.dir.path().join("service-registry");
+
+    let started = Command::new(env!("CARGO_BIN_EXE_goal"))
+        .arg("up")
+        .arg(&fixture.config)
+        .args(["--output", "json"])
+        .env("GOAL_STATE_DIR", &registry)
+        .output()
+        .unwrap();
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let started: serde_json::Value = serde_json::from_slice(&started.stdout).unwrap();
+    let pid = started["service"]["pid"].as_u64().unwrap() as i32;
+
+    struct Cleanup {
+        armed: bool,
+        config: PathBuf,
+        registry: PathBuf,
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            if self.armed {
+                let _ = Command::new(env!("CARGO_BIN_EXE_goal"))
+                    .arg("down")
+                    .arg(&self.config)
+                    .env("GOAL_STATE_DIR", &self.registry)
+                    .output();
+            }
+        }
+    }
+    let mut cleanup = Cleanup {
+        armed: true,
+        config: fixture.config.clone(),
+        registry: registry.clone(),
+    };
+
+    let listed = Command::new(env!("CARGO_BIN_EXE_goal"))
+        .args(["list", "--output", "json"])
+        .env("GOAL_STATE_DIR", &registry)
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    assert_eq!(listed[0]["pid"], pid);
+    assert_eq!(
+        listed[0]["config_path"],
+        fs::canonicalize(&fixture.config)
+            .unwrap()
+            .to_string_lossy()
+            .as_ref()
+    );
+
+    let duplicate = Command::new(env!("CARGO_BIN_EXE_goal"))
+        .arg("up")
+        .arg(&fixture.config)
+        .env("GOAL_STATE_DIR", &registry)
+        .output()
+        .unwrap();
+    assert!(!duplicate.status.success());
+    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("already running"));
+
+    let service_log = fixture.dir.path().join(".goal/service.log");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while fs::read_to_string(&service_log)
+        .map(|log| !log.contains("keep service running"))
+        .unwrap_or(true)
+        && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let tailed = Command::new(env!("CARGO_BIN_EXE_goal"))
+        .arg("tail")
+        .arg(&fixture.config)
+        .args(["--lines", "20"])
+        .env("GOAL_STATE_DIR", &registry)
+        .output()
+        .unwrap();
+    assert!(tailed.status.success());
+    assert!(String::from_utf8_lossy(&tailed.stdout).contains("keep service running"));
+
+    let stopped = Command::new(env!("CARGO_BIN_EXE_goal"))
+        .arg("down")
+        .arg(&fixture.config)
+        .args(["--output", "json"])
+        .env("GOAL_STATE_DIR", &registry)
+        .output()
+        .unwrap();
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    cleanup.armed = false;
+
+    let listed = Command::new(env!("CARGO_BIN_EXE_goal"))
+        .args(["list", "--output", "json"])
+        .env("GOAL_STATE_DIR", &registry)
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listed, serde_json::json!([]));
 }
 
 #[test]
@@ -425,7 +651,7 @@ fn goal_file_is_reloaded_between_cycles_with_one_snapshot_per_cycle() {
 }
 
 #[test]
-fn stats_reports_metadata_from_goal_dir_or_current_directory() {
+fn stats_and_analysis_require_and_use_an_explicit_goal_file() {
     let fixture = Fixture::new(
         COUNT_SENSOR,
         r#"n=0; test ! -f decider-count || n=$(cat decider-count); n=$((n+1)); echo "$n" > decider-count; if test "$n" = 1; then r='{"type":"run_task","task":"do one thing"}'; else r='{"type":"complete","summary":"observed done"}'; fi; printf '%s' "$r" > "$GOAL_RESULT_PATH""#,
@@ -434,8 +660,9 @@ fn stats_reports_metadata_from_goal_dir_or_current_directory() {
     assert!(fixture.run().status.success());
 
     let output = Command::new(env!("CARGO_BIN_EXE_goal"))
-        .args(["stats", "--since", "24h", "--output", "json"])
-        .env("GOAL_DIR", fixture.dir.path())
+        .arg("stats")
+        .arg(&fixture.config)
+        .args(["--since", "24h", "--output", "json"])
         .output()
         .unwrap();
     assert!(
@@ -452,16 +679,7 @@ fn stats_reports_metadata_from_goal_dir_or_current_directory() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_goal"))
         .arg("stats")
-        .env("GOAL_DIR", fixture.dir.path())
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("worker success rate: 100.0%"));
-
-    let output = Command::new(env!("CARGO_BIN_EXE_goal"))
-        .arg("stats")
-        .current_dir(fixture.dir.path())
-        .env_remove("GOAL_DIR")
+        .arg(&fixture.config)
         .output()
         .unwrap();
     assert!(
@@ -472,8 +690,9 @@ fn stats_reports_metadata_from_goal_dir_or_current_directory() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("5 recorded"));
 
     let output = Command::new(env!("CARGO_BIN_EXE_goal"))
-        .args(["analysis", "--output", "json"])
-        .env("GOAL_DIR", fixture.dir.path())
+        .arg("analysis")
+        .arg(&fixture.config)
+        .args(["--output", "json"])
         .output()
         .unwrap();
     assert!(
@@ -536,9 +755,9 @@ fn sensor_process_failure_is_recorded_and_retried_after_resensing() {
     assert!(events.iter().any(|event| event["type"] == "complete"));
 
     let stats = Command::new(env!("CARGO_BIN_EXE_goal"))
-        .args(["stats", "--output", "json"])
-        .current_dir(fixture.dir.path())
-        .env_remove("GOAL_DIR")
+        .arg("stats")
+        .arg(&fixture.config)
+        .args(["--output", "json"])
         .output()
         .unwrap();
     assert!(stats.status.success());
@@ -657,9 +876,9 @@ fn worker_reported_failure_is_recorded_and_the_next_cycle_can_complete() {
     assert!(events.iter().any(|event| event["type"] == "complete"));
 
     let stats = Command::new(env!("CARGO_BIN_EXE_goal"))
-        .args(["stats", "--output", "json"])
-        .current_dir(fixture.dir.path())
-        .env_remove("GOAL_DIR")
+        .arg("stats")
+        .arg(&fixture.config)
+        .args(["--output", "json"])
         .output()
         .unwrap();
     assert!(stats.status.success());
@@ -816,9 +1035,9 @@ fn decider_reported_failure_is_recorded_and_the_next_cycle_can_complete() {
     assert!(events.iter().any(|event| event["type"] == "complete"));
 
     let stats = Command::new(env!("CARGO_BIN_EXE_goal"))
-        .args(["stats", "--output", "json"])
-        .current_dir(fixture.dir.path())
-        .env_remove("GOAL_DIR")
+        .arg("stats")
+        .arg(&fixture.config)
+        .args(["--output", "json"])
         .output()
         .unwrap();
     assert!(stats.status.success());
@@ -867,10 +1086,8 @@ fn json_decider_failure_output_is_structured_and_the_next_cycle_can_complete() {
         r#"n=0; test ! -f decider-count || n=$(cat decider-count); n=$((n+1)); echo "$n" > decider-count; if test "$n" = 1; then r='{"type":"failure","reason":"automatic authority is unavailable"}'; else r='{"type":"complete","summary":"recovered"}'; fi; printf '%s' "$r" > "$GOAL_RESULT_PATH""#,
         r#"exit 99"#,
     );
-    let output = Command::new(env!("CARGO_BIN_EXE_goal"))
+    let output = command(&fixture.config)
         .args(["--output", "json"])
-        .current_dir(fixture.dir.path())
-        .env_remove("GOAL_DIR")
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -929,4 +1146,403 @@ fn ctrl_c_terminates_worker_and_does_not_start_another_cycle() {
     thread::sleep(Duration::from_millis(150));
     assert_eq!(fixture.count("sensor-count"), 1);
     assert_eq!(fixture.count("decider-count"), 1);
+}
+
+#[test]
+fn bounded_batch_overlaps_to_the_cap_rolls_the_fixed_queue_and_orders_results() {
+    let fixture = Fixture::new(
+        r#"n=0; test ! -f sensor-count || n=$(cat sensor-count); n=$((n+1)); echo "$n" > sensor-count; if test "$n" -gt 1; then for i in 0 1 2 3; do test -f "finished-$i" || touch sensor-ran-early; done; fi; printf '{"sense":%s}\n' "$n""#,
+        r#"n=0; test ! -f decider-count || n=$(cat decider-count); n=$((n+1)); echo "$n" > decider-count; if test "$n" = 1; then r='{"type":"run_tasks","tasks":["BATCH task zero","BATCH task one","BATCH task two","BATCH task three"],"concurrency":4}'; else cat "$1" > next-decider-prompt; r='{"type":"complete","summary":"observed the whole batch"}'; fi; printf '%s' "$r" > "$GOAL_RESULT_PATH""#,
+        r#"
+acquire() { while ! mkdir active-lock 2>/dev/null; do sleep 0.01; done; }
+release() { rmdir active-lock; }
+wait_marker() { n=0; while test ! -f "$1"; do n=$((n+1)); test "$n" -lt 300 || exit 70; sleep 0.01; done; }
+prompt=$(cat)
+case "$prompt" in
+  *"BATCH task zero"*) task=0 ;;
+  *"BATCH task one"*) task=1 ;;
+  *"BATCH task two"*) task=2 ;;
+  *"BATCH task three"*) task=3 ;;
+  *) exit 71 ;;
+esac
+acquire
+active=0; test ! -f active-count || active=$(cat active-count)
+active=$((active+1)); echo "$active" > active-count
+maximum=0; test ! -f max-active || maximum=$(cat max-active)
+if test "$active" -gt "$maximum"; then echo "$active" > max-active; fi
+release
+finish() { acquire; active=$(cat active-count); active=$((active-1)); echo "$active" > active-count; release; }
+trap finish EXIT
+touch "started-$task"
+case "$task" in
+  0) wait_marker started-1; touch finished-0 ;;
+  1) wait_marker finished-3; touch finished-1 ;;
+  2) test -f finished-0 || touch rolling-admission-violation; touch finished-2 ;;
+  3) touch finished-3 ;;
+esac
+printf '{"type":"done","summary":"completed task %s"}' "$task" > "$GOAL_RESULT_PATH"
+"#,
+    );
+    fixture.set_max_concurrency(2);
+
+    let output = fixture.run();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fixture.count("sensor-count"), 2);
+    assert_eq!(fixture.count("decider-count"), 2);
+    assert_eq!(fixture.count("max-active"), 2);
+    assert!(!fixture.dir.path().join("rolling-admission-violation").exists());
+    assert!(!fixture.dir.path().join("sensor-ran-early").exists());
+
+    let events = events(&fixture);
+    let started = events
+        .iter()
+        .find(|event| event["type"] == "worker_batch_started")
+        .expect("missing worker_batch_started");
+    assert_eq!(started["details"]["task_count"], 4);
+    assert_eq!(started["details"]["requested_concurrency"], 4);
+    assert_eq!(started["details"]["concurrency"], 2);
+    let finished = events
+        .iter()
+        .find(|event| event["type"] == "worker_batch_finished")
+        .expect("missing worker_batch_finished");
+    assert_eq!(finished["details"]["task_count"], 4);
+
+    let mut completions = events
+        .iter()
+        .filter(|event| event["type"] == "worker_completed")
+        .collect::<Vec<_>>();
+    assert_eq!(completions.len(), 4);
+    let arrived = completions.iter()
+        .map(|event| event["details"]["task_index"].as_u64().unwrap())
+        .collect::<Vec<_>>();
+    assert!(arrived.iter().position(|index| *index == 2).unwrap()
+        < arrived.iter().position(|index| *index == 1).unwrap());
+    completions.sort_by_key(|event| event["details"]["task_index"].as_u64().unwrap());
+    let batch_id = started["details"]["batch_id"].as_str().unwrap();
+    let mut run_ids = Vec::new();
+    for (index, completion) in completions.iter().enumerate() {
+        assert_eq!(completion["details"]["task_index"], index);
+        assert_eq!(completion["details"]["batch_id"], batch_id);
+        assert_eq!(
+            completion["details"]["task"],
+            format!("BATCH task {}", ["zero", "one", "two", "three"][index])
+        );
+        run_ids.push(completion["details"]["run_id"].as_str().unwrap());
+    }
+    run_ids.sort_unstable();
+    run_ids.dedup();
+    assert_eq!(run_ids.len(), 4);
+
+    let state = state(&fixture);
+    assert!(state["latest_worker_completion"].is_null());
+    let batch = &state["latest_worker_batch"];
+    assert_eq!(batch["batch_id"], batch_id);
+    assert_eq!(batch["task_count"], 4);
+    let results = batch["results"].as_array().unwrap();
+    assert_eq!(results.len(), 4);
+    for (index, result) in results.iter().enumerate() {
+        assert_eq!(result["task_index"], index);
+        assert_eq!(result["completion"]["type"], "done");
+        assert!(result["run_id"].is_string());
+    }
+
+    let prompt = fs::read_to_string(fixture.dir.path().join("next-decider-prompt")).unwrap();
+    let mut cursor = 0;
+    for task in [
+        "BATCH task zero",
+        "BATCH task one",
+        "BATCH task two",
+        "BATCH task three",
+    ] {
+        let position = prompt[cursor..]
+            .find(task)
+            .unwrap_or_else(|| panic!("missing ordered task {task:?} from next prompt"));
+        cursor += position + task.len();
+    }
+}
+
+#[test]
+fn max_concurrency_defaults_to_one_without_truncating_the_batch() {
+    let fixture = Fixture::new(
+        r#"n=0; test ! -f sensor-count || n=$(cat sensor-count); n=$((n+1)); echo "$n" > sensor-count; if test "$n" -gt 1; then for i in 0 1 2; do test -f "serial-finished-$i" || touch sensor-ran-early; done; fi; printf '{"sense":%s}\n' "$n""#,
+        r#"n=0; test ! -f decider-count || n=$(cat decider-count); n=$((n+1)); echo "$n" > decider-count; if test "$n" = 1; then r='{"type":"run_tasks","tasks":["SERIAL zero","SERIAL one","SERIAL two"],"concurrency":3}'; else r='{"type":"complete","summary":"serial batch settled"}'; fi; printf '%s' "$r" > "$GOAL_RESULT_PATH""#,
+        r#"
+acquire() { while ! mkdir serial-active-lock 2>/dev/null; do sleep 0.01; done; }
+release() { rmdir serial-active-lock; }
+prompt=$(cat)
+case "$prompt" in *"SERIAL zero"*) task=0 ;; *"SERIAL one"*) task=1 ;; *"SERIAL two"*) task=2 ;; *) exit 72 ;; esac
+acquire
+active=0; test ! -f serial-active || active=$(cat serial-active)
+active=$((active+1)); echo "$active" > serial-active
+maximum=0; test ! -f serial-max-active || maximum=$(cat serial-max-active)
+if test "$active" -gt "$maximum"; then echo "$active" > serial-max-active; fi
+release
+finish() { acquire; active=$(cat serial-active); active=$((active-1)); echo "$active" > serial-active; release; }
+trap finish EXIT
+sleep 0.05
+touch "serial-finished-$task"
+printf '{"type":"done","summary":"serial %s"}' "$task" > "$GOAL_RESULT_PATH"
+"#,
+    );
+
+    let output = fixture.run();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fixture.count("serial-max-active"), 1);
+    assert!(!fixture.dir.path().join("sensor-ran-early").exists());
+    for index in 0..3 {
+        assert!(fixture.dir.path().join(format!("serial-finished-{index}")).exists());
+    }
+    let events = events(&fixture);
+    let started = events
+        .iter()
+        .find(|event| event["type"] == "worker_batch_started")
+        .unwrap();
+    assert_eq!(started["details"]["requested_concurrency"], 3);
+    assert_eq!(started["details"]["concurrency"], 1);
+}
+
+#[test]
+fn requested_one_is_respected_and_requests_are_clamped_to_task_count() {
+    let fixture = Fixture::new(
+        r#"n=0; test ! -f sensor-count || n=$(cat sensor-count); n=$((n+1)); echo "$n" > sensor-count; if test "$n" = 2; then test -f a-finished-0 && test -f a-finished-1 || touch sensor-ran-early; elif test "$n" -gt 2; then test -f b-finished-0 && test -f b-finished-1 || touch sensor-ran-early; fi; printf '{"sense":%s}\n' "$n""#,
+        r#"n=0; test ! -f decider-count || n=$(cat decider-count); n=$((n+1)); echo "$n" > decider-count; if test "$n" = 1; then r='{"type":"run_tasks","tasks":["REQUEST ONE A0","REQUEST ONE A1"],"concurrency":1}'; elif test "$n" = 2; then r='{"type":"run_tasks","tasks":["CLAMP COUNT B0","CLAMP COUNT B1"],"concurrency":9}'; else r='{"type":"complete","summary":"both batches settled"}'; fi; printf '%s' "$r" > "$GOAL_RESULT_PATH""#,
+        r#"
+wait_marker() { n=0; while test ! -f "$1"; do n=$((n+1)); test "$n" -lt 300 || exit 73; sleep 0.01; done; }
+prompt=$(cat)
+case "$prompt" in
+  *"CLAMP COUNT B0"*) touch b-started-0; wait_marker b-started-1; touch b-finished-0; summary=B0 ;;
+  *"CLAMP COUNT B1"*) touch b-started-1; wait_marker b-started-0; touch b-finished-1; summary=B1 ;;
+  *"REQUEST ONE A0"*) test ! -f a-finished-1 || touch requested-one-reordered; touch a-finished-0; summary=A0 ;;
+  *"REQUEST ONE A1"*) test -f a-finished-0 || touch requested-one-overlap; touch a-finished-1; summary=A1 ;;
+  *) exit 74 ;;
+esac
+printf '{"type":"done","summary":"%s"}' "$summary" > "$GOAL_RESULT_PATH"
+"#,
+    );
+    fixture.set_max_concurrency(4);
+
+    let output = fixture.run();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fixture.count("sensor-count"), 3);
+    assert!(!fixture.dir.path().join("sensor-ran-early").exists());
+    assert!(!fixture.dir.path().join("requested-one-overlap").exists());
+    assert!(!fixture.dir.path().join("requested-one-reordered").exists());
+
+    let events = events(&fixture);
+    let starts = events
+        .iter()
+        .filter(|event| event["type"] == "worker_batch_started")
+        .collect::<Vec<_>>();
+    assert_eq!(starts.len(), 2);
+    assert_eq!(starts[0]["details"]["requested_concurrency"], 1);
+    assert_eq!(starts[0]["details"]["concurrency"], 1);
+    assert_eq!(starts[1]["details"]["requested_concurrency"], 9);
+    assert_eq!(starts[1]["details"]["concurrency"], 2);
+}
+
+#[test]
+fn batch_collects_logical_process_protocol_and_timeout_failures_without_stopping_peers() {
+    let fixture = Fixture::new(
+        r#"n=0; test ! -f sensor-count || n=$(cat sensor-count); n=$((n+1)); echo "$n" > sensor-count; if test "$n" -gt 1; then for task in process malformed logical timeout done; do test -f "mixed-$task" || touch sensor-ran-early; done; fi; printf '{"sense":%s}\n' "$n""#,
+        r#"n=0; test ! -f decider-count || n=$(cat decider-count); n=$((n+1)); echo "$n" > decider-count; if test "$n" = 1; then r='{"type":"run_tasks","tasks":["MIXED process","MIXED malformed","MIXED logical","MIXED timeout","MIXED done"],"concurrency":2}'; else cat "$1" > mixed-next-prompt; r='{"type":"complete","summary":"observed mixed outcomes"}'; fi; printf '%s' "$r" > "$GOAL_RESULT_PATH""#,
+        r#"
+prompt=$(cat)
+case "$prompt" in
+  *"MIXED done"*) touch mixed-done; printf '{"type":"done","summary":"verified success"}' > "$GOAL_RESULT_PATH" ;;
+  *"MIXED logical"*) touch mixed-logical; printf '{"type":"failure","reason":"expected logical refusal"}' > "$GOAL_RESULT_PATH" ;;
+  *"MIXED process"*) touch mixed-process; exit 8 ;;
+  *"MIXED malformed"*) touch mixed-malformed; printf 'not json' > "$GOAL_RESULT_PATH" ;;
+  *"MIXED timeout"*) touch mixed-timeout; sleep 10 ;;
+  *) exit 75 ;;
+esac
+"#,
+    );
+    fixture.set_max_concurrency(2);
+    fixture.set_timeout("worker", 1);
+
+    let output = fixture.run();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fixture.count("sensor-count"), 2);
+    assert!(!fixture.dir.path().join("sensor-ran-early").exists());
+    for task in ["process", "malformed", "logical", "timeout", "done"] {
+        assert!(fixture.dir.path().join(format!("mixed-{task}")).exists());
+    }
+
+    let events = events(&fixture);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "worker_completed")
+            .count(),
+        2
+    );
+    let failures = events
+        .iter()
+        .filter(|event| event["type"] == "worker_failed")
+        .collect::<Vec<_>>();
+    assert_eq!(failures.len(), 3);
+    assert!(failures.iter().all(|event| {
+        event["details"]["retry_after_seconds"] == 5
+            && event["details"]["recovery"] == "resense"
+            && event["details"]["batch_id"].is_string()
+            && event["details"]["task_index"].is_number()
+            && event["details"]["task"].is_string()
+    }));
+    assert!(failures.iter().any(|event| {
+        event["details"]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("process exited unsuccessfully"))
+    }));
+    assert!(failures.iter().any(|event| {
+        event["details"]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("protocol failure"))
+    }));
+    assert!(events
+        .iter()
+        .any(|event| event["type"] == "worker_batch_finished"));
+
+    let state = state(&fixture);
+    let results = state["latest_worker_batch"]["results"]
+        .as_array()
+        .unwrap();
+    assert_eq!(results.len(), 5);
+    for (index, result) in results.iter().enumerate() {
+        assert_eq!(result["task_index"], index);
+        assert!(result["run_id"].is_string());
+        assert_eq!(result["completion"]["type"], if index == 4 { "done" } else { "failure" });
+    }
+
+    let prompt = fs::read_to_string(fixture.dir.path().join("mixed-next-prompt")).unwrap();
+    let mut cursor = 0;
+    for task in ["MIXED process", "MIXED malformed", "MIXED logical", "MIXED timeout", "MIXED done"] {
+        let position = prompt[cursor..]
+            .find(task)
+            .unwrap_or_else(|| panic!("missing ordered mixed result for {task:?}"));
+        cursor += position + task.len();
+    }
+    assert!(prompt.contains("expected logical refusal"));
+    assert!(prompt.contains("Worker invocation failed after it may have modified external state"));
+
+    let stats = Command::new(env!("CARGO_BIN_EXE_goal"))
+        .arg("stats")
+        .arg(&fixture.config)
+        .args(["--output", "json"])
+        .output()
+        .unwrap();
+    assert!(stats.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&stats.stdout).unwrap();
+    assert_eq!(report["recorded_runs"], 9);
+    assert_eq!(report["outcomes"]["success"], 5);
+    assert_eq!(report["outcomes"]["failure"], 4);
+    assert_eq!(report["roles"]["worker"]["duration_ms"]["count"], 5);
+    assert_eq!(report["failures_by_kind"]["timeout"], 1);
+    assert_eq!(report["failures_by_kind"]["logical"], 1);
+    assert_eq!(report["failures_by_kind"]["process"], 1);
+    assert_eq!(report["failures_by_kind"]["protocol"], 1);
+}
+
+#[test]
+fn cancelling_a_batch_drains_active_workers_and_never_starts_the_queue() {
+    let fixture = Fixture::new(
+        COUNT_SENSOR,
+        r#"echo 1 > decider-count; printf '{"type":"run_tasks","tasks":["CANCEL zero","CANCEL one","CANCEL queued"],"concurrency":2}' > "$GOAL_RESULT_PATH""#,
+        r#"
+prompt=$(cat)
+case "$prompt" in *"CANCEL zero"*) task=0 ;; *"CANCEL one"*) task=1 ;; *"CANCEL queued"*) touch queued-started; task=2 ;; *) exit 76 ;; esac
+printf '%s\n' "$$" > "worker-pid-$task"
+printf '%s\n' "$GOAL_WORK_DIR" > "worker-work-dir-$task"
+touch "worker-started-$task"
+sleep 30
+printf '{"type":"done","summary":"late %s"}' "$task" > "$GOAL_RESULT_PATH"
+"#,
+    );
+    fixture.set_max_concurrency(2);
+    fixture.set_timeout("worker", 30);
+    let mut child = ChildGuard::new(
+        command(&fixture.config)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+
+    wait_for("both active workers", Duration::from_secs(10), || {
+        fixture.dir.path().join("worker-started-0").exists()
+            && fixture.dir.path().join("worker-started-1").exists()
+    });
+    child.interrupt();
+    let controller_status = child.wait();
+    assert!(
+        controller_status.success(),
+        "intentional interruption should be a clean exit: {controller_status}"
+    );
+
+    assert_eq!(fixture.count("sensor-count"), 1);
+    assert_eq!(fixture.count("decider-count"), 1);
+    assert!(!fixture.dir.path().join("queued-started").exists());
+    let pids = [0, 1].map(|index| {
+        fs::read_to_string(fixture.dir.path().join(format!("worker-pid-{index}")))
+            .unwrap()
+            .trim()
+            .to_owned()
+    });
+    wait_for("worker process groups to terminate", Duration::from_secs(5), || {
+        pids.iter().all(|pid| !process_exists(pid))
+    });
+    for index in 0..2 {
+        let work_dir = fs::read_to_string(
+            fixture
+                .dir
+                .path()
+                .join(format!("worker-work-dir-{index}")),
+        )
+        .unwrap();
+        assert!(
+            !Path::new(work_dir.trim()).exists(),
+            "worker {index} temporary directory was not removed"
+        );
+    }
+
+    let events = events(&fixture);
+    let cancelled = events
+        .iter()
+        .filter(|event| event["type"] == "worker_cancelled")
+        .collect::<Vec<_>>();
+    assert_eq!(cancelled.len(), 2);
+    assert!(cancelled.iter().all(|event| {
+        event["details"]["batch_id"].is_string()
+            && event["details"]["task_index"].is_number()
+            && event["details"]["task"].is_string()
+    }));
+    assert!(!events
+        .iter()
+        .any(|event| event["type"] == "worker_batch_finished"));
+    let state = state(&fixture);
+    let batch = &state["latest_worker_batch"];
+    assert_eq!(batch["task_count"], 3);
+    let results = batch["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["task_index"], 0);
+    assert_eq!(results[1]["task_index"], 1);
+    assert!(results
+        .iter()
+        .all(|result| result["completion"]["type"] == "failure"));
 }

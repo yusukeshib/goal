@@ -3,7 +3,7 @@ name = "goal"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "A foreground controller for continuously pursuing one natural-language goal"
+description = "A service controller for continuously pursuing natural-language goals"
 license = "MIT"
 
 [dependencies]

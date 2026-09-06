@@ -1,6 +1,6 @@
 use std::{
     fs::{self, OpenOptions},
-    io::Write,
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -10,14 +10,22 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::model::WorkerCompletion;
+use crate::model::{WorkerBatchCompletion, WorkerCompletion};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PersistentState {
     pub latest_worker_completion: Option<WorkerCompletion>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_worker_batch: Option<WorkerBatchCompletion>,
     pub latest_cycle_id: Option<String>,
     pub latest_cycle_timestamp: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ControllerOwner {
+    pid: u32,
+    config_path: PathBuf,
 }
 
 #[derive(Debug)]
@@ -26,11 +34,11 @@ pub struct ControllerLock {
 }
 
 impl ControllerLock {
-    pub fn acquire(project_dir: &Path) -> Result<Self> {
+    pub fn acquire(project_dir: &Path, config_path: &Path) -> Result<Self> {
         let state_dir = project_dir.join(".goal");
         fs::create_dir_all(&state_dir).context("create .goal directory for controller lock")?;
         let lock_path = state_dir.join("controller.lock");
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
@@ -47,7 +55,39 @@ impl ControllerLock {
             return Err(error)
                 .with_context(|| format!("lock controller file {}", lock_path.display()));
         }
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        serde_json::to_writer(
+            &mut file,
+            &ControllerOwner {
+                pid: std::process::id(),
+                config_path: config_path.to_owned(),
+            },
+        )?;
+        file.write_all(b"\n")?;
+        file.flush()?;
         Ok(Self { _file: file })
+    }
+
+    pub fn owner_matches(project_dir: &Path, config_path: &Path, pid: u32) -> bool {
+        let lock_path = project_dir.join(".goal/controller.lock");
+        let Ok(mut file) = OpenOptions::new().read(true).write(true).open(&lock_path) else {
+            return false;
+        };
+        match file.try_lock_exclusive() {
+            Ok(()) => {
+                let _ = FileExt::unlock(&file);
+                false
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                let mut bytes = Vec::new();
+                file.seek(SeekFrom::Start(0)).is_ok()
+                    && file.read_to_end(&mut bytes).is_ok()
+                    && serde_json::from_slice::<ControllerOwner>(&bytes)
+                        .is_ok_and(|owner| owner.pid == pid && owner.config_path == config_path)
+            }
+            Err(_) => false,
+        }
     }
 }
 
@@ -140,11 +180,22 @@ mod tests {
     #[test]
     fn controller_lock_is_exclusive_and_released_on_drop() {
         let dir = tempfile::tempdir().unwrap();
-        let first = ControllerLock::acquire(dir.path()).unwrap();
-        let error = ControllerLock::acquire(dir.path()).unwrap_err();
+        let config = dir.path().join("goal.toml");
+        let first = ControllerLock::acquire(dir.path(), &config).unwrap();
+        assert!(ControllerLock::owner_matches(
+            dir.path(),
+            &config,
+            std::process::id()
+        ));
+        let error = ControllerLock::acquire(dir.path(), &config).unwrap_err();
         assert!(error.to_string().contains("already running"));
         drop(first);
-        ControllerLock::acquire(dir.path()).unwrap();
+        assert!(!ControllerLock::owner_matches(
+            dir.path(),
+            &config,
+            std::process::id()
+        ));
+        ControllerLock::acquire(dir.path(), &config).unwrap();
     }
 
     #[test]
@@ -166,6 +217,32 @@ mod tests {
         let line = fs::read_to_string(dir.path().join(".goal/events.jsonl")).unwrap();
         assert_eq!(line.lines().count(), 1);
         serde_json::from_str::<Value>(line.trim()).unwrap();
+    }
+
+    #[test]
+    fn batch_state_round_trip_and_old_state_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::new(dir.path()).unwrap();
+        let state = PersistentState {
+            latest_worker_batch: Some(WorkerBatchCompletion {
+                batch_id: "batch-1".into(),
+                task_count: 2,
+                results: vec![crate::model::WorkerTaskResult {
+                    task_index: 1,
+                    task: "second task".into(),
+                    run_id: Some("run-2".into()),
+                    completion: WorkerCompletion::Failure { reason: "unavailable".into() },
+                }],
+            }),
+            ..PersistentState::default()
+        };
+        store.save(&state).unwrap();
+        assert_eq!(store.load().unwrap(), state);
+        let old: PersistentState = serde_json::from_str(
+            r#"{"latest_worker_completion":{"type":"done","summary":"old"}}"#,
+        ).unwrap();
+        assert!(old.latest_worker_batch.is_none());
+        assert!(!serde_json::to_string(&old).unwrap().contains("latest_worker_batch"));
     }
 
     #[test]

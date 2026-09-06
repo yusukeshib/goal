@@ -7,6 +7,10 @@ pub enum DeciderAction {
     RunTask {
         task: String,
     },
+    RunTasks {
+        tasks: Vec<String>,
+        concurrency: usize,
+    },
     Wait {
         reason: String,
         retry_after_seconds: u64,
@@ -23,6 +27,15 @@ impl DeciderAction {
     pub fn validate(&self) -> Result<()> {
         match self {
             Self::RunTask { task } => require_text("task", task),
+            Self::RunTasks { tasks, concurrency } => {
+                if tasks.is_empty() || *concurrency == 0 {
+                    bail!("run_tasks requires nonempty tasks and concurrency greater than zero");
+                }
+                for task in tasks {
+                    require_text("task", task)?;
+                }
+                Ok(())
+            },
             Self::Wait { reason, .. } => require_text("reason", reason),
             Self::Complete { summary } => require_text("summary", summary),
             Self::Failure { reason } => require_text("reason", reason),
@@ -46,6 +59,23 @@ impl WorkerCompletion {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerTaskResult {
+    pub task_index: usize,
+    pub task: String,
+    pub run_id: Option<String>,
+    pub completion: WorkerCompletion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerBatchCompletion {
+    pub batch_id: String,
+    pub task_count: usize,
+    pub results: Vec<WorkerTaskResult>,
+}
+
 fn require_text(name: &str, value: &str) -> Result<()> {
     if value.trim().is_empty() {
         bail!("{name} must not be empty");
@@ -61,6 +91,7 @@ mod tests {
     fn parses_every_decider_variant() {
         let cases = [
             r#"{"type":"run_task","task":"fix it"}"#,
+            r#"{"type":"run_tasks","tasks":["a","b"],"concurrency":8}"#,
             r#"{"type":"wait","reason":"CI","retry_after_seconds":10}"#,
             r#"{"type":"complete","summary":"done"}"#,
             r#"{"type":"failure","reason":"missing authority"}"#,
@@ -76,6 +107,14 @@ mod tests {
     #[test]
     fn rejects_invalid_decider_messages() {
         let cases = [
+            r#"{"type":"run_tasks","tasks":[],"concurrency":1}"#,
+            r#"{"type":"run_tasks","tasks":["a","  "],"concurrency":1}"#,
+            r#"{"type":"run_tasks","tasks":["a"],"concurrency":0}"#,
+            r#"{"type":"run_tasks","tasks":["a"]}"#,
+            r#"{"type":"run_tasks","tasks":["a"],"concurrency":-1}"#,
+            r#"{"type":"run_tasks","tasks":["a"],"concurrency":1.5}"#,
+            r#"{"type":"run_tasks","tasks":"a","concurrency":1}"#,
+            r#"{"type":"run_tasks","tasks":["a"],"concurrency":1,"extra":true}"#,
             r#"{"type":"unknown"}"#,
             r#"{"type":"run_task"}"#,
             r#"{"type":"run_task","task":"","extra":1}"#,

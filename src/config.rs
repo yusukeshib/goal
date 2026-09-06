@@ -13,6 +13,8 @@ pub struct Config {
     pub interval_seconds: u64,
     #[serde(default = "default_max_wait")]
     pub max_wait_seconds: u64,
+    #[serde(default = "default_max_concurrency")]
+    pub max_concurrency: usize,
     #[serde(default)]
     pub worker_observation: WorkerObservation,
     #[serde(default)]
@@ -37,6 +39,10 @@ pub struct CommandConfig {
     pub timeout_seconds: u64,
 }
 
+fn default_max_concurrency() -> usize {
+    1
+}
+
 fn default_max_wait() -> u64 {
     3600
 }
@@ -44,31 +50,36 @@ fn default_max_wait() -> u64 {
 #[derive(Debug, Clone)]
 pub struct LoadedConfig {
     pub config: Config,
+    pub config_path: PathBuf,
     pub project_dir: PathBuf,
     pub goal_path: PathBuf,
 }
 
+pub fn canonical_config_path(path: &Path) -> Result<PathBuf> {
+    let config_path =
+        fs::canonicalize(path).with_context(|| format!("resolve config {}", path.display()))?;
+    if !config_path.is_file() {
+        bail!(
+            "goal file must be a TOML file, not a directory: {}",
+            path.display()
+        );
+    }
+    Ok(config_path)
+}
+
 impl LoadedConfig {
     pub fn load(path: &Path) -> Result<Self> {
-        let requested_path = if path.is_dir() {
-            path.join("goal.toml")
-        } else {
-            path.to_owned()
-        };
-        let config_path = fs::canonicalize(&requested_path)
-            .with_context(|| format!("resolve config {}", requested_path.display()))?;
+        let config_path = canonical_config_path(path)?;
         let text = fs::read_to_string(&config_path)
             .with_context(|| format!("read config {}", config_path.display()))?;
         let config: Config =
             toml::from_str(&text).with_context(|| format!("parse config {}", path.display()))?;
         config.validate()?;
 
-        let parent = requested_path
+        let project_dir = config_path
             .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let project_dir = fs::canonicalize(parent)
-            .with_context(|| format!("resolve project directory {}", parent.display()))?;
+            .expect("canonical config path has a parent")
+            .to_owned();
         let goal_path = if config.goal_file.is_absolute() {
             config.goal_file.clone()
         } else {
@@ -76,6 +87,7 @@ impl LoadedConfig {
         };
         let loaded = Self {
             config,
+            config_path,
             project_dir,
             goal_path,
         };
@@ -100,6 +112,9 @@ impl Config {
         }
         if self.max_wait_seconds == 0 {
             bail!("max_wait_seconds must be greater than zero");
+        }
+        if self.max_concurrency == 0 {
+            bail!("max_concurrency must be greater than zero");
         }
         if self.max_completed_runs == Some(0) {
             bail!("max_completed_runs must be greater than zero when set");
@@ -142,17 +157,18 @@ timeout_seconds = 1
     }
 
     #[test]
-    fn loads_file_or_directory_with_relative_goal_file() {
+    fn loads_explicit_file_with_relative_goal_file() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("goal.toml"), valid()).unwrap();
+        let config_path = dir.path().join("goal.toml");
+        fs::write(&config_path, valid()).unwrap();
         fs::write(dir.path().join("GOAL.md"), "Ship the feature").unwrap();
-        for path in [dir.path(), &dir.path().join("goal.toml")] {
-            let loaded = LoadedConfig::load(path).unwrap();
-            assert_eq!(loaded.read_goal().unwrap(), "Ship the feature");
-            assert_eq!(loaded.project_dir, fs::canonicalize(dir.path()).unwrap());
-            assert_eq!(loaded.config.worker_observation, WorkerObservation::Full);
-            assert_eq!(loaded.config.max_completed_runs, None);
-        }
+        let loaded = LoadedConfig::load(&config_path).unwrap();
+        assert_eq!(loaded.read_goal().unwrap(), "Ship the feature");
+        assert_eq!(loaded.config_path, fs::canonicalize(config_path).unwrap());
+        assert_eq!(loaded.project_dir, fs::canonicalize(dir.path()).unwrap());
+        assert_eq!(loaded.config.worker_observation, WorkerObservation::Full);
+        assert_eq!(loaded.config.max_completed_runs, None);
+        assert_eq!(loaded.config.max_concurrency, 1);
     }
 
     #[test]
@@ -160,20 +176,21 @@ timeout_seconds = 1
         let dir = tempfile::tempdir().unwrap();
         let text = valid().replace(
             "max_wait_seconds = 10",
-            "max_wait_seconds = 10\nworker_observation = \"none\"\nmax_completed_runs = 25",
+            "max_wait_seconds = 10\nworker_observation = \"none\"\nmax_completed_runs = 25\nmax_concurrency = 3",
         );
         fs::write(dir.path().join("goal.toml"), text).unwrap();
         fs::write(dir.path().join("GOAL.md"), "Ship the feature").unwrap();
-        let loaded = LoadedConfig::load(dir.path()).unwrap();
+        let loaded = LoadedConfig::load(&dir.path().join("goal.toml")).unwrap();
         assert_eq!(loaded.config.worker_observation, WorkerObservation::None);
         assert_eq!(loaded.config.max_completed_runs, Some(25));
+        assert_eq!(loaded.config.max_concurrency, 3);
     }
 
     #[test]
-    fn directory_without_goal_toml_is_an_error() {
+    fn directory_is_rejected_when_a_goal_file_is_required() {
         let dir = tempfile::tempdir().unwrap();
         let error = LoadedConfig::load(dir.path()).unwrap_err();
-        assert!(error.to_string().contains("goal.toml"));
+        assert!(error.to_string().contains("must be a TOML file"));
     }
 
     #[test]
@@ -182,8 +199,15 @@ timeout_seconds = 1
             valid().replace("command = [\"sensor\"]", "command = []"),
             valid().replace("timeout_seconds = 1", "timeout_seconds = 0"),
             valid().replace("max_wait_seconds = 10", "max_wait_seconds = 0"),
-            valid().replace("max_wait_seconds = 10", "max_wait_seconds = 10\nmax_completed_runs = 0"),
-            valid().replace("max_wait_seconds = 10", "max_wait_seconds = 10\nworker_observation = \"selected\""),
+            valid().replace("max_wait_seconds = 10", "max_concurrency = 0"),
+            valid().replace(
+                "max_wait_seconds = 10",
+                "max_wait_seconds = 10\nmax_completed_runs = 0",
+            ),
+            valid().replace(
+                "max_wait_seconds = 10",
+                "max_wait_seconds = 10\nworker_observation = \"selected\"",
+            ),
         ];
         for (index, text) in invalid.iter().enumerate() {
             let dir = tempfile::tempdir().unwrap();

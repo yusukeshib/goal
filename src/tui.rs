@@ -247,6 +247,7 @@ struct UiState {
     evicted: u64,
     phase: String,
     phase_started_at: Option<u64>,
+    batch_active: bool,
     cycle: String,
     project: String,
     hit_regions: Vec<(Rect, usize)>,
@@ -275,12 +276,24 @@ impl UiState {
         if let Activity::Controller { kind, details, .. } = &activity {
             match kind.as_str() {
                 "cycle_started" => {
+                    self.batch_active = false;
                     if let Some(cycle) = details.get("cycle_id").and_then(Value::as_str) {
                         self.cycle = cycle.to_owned();
                     }
                 }
+                "worker_batch_started" => {
+                    self.batch_active = true;
+                    self.phase = "WORKERS".to_owned();
+                    self.phase_started_at = match &activity {
+                        Activity::Controller { timestamp, .. } => Some(*timestamp),
+                        _ => None,
+                    };
+                }
+                "worker_batch_finished" => self.batch_active = false,
                 "phase_started" => {
-                    if let Some(phase) = details.get("phase").and_then(Value::as_str) {
+                    if let Some(phase) = details.get("phase").and_then(Value::as_str)
+                        && !(self.batch_active && phase == "worker")
+                    {
                         self.phase = phase.to_uppercase();
                         self.phase_started_at = match &activity {
                             Activity::Controller { timestamp, .. } => Some(*timestamp),
@@ -290,7 +303,11 @@ impl UiState {
                 }
                 "wait" => self.phase = "WAITING".to_owned(),
                 "complete" => self.phase = "COMPLETE".to_owned(),
-                kind if kind.ends_with("failed") => self.phase = "FAILED".to_owned(),
+                kind if kind.ends_with("failed")
+                    && !(self.batch_active && kind == "worker_failed") =>
+                {
+                    self.phase = "FAILED".to_owned();
+                }
                 _ => {}
             }
         }
@@ -1562,6 +1579,7 @@ fn card_parts(activity: &Activity) -> (u64, String, String, Color) {
             timestamp,
             role,
             stream,
+            run_id,
             summary,
             original_bytes,
             ..
@@ -1569,7 +1587,12 @@ fn card_parts(activity: &Activity) -> (u64, String, String, Color) {
             *timestamp,
             role.to_uppercase(),
             format!(
-                "{}{summary} · {original_bytes} B",
+                "{}{}{summary} · {original_bytes} B",
+                if role == "worker" {
+                    format!("[{run_id}] ")
+                } else {
+                    String::new()
+                },
                 if stream == "stderr" { "[stderr] " } else { "" }
             ),
             match role.as_str() {
@@ -1665,9 +1688,53 @@ mod tests {
         };
         let (_, _, stdout_summary, worker_color) = card_parts(&child("stdout"));
         let (_, _, stderr_summary, _) = card_parts(&child("stderr"));
-        assert_eq!(stdout_summary, "diagnostic · 10 B");
-        assert_eq!(stderr_summary, "[stderr] diagnostic · 10 B");
+        assert_eq!(stdout_summary, "[run] diagnostic · 10 B");
+        assert_eq!(stderr_summary, "[run] [stderr] diagnostic · 10 B");
         assert_eq!(worker_color, Color::Green);
+    }
+
+    #[test]
+    fn reducer_keeps_batch_phase_active_through_worker_events() {
+        let controller = |timestamp, kind: &str, details| Activity::Controller {
+            timestamp,
+            kind: kind.into(),
+            details,
+        };
+        let mut state = UiState::new();
+        state.push(controller(
+            10,
+            "worker_batch_started",
+            serde_json::json!({"batch_id":"batch-1"}),
+        ));
+        assert!(state.batch_active);
+        assert_eq!(state.phase, "WORKERS");
+        assert_eq!(state.phase_started_at, Some(10));
+
+        state.push(controller(
+            11,
+            "phase_started",
+            serde_json::json!({"phase":"worker", "run_id":"run-1"}),
+        ));
+        state.push(controller(
+            12,
+            "worker_failed",
+            serde_json::json!({"run_id":"run-1"}),
+        ));
+        assert_eq!(state.phase, "WORKERS");
+        assert_eq!(state.phase_started_at, Some(10));
+
+        state.push(controller(
+            13,
+            "worker_batch_finished",
+            serde_json::json!({"batch_id":"batch-1"}),
+        ));
+        assert!(!state.batch_active);
+        state.push(controller(
+            14,
+            "cycle_started",
+            serde_json::json!({"cycle_id":"cycle-2"}),
+        ));
+        assert!(!state.batch_active);
     }
 
     #[test]

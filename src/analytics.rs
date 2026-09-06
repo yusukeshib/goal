@@ -8,6 +8,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::config::canonical_config_path;
+
 pub const METADATA_FILE: &str = "metadata.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -349,19 +351,12 @@ pub fn unix_timestamp_millis() -> u64 {
         .as_millis() as u64
 }
 
-pub fn resolve_project_dir(config_or_dir: &Path) -> Result<PathBuf> {
-    let config = if config_or_dir.is_dir() {
-        config_or_dir.join("goal.toml")
-    } else {
-        config_or_dir.to_owned()
-    };
-    fs::canonicalize(&config).with_context(|| format!("resolve config {}", config.display()))?;
-    let parent = config
+pub fn resolve_project_dir(goal_file: &Path) -> Result<PathBuf> {
+    let config_path = canonical_config_path(goal_file)?;
+    Ok(config_path
         .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    fs::canonicalize(parent)
-        .with_context(|| format!("resolve project directory {}", parent.display()))
+        .expect("canonical config path has a parent")
+        .to_owned())
 }
 
 #[cfg(test)]
