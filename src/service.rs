@@ -285,6 +285,7 @@ pub fn start_background(config_path: &Path, project_dir: &Path) -> Result<Servic
             .arg(config_path)
             .arg("--ready")
             .arg(&ready_path)
+            .env("GOAL_STATE_DIR", registry_root()?)
             .current_dir(project_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
@@ -564,22 +565,27 @@ fn update_registry(mut update: impl FnMut(&mut Registry) -> Result<()>) -> Resul
     write_json_atomic(&registry_path, &registry)
 }
 
-fn registry_root() -> Result<PathBuf> {
-    if let Some(path) = env::var_os("GOAL_STATE_DIR").filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(path));
+pub(crate) fn registry_root() -> Result<PathBuf> {
+    let root = if let Some(path) = env::var_os("GOAL_STATE_DIR").filter(|value| !value.is_empty()) {
+        PathBuf::from(path)
+    } else if let Some(path) = env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty()) {
+        PathBuf::from(path).join("goal")
+    } else {
+        let home = env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                anyhow!("HOME is not set; set XDG_STATE_HOME for the goal service registry")
+            })?;
+        PathBuf::from(home).join(".local/state/goal")
+    };
+    if root.is_absolute() {
+        Ok(root)
+    } else {
+        Ok(env::current_dir().context("resolve goal state directory")?.join(root))
     }
-    if let Some(path) = env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(path).join("goal"));
-    }
-    let home = env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            anyhow!("HOME is not set; set XDG_STATE_HOME for the goal service registry")
-        })?;
-    Ok(PathBuf::from(home).join(".local/state/goal"))
 }
 
-fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
+pub(crate) fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;

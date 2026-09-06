@@ -9,14 +9,24 @@ use std::{
     time::{Duration, Instant},
 };
 
+const TEST_GOAL_ID: &str = "test-goal";
+
+fn test_tempdir() -> tempfile::TempDir {
+    // macOS's default /var/folders/... temp root can exceed sockaddr_un's
+    // path limit once the registry and control socket filename are appended.
+    let root = fs::canonicalize("/tmp").unwrap();
+    tempfile::Builder::new().prefix("goal-").tempdir_in(root).unwrap()
+}
+
 struct Fixture {
     dir: tempfile::TempDir,
     config: PathBuf,
+    registry: PathBuf,
 }
 
 impl Fixture {
     fn new(sensor: &str, decider: &str, worker: &str) -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_tempdir();
         fs::write(dir.path().join("GOAL.md"), "Reach the fake goal safely.\n").unwrap();
         let sensor = script(dir.path(), "sensor.sh", sensor);
         let decider = script(dir.path(), "decider.sh", decider);
@@ -44,7 +54,23 @@ timeout_seconds = 5
             ),
         )
         .unwrap();
-        Self { dir, config }
+        let registry = dir.path().join("registry");
+        let added = goal_command(&registry)
+            .arg("add")
+            .arg(&config)
+            .args(["--id", TEST_GOAL_ID])
+            .output()
+            .unwrap();
+        assert!(
+            added.status.success(),
+            "failed to register fixture: {}",
+            String::from_utf8_lossy(&added.stderr)
+        );
+        Self {
+            dir,
+            config,
+            registry,
+        }
     }
 
     fn run(&self) -> Output {
@@ -94,15 +120,57 @@ timeout_seconds = 5
     }
 }
 
-fn command(config: &Path) -> Command {
+fn goal_command(state_dir: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_goal"));
     command
-        .arg("up")
-        .arg(config)
-        .arg("--foreground")
-        .env("GOAL_STATE_DIR", config.parent().unwrap().join("registry"))
+        .env("GOAL_STATE_DIR", state_dir)
         .env_remove("GOAL_DIR");
     command
+}
+
+fn command(config: &Path) -> Command {
+    let mut command = goal_command(&config.parent().unwrap().join("registry"));
+    command
+        .args(["up", TEST_GOAL_ID, "--foreground"]);
+    command
+}
+
+fn write_project(root: &Path, name: &str) -> PathBuf {
+    let project = root.join(name);
+    fs::create_dir(&project).unwrap();
+    fs::write(project.join("GOAL.md"), "Exercise the registry.\n").unwrap();
+    let config = project.join("goal.toml");
+    fs::write(
+        &config,
+        r#"goal_file = "GOAL.md"
+interval_seconds = 0
+max_wait_seconds = 1
+[sensor]
+command = ["/usr/bin/true"]
+timeout_seconds = 1
+[decider]
+command = ["/usr/bin/true"]
+timeout_seconds = 1
+[worker]
+command = ["/usr/bin/true"]
+timeout_seconds = 1
+"#,
+    )
+    .unwrap();
+    config
+}
+
+fn listed_goals(registry: &Path) -> Vec<serde_json::Value> {
+    let output = goal_command(registry)
+        .args(["list", "--output", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "failed to list goals: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
 }
 
 fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
@@ -144,6 +212,32 @@ fn process_exists(pid: &str) -> bool {
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
+}
+
+struct ServicesGuard {
+    registry: PathBuf,
+    armed: bool,
+}
+
+impl ServicesGuard {
+    fn new(registry: &Path) -> Self {
+        Self {
+            registry: registry.to_owned(),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ServicesGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = goal_command(&self.registry).arg("down").output();
+        }
+    }
 }
 
 struct ChildGuard(Option<Child>);
@@ -198,19 +292,21 @@ const COUNT_SENSOR: &str = r#"n=0; test ! -f sensor-count || n=$(cat sensor-coun
 
 #[test]
 fn help_fully_describes_configuration_and_process_contracts() {
-    let root = Command::new(env!("CARGO_BIN_EXE_goal"))
-        .arg("--help")
-        .output()
-        .unwrap();
+    let state = test_tempdir();
+    let root = goal_command(state.path()).arg("--help").output().unwrap();
     assert!(root.status.success());
     let root = String::from_utf8(root.stdout).unwrap();
     for expected in [
         "sense -> decide -> act -> sense",
-        "goal up GOAL_FILE",
+        "goal add PATH [--id ID]",
+        "goal up [ID]",
         ".goal/",
-        "goal down GOAL_FILE",
+        "goal down [ID]",
+        "goal enable ID",
+        "goal disable ID",
+        "goal remove ID",
         "goal list",
-        "goal tail GOAL_FILE --follow",
+        "goal tail ID --follow",
         "current directory or GOAL_DIR",
         "stats",
         "analysis",
@@ -223,12 +319,10 @@ fn help_fully_describes_configuration_and_process_contracts() {
     assert!(!root.contains("--goal-dir"));
     assert!(!root.contains("CONFIG_OR_DIR"));
 
-    let run = Command::new(env!("CARGO_BIN_EXE_goal"))
-        .arg("--help")
-        .output()
-        .unwrap();
+    let run = goal_command(state.path()).arg("--help").output().unwrap();
     assert!(run.status.success());
     let run = String::from_utf8(run.stdout).unwrap();
+    let run = run.split_whitespace().collect::<Vec<_>>().join(" ");
     for expected in [
         "goal_file = \"GOAL.md\"",
         "SENSOR CONTRACT",
@@ -258,15 +352,15 @@ fn help_fully_describes_configuration_and_process_contracts() {
 #[test]
 fn commands_never_infer_a_goal_from_the_current_directory_or_environment() {
     let fixture = Fixture::new(COUNT_SENSOR, r#"exit 99"#, r#"exit 99"#);
+    let empty_registry = fixture.dir.path().join("no-inference-registry");
+
     for args in [
         Vec::<&str>::new(),
-        vec!["up"],
-        vec!["down"],
         vec!["tail"],
         vec!["stats"],
         vec!["analysis"],
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_goal"))
+        let output = goal_command(&empty_registry)
             .args(args)
             .current_dir(fixture.dir.path())
             .env("GOAL_DIR", fixture.dir.path())
@@ -274,6 +368,436 @@ fn commands_never_infer_a_goal_from_the_current_directory_or_environment() {
             .unwrap();
         assert!(!output.status.success());
     }
+
+    for args in [vec!["up"], vec!["down"]] {
+        let output = goal_command(&empty_registry)
+            .args(args)
+            .current_dir(fixture.dir.path())
+            .env("GOAL_DIR", fixture.dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "empty bulk command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(listed_goals(&empty_registry).is_empty());
+    assert!(!fixture.dir.path().join(".goal").exists());
+}
+
+#[test]
+fn registration_accepts_files_and_directories_and_rejects_collisions() {
+    let root = test_tempdir();
+    let registry = root.path().join("registry");
+    let alpha = write_project(root.path(), "alpha");
+    let beta = write_project(root.path(), "beta");
+    let gamma = write_project(root.path(), "gamma");
+    let needs_override = write_project(root.path(), "_needs-override");
+
+    let added = goal_command(&registry)
+        .arg("add")
+        .arg(alpha.parent().unwrap())
+        .output()
+        .unwrap();
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    let added = goal_command(&registry)
+        .arg("add")
+        .arg(&beta)
+        .args(["--id", "custom.beta"])
+        .output()
+        .unwrap();
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+
+    let invalid_derived_id = goal_command(&registry)
+        .arg("add")
+        .arg(needs_override.parent().unwrap())
+        .output()
+        .unwrap();
+    assert!(!invalid_derived_id.status.success());
+    let overridden = goal_command(&registry)
+        .arg("add")
+        .arg(needs_override.parent().unwrap())
+        .args(["--id", "valid-override"])
+        .output()
+        .unwrap();
+    assert!(
+        overridden.status.success(),
+        "{}",
+        String::from_utf8_lossy(&overridden.stderr)
+    );
+
+    let duplicate_path = goal_command(&registry)
+        .arg("add")
+        .arg(&alpha)
+        .args(["--id", "alpha-alias"])
+        .output()
+        .unwrap();
+    assert!(!duplicate_path.status.success());
+    let alpha_symlink = root.path().join("alpha-link.toml");
+    std::os::unix::fs::symlink(&alpha, &alpha_symlink).unwrap();
+    let duplicate_symlink = goal_command(&registry)
+        .arg("add")
+        .arg(&alpha_symlink)
+        .args(["--id", "alpha-symlink"])
+        .output()
+        .unwrap();
+    assert!(!duplicate_symlink.status.success());
+    let duplicate_id = goal_command(&registry)
+        .arg("add")
+        .arg(&gamma)
+        .args(["--id", "alpha"])
+        .output()
+        .unwrap();
+    assert!(!duplicate_id.status.success());
+
+    let listed = listed_goals(&registry);
+    assert_eq!(
+        listed.iter().map(|goal| goal["id"].as_str().unwrap()).collect::<Vec<_>>(),
+        vec!["alpha", "custom.beta", "valid-override"]
+    );
+    assert!(listed.iter().all(|goal| {
+        goal["enabled"] == true
+            && goal["status"] == "stopped"
+            && goal["pid"].is_null()
+            && goal["config_path"].is_string()
+    }));
+    assert!(registry.join("goals.json").is_file());
+
+    let alias = goal_command(&registry)
+        .args(["ls", "--output", "json"])
+        .output()
+        .unwrap();
+    assert!(alias.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Vec<serde_json::Value>>(&alias.stdout).unwrap(),
+        listed
+    );
+}
+
+#[test]
+fn malformed_registration_file_is_reported_without_being_replaced() {
+    let root = test_tempdir();
+    let registry = root.path().join("registry");
+    fs::create_dir(&registry).unwrap();
+    let registrations = registry.join("goals.json");
+    let malformed = b"{ definitely-not-valid-json\n";
+    fs::write(&registrations, malformed).unwrap();
+    let config = write_project(root.path(), "valid-project");
+
+    for args in [vec!["list"], vec!["add", config.to_str().unwrap()]] {
+        let output = goal_command(&registry).args(args).output().unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("parse goal registrations"));
+        assert_eq!(fs::read(&registrations).unwrap(), malformed);
+    }
+}
+
+#[test]
+fn enable_disable_now_and_remove_keep_intent_separate_from_runtime() {
+    let fixture = Fixture::new(
+        COUNT_SENSOR,
+        r#"printf '{"type":"wait","reason":"stay active","retry_after_seconds":1}' > "$GOAL_RESULT_PATH""#,
+        r#"exit 99"#,
+    );
+    let mut cleanup = ServicesGuard::new(&fixture.registry);
+
+    let disabled = goal_command(&fixture.registry)
+        .args(["disable", TEST_GOAL_ID])
+        .output()
+        .unwrap();
+    assert!(disabled.status.success());
+    let listed = listed_goals(&fixture.registry);
+    assert_eq!(listed[0]["enabled"], false);
+    assert_eq!(listed[0]["status"], "stopped");
+
+    let explicit_up = goal_command(&fixture.registry)
+        .args(["up", TEST_GOAL_ID])
+        .output()
+        .unwrap();
+    assert!(!explicit_up.status.success());
+    assert!(String::from_utf8_lossy(&explicit_up.stderr).contains("disabled"));
+
+    let enabled_without_start = goal_command(&fixture.registry)
+        .args(["enable", TEST_GOAL_ID])
+        .output()
+        .unwrap();
+    assert!(enabled_without_start.status.success());
+    let listed = listed_goals(&fixture.registry);
+    assert_eq!(listed[0]["enabled"], true);
+    assert_eq!(listed[0]["status"], "stopped");
+
+    let enabled_now = goal_command(&fixture.registry)
+        .args(["enable", TEST_GOAL_ID, "--now"])
+        .output()
+        .unwrap();
+    assert!(
+        enabled_now.status.success(),
+        "{}",
+        String::from_utf8_lossy(&enabled_now.stderr)
+    );
+    let listed = listed_goals(&fixture.registry);
+    assert_eq!(listed[0]["enabled"], true);
+    assert_eq!(listed[0]["status"], "running");
+    assert!(listed[0]["pid"].is_u64());
+
+    let disabled_without_stop = goal_command(&fixture.registry)
+        .args(["disable", TEST_GOAL_ID])
+        .output()
+        .unwrap();
+    assert!(disabled_without_stop.status.success());
+    let listed = listed_goals(&fixture.registry);
+    assert_eq!(listed[0]["enabled"], false);
+    assert_eq!(listed[0]["status"], "running");
+
+    let remove_running = goal_command(&fixture.registry)
+        .args(["remove", TEST_GOAL_ID])
+        .output()
+        .unwrap();
+    assert!(!remove_running.status.success());
+    assert!(String::from_utf8_lossy(&remove_running.stderr).contains("running"));
+
+    let explicit_up = goal_command(&fixture.registry)
+        .args(["up", TEST_GOAL_ID])
+        .output()
+        .unwrap();
+    assert!(!explicit_up.status.success());
+    assert!(String::from_utf8_lossy(&explicit_up.stderr).contains("disabled"));
+
+    let disabled_now = goal_command(&fixture.registry)
+        .args(["disable", TEST_GOAL_ID, "--now"])
+        .output()
+        .unwrap();
+    assert!(
+        disabled_now.status.success(),
+        "{}",
+        String::from_utf8_lossy(&disabled_now.stderr)
+    );
+    let listed = listed_goals(&fixture.registry);
+    assert_eq!(listed[0]["enabled"], false);
+    assert_eq!(listed[0]["status"], "stopped");
+    assert!(listed[0]["pid"].is_null());
+
+    let config_before_remove = fs::read(&fixture.config).unwrap();
+    let artifacts = fixture.dir.path().join(".goal");
+    assert!(artifacts.is_dir());
+    let removed = goal_command(&fixture.registry)
+        .args(["remove", TEST_GOAL_ID])
+        .output()
+        .unwrap();
+    assert!(removed.status.success());
+    assert!(listed_goals(&fixture.registry).is_empty());
+    assert_eq!(fs::read(&fixture.config).unwrap(), config_before_remove);
+    assert!(artifacts.is_dir());
+    cleanup.disarm();
+}
+
+#[test]
+fn bulk_operations_continue_after_failures_and_include_disabled_goals() {
+    let broken = Fixture::new(COUNT_SENSOR, r#"exit 99"#, r#"exit 99"#);
+    let healthy = Fixture::new(
+        COUNT_SENSOR,
+        r#"printf '{"type":"wait","reason":"bulk service active","retry_after_seconds":1}' > "$GOAL_RESULT_PATH""#,
+        r#"exit 99"#,
+    );
+    let skipped = Fixture::new(COUNT_SENSOR, r#"exit 99"#, r#"exit 99"#);
+    let registry = healthy.dir.path().join("bulk-registry");
+    for (id, config) in [
+        ("a-broken", &broken.config),
+        ("m-disabled", &skipped.config),
+        ("z-healthy", &healthy.config),
+    ] {
+        let added = goal_command(&registry)
+            .arg("add")
+            .arg(config)
+            .args(["--id", id])
+            .output()
+            .unwrap();
+        assert!(
+            added.status.success(),
+            "{}",
+            String::from_utf8_lossy(&added.stderr)
+        );
+    }
+    assert!(goal_command(&registry)
+        .args(["disable", "a-broken"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    assert!(goal_command(&registry)
+        .args(["disable", "m-disabled"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    fs::remove_file(&broken.config).unwrap();
+    let failed_enable = goal_command(&registry)
+        .args(["enable", "a-broken", "--now"])
+        .output()
+        .unwrap();
+    assert!(!failed_enable.status.success());
+    let broken_goal = listed_goals(&registry)
+        .into_iter()
+        .find(|goal| goal["id"] == "a-broken")
+        .unwrap();
+    assert_eq!(broken_goal["enabled"], true);
+    assert_eq!(broken_goal["status"], "stopped");
+    let mut cleanup = ServicesGuard::new(&registry);
+
+    let first = goal_command(&registry)
+        .args(["up", "--output", "json"])
+        .output()
+        .unwrap();
+    assert!(!first.status.success());
+    let first_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(first_text.contains("a-broken"));
+    assert!(first_text.contains("z-healthy"));
+    let listed = listed_goals(&registry);
+    let healthy_goal = listed.iter().find(|goal| goal["id"] == "z-healthy").unwrap();
+    assert_eq!(healthy_goal["status"], "running");
+    let skipped_goal = listed.iter().find(|goal| goal["id"] == "m-disabled").unwrap();
+    assert_eq!(skipped_goal["enabled"], false);
+    assert_eq!(skipped_goal["status"], "stopped");
+    assert!(skipped_goal["pid"].is_null());
+    let pid = healthy_goal["pid"].as_u64().unwrap();
+
+    let second = goal_command(&registry)
+        .args(["up", "--output", "json"])
+        .output()
+        .unwrap();
+    assert!(!second.status.success());
+    let listed = listed_goals(&registry);
+    assert_eq!(
+        listed.iter().find(|goal| goal["id"] == "z-healthy").unwrap()["pid"],
+        pid
+    );
+
+    let disabled = goal_command(&registry)
+        .args(["disable", "z-healthy"])
+        .output()
+        .unwrap();
+    assert!(disabled.status.success());
+    assert_eq!(
+        listed_goals(&registry)
+            .iter()
+            .find(|goal| goal["id"] == "z-healthy")
+            .unwrap()["status"],
+        "running"
+    );
+
+    let stopped = goal_command(&registry).arg("down").output().unwrap();
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    let listed = listed_goals(&registry);
+    assert!(listed.iter().all(|goal| goal["status"] == "stopped"));
+    assert_eq!(
+        listed.iter().find(|goal| goal["id"] == "z-healthy").unwrap()["enabled"],
+        false
+    );
+    assert!(goal_command(&registry).arg("down").output().unwrap().status.success());
+
+    for id in ["a-broken", "m-disabled", "z-healthy"] {
+        let removed = goal_command(&registry)
+            .args(["remove", id])
+            .output()
+            .unwrap();
+        assert!(
+            removed.status.success(),
+            "failed to remove {id}: {}",
+            String::from_utf8_lossy(&removed.stderr)
+        );
+    }
+    assert!(listed_goals(&registry).is_empty());
+    cleanup.disarm();
+}
+
+#[test]
+fn id_only_commands_reject_unknown_paths_and_foreground_without_an_id() {
+    let fixture = Fixture::new(COUNT_SENSOR, r#"exit 99"#, r#"exit 99"#);
+    let foreground_without_id = goal_command(&fixture.registry)
+        .args(["up", "--foreground"])
+        .output()
+        .unwrap();
+    assert!(!foreground_without_id.status.success());
+
+    for args in [
+        vec!["up", "unknown"],
+        vec!["down", "unknown"],
+        vec!["tail", "unknown"],
+        vec!["stats", "unknown"],
+        vec!["analysis", "unknown"],
+        vec!["enable", "unknown"],
+        vec!["disable", "unknown"],
+        vec!["remove", "unknown"],
+        vec!["down", fixture.config.to_str().unwrap()],
+    ] {
+        let output = goal_command(&fixture.registry).args(args).output().unwrap();
+        assert!(!output.status.success());
+    }
+}
+
+#[test]
+fn relative_state_root_is_shared_with_the_detached_service() {
+    let fixture = Fixture::new(
+        COUNT_SENSOR,
+        r#"printf '{"type":"wait","reason":"relative registry active","retry_after_seconds":1}' > "$GOAL_RESULT_PATH""#,
+        r#"exit 99"#,
+    );
+    let caller = test_tempdir();
+    let relative_registry = Path::new("r");
+    let absolute_registry = caller.path().join(relative_registry);
+    let mut cleanup = ServicesGuard::new(&absolute_registry);
+
+    let added = goal_command(relative_registry)
+        .current_dir(caller.path())
+        .arg("add")
+        .arg(&fixture.config)
+        .args(["--id", "relative-goal"])
+        .output()
+        .unwrap();
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    let started = goal_command(relative_registry)
+        .current_dir(caller.path())
+        .args(["up", "relative-goal"])
+        .output()
+        .unwrap();
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let listed = listed_goals(&absolute_registry);
+    assert_eq!(listed[0]["id"], "relative-goal");
+    assert_eq!(listed[0]["status"], "running");
+
+    let stopped = goal_command(relative_registry)
+        .current_dir(caller.path())
+        .args(["down", "relative-goal"])
+        .output()
+        .unwrap();
+    assert!(stopped.status.success());
+    assert_eq!(listed_goals(&absolute_registry)[0]["status"], "stopped");
+    cleanup.disarm();
 }
 
 #[test]
@@ -415,12 +939,22 @@ fn background_service_can_be_listed_tailed_and_stopped() {
         r#"exit 99"#,
     );
     let registry = fixture.dir.path().join("service-registry");
+    let id = "background-goal";
 
-    let started = Command::new(env!("CARGO_BIN_EXE_goal"))
-        .arg("up")
+    let added = goal_command(&registry)
+        .arg("add")
         .arg(&fixture.config)
-        .args(["--output", "json"])
-        .env("GOAL_STATE_DIR", &registry)
+        .args(["--id", id])
+        .output()
+        .unwrap();
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+
+    let started = goal_command(&registry)
+        .args(["up", id, "--output", "json"])
         .output()
         .unwrap();
     assert!(
@@ -429,38 +963,33 @@ fn background_service_can_be_listed_tailed_and_stopped() {
         String::from_utf8_lossy(&started.stderr)
     );
     let started: serde_json::Value = serde_json::from_slice(&started.stdout).unwrap();
-    let pid = started["service"]["pid"].as_u64().unwrap() as i32;
+    let pid = started["service"]["pid"].as_u64().unwrap();
 
     struct Cleanup {
         armed: bool,
-        config: PathBuf,
+        id: String,
         registry: PathBuf,
     }
     impl Drop for Cleanup {
         fn drop(&mut self) {
             if self.armed {
-                let _ = Command::new(env!("CARGO_BIN_EXE_goal"))
-                    .arg("down")
-                    .arg(&self.config)
-                    .env("GOAL_STATE_DIR", &self.registry)
+                let _ = goal_command(&self.registry)
+                    .args(["down", &self.id])
                     .output();
             }
         }
     }
     let mut cleanup = Cleanup {
         armed: true,
-        config: fixture.config.clone(),
+        id: id.to_owned(),
         registry: registry.clone(),
     };
 
-    let listed = Command::new(env!("CARGO_BIN_EXE_goal"))
-        .args(["list", "--output", "json"])
-        .env("GOAL_STATE_DIR", &registry)
-        .output()
-        .unwrap();
-    assert!(listed.status.success());
-    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
-    assert_eq!(listed.as_array().unwrap().len(), 1);
+    let listed = listed_goals(&registry);
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0]["id"], id);
+    assert_eq!(listed[0]["enabled"], true);
+    assert_eq!(listed[0]["status"], "running");
     assert_eq!(listed[0]["pid"], pid);
     assert_eq!(
         listed[0]["config_path"],
@@ -470,40 +999,33 @@ fn background_service_can_be_listed_tailed_and_stopped() {
             .as_ref()
     );
 
-    let duplicate = Command::new(env!("CARGO_BIN_EXE_goal"))
-        .arg("up")
-        .arg(&fixture.config)
-        .env("GOAL_STATE_DIR", &registry)
+    let duplicate = goal_command(&registry)
+        .args(["up", id, "--output", "json"])
         .output()
         .unwrap();
-    assert!(!duplicate.status.success());
-    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("already running"));
+    assert!(
+        duplicate.status.success(),
+        "{}",
+        String::from_utf8_lossy(&duplicate.stderr)
+    );
+    assert!(String::from_utf8_lossy(&duplicate.stdout).contains("already_running"));
 
     let service_log = fixture.dir.path().join(".goal/service.log");
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while fs::read_to_string(&service_log)
-        .map(|log| !log.contains("keep service running"))
-        .unwrap_or(true)
-        && Instant::now() < deadline
-    {
-        thread::sleep(Duration::from_millis(20));
-    }
+    wait_for("service log output", Duration::from_secs(3), || {
+        fs::read_to_string(&service_log)
+            .map(|log| log.contains("keep service running"))
+            .unwrap_or(false)
+    });
 
-    let tailed = Command::new(env!("CARGO_BIN_EXE_goal"))
-        .arg("tail")
-        .arg(&fixture.config)
-        .args(["--lines", "20"])
-        .env("GOAL_STATE_DIR", &registry)
+    let tailed = goal_command(&registry)
+        .args(["tail", id, "--lines", "20"])
         .output()
         .unwrap();
     assert!(tailed.status.success());
     assert!(String::from_utf8_lossy(&tailed.stdout).contains("keep service running"));
 
-    let stopped = Command::new(env!("CARGO_BIN_EXE_goal"))
-        .arg("down")
-        .arg(&fixture.config)
-        .args(["--output", "json"])
-        .env("GOAL_STATE_DIR", &registry)
+    let stopped = goal_command(&registry)
+        .args(["down", id, "--output", "json"])
         .output()
         .unwrap();
     assert!(
@@ -513,14 +1035,16 @@ fn background_service_can_be_listed_tailed_and_stopped() {
     );
     cleanup.armed = false;
 
-    let listed = Command::new(env!("CARGO_BIN_EXE_goal"))
-        .args(["list", "--output", "json"])
-        .env("GOAL_STATE_DIR", &registry)
-        .output()
-        .unwrap();
-    assert!(listed.status.success());
-    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
-    assert_eq!(listed, serde_json::json!([]));
+    let listed = listed_goals(&registry);
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0]["id"], id);
+    assert_eq!(listed[0]["enabled"], true);
+    assert_eq!(listed[0]["status"], "stopped");
+    assert!(listed[0]["pid"].is_null());
+    assert_eq!(
+        listed[0]["config_path"],
+        fs::canonicalize(&fixture.config).unwrap().to_string_lossy().as_ref()
+    );
 }
 
 #[test]
@@ -539,6 +1063,45 @@ fn default_non_tty_output_falls_back_to_plain_and_hides_sensor_protocol() {
         !stdout.contains("\u{1b}["),
         "non-TTY output contained terminal escapes"
     );
+}
+
+#[test]
+fn sensor_protocol_is_hidden_in_pretty_but_retained_in_json_and_artifacts() {
+    for mode in ["pretty", "json"] {
+        let fixture = Fixture::new(
+            r#"printf '{"private_observation":"sensor-payload"}'; echo sensor-diagnostic >&2"#,
+            r#"grep -q 'sensor-payload' "$GOAL_PROMPT_PATH"; printf '{"type":"complete","summary":"observation received"}' > "$GOAL_RESULT_PATH""#,
+            r#"exit 99"#,
+        );
+        let output = command(&fixture.config)
+            .args(["--output", mode])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{mode}: {output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("observation received"));
+        if mode == "pretty" {
+            assert!(!stdout.contains("sensor-payload"));
+            assert!(String::from_utf8_lossy(&output.stderr).contains("sensor-diagnostic"));
+        } else {
+            assert!(output.stderr.is_empty());
+            let messages = stdout.lines().map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()
+            }).collect::<Vec<_>>();
+            assert!(messages.iter().any(|message| {
+                message["type"] == "child_output"
+                    && message["details"]["role"] == "sensor"
+                    && message["details"]["payload"]["private_observation"] == "sensor-payload"
+            }));
+            assert!(stdout.contains("sensor-diagnostic"));
+        }
+        assert!(fs::read_dir(fixture.dir.path().join(".goal/runs"))
+            .unwrap()
+            .any(|entry| {
+                fs::read(entry.unwrap().path().join("stdout.log"))
+                    .is_ok_and(|bytes| bytes == br#"{"private_observation":"sensor-payload"}"#)
+            }));
+    }
 }
 
 #[test]
@@ -600,10 +1163,26 @@ fn wait_retry_delay_is_not_extended_by_the_cycle_interval() {
     );
     fixture.set_interval(5);
 
-    let started = Instant::now();
-    let output = fixture.run();
-    assert!(output.status.success());
-    assert!(started.elapsed() < Duration::from_secs(3));
+    let output = command(&fixture.config)
+        .args(["--output", "json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let messages = stdout.lines().map(|line| {
+        serde_json::from_str::<serde_json::Value>(line).unwrap()
+    }).collect::<Vec<_>>();
+    let wait_index = messages.iter().position(|event| event["type"] == "wait").unwrap();
+    let wait = &messages[wait_index];
+    assert_eq!(wait["details"]["actual_seconds"], 0);
+    let next_cycle = messages[wait_index + 1..].iter()
+        .find(|event| event["type"] == "cycle_started")
+        .expect("wait must be followed by another cycle");
+    // Measure the retry boundary, not unrelated startup and child process time.
+    // An incorrectly added five-second interval still exceeds this bound.
+    let elapsed = next_cycle["timestamp"].as_u64().unwrap()
+        - wait["timestamp"].as_u64().unwrap();
+    assert!(elapsed < 3, "zero-second retry took {elapsed} seconds");
     assert_eq!(fixture.count("sensor-count"), 2);
 }
 
@@ -651,7 +1230,7 @@ fn goal_file_is_reloaded_between_cycles_with_one_snapshot_per_cycle() {
 }
 
 #[test]
-fn stats_and_analysis_require_and_use_an_explicit_goal_file() {
+fn stats_and_analysis_require_and_use_a_registered_id() {
     let fixture = Fixture::new(
         COUNT_SENSOR,
         r#"n=0; test ! -f decider-count || n=$(cat decider-count); n=$((n+1)); echo "$n" > decider-count; if test "$n" = 1; then r='{"type":"run_task","task":"do one thing"}'; else r='{"type":"complete","summary":"observed done"}'; fi; printf '%s' "$r" > "$GOAL_RESULT_PATH""#,
@@ -659,9 +1238,9 @@ fn stats_and_analysis_require_and_use_an_explicit_goal_file() {
     );
     assert!(fixture.run().status.success());
 
-    let output = Command::new(env!("CARGO_BIN_EXE_goal"))
+    let output = goal_command(&fixture.registry)
         .arg("stats")
-        .arg(&fixture.config)
+        .arg(TEST_GOAL_ID)
         .args(["--since", "24h", "--output", "json"])
         .output()
         .unwrap();
@@ -677,9 +1256,9 @@ fn stats_and_analysis_require_and_use_an_explicit_goal_file() {
     assert_eq!(report["worker_success_rate"], 1.0);
     assert_eq!(report["roles"]["worker"]["duration_ms"]["count"], 1);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_goal"))
+    let output = goal_command(&fixture.registry)
         .arg("stats")
-        .arg(&fixture.config)
+        .arg(TEST_GOAL_ID)
         .output()
         .unwrap();
     assert!(
@@ -689,9 +1268,9 @@ fn stats_and_analysis_require_and_use_an_explicit_goal_file() {
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("5 recorded"));
 
-    let output = Command::new(env!("CARGO_BIN_EXE_goal"))
+    let output = goal_command(&fixture.registry)
         .arg("analysis")
-        .arg(&fixture.config)
+        .arg(TEST_GOAL_ID)
         .args(["--output", "json"])
         .output()
         .unwrap();
@@ -754,9 +1333,9 @@ fn sensor_process_failure_is_recorded_and_retried_after_resensing() {
     assert!(!events.iter().any(|event| event["type"] == "failure"));
     assert!(events.iter().any(|event| event["type"] == "complete"));
 
-    let stats = Command::new(env!("CARGO_BIN_EXE_goal"))
+    let stats = goal_command(&fixture.registry)
         .arg("stats")
-        .arg(&fixture.config)
+        .arg(TEST_GOAL_ID)
         .args(["--output", "json"])
         .output()
         .unwrap();
@@ -875,9 +1454,9 @@ fn worker_reported_failure_is_recorded_and_the_next_cycle_can_complete() {
     );
     assert!(events.iter().any(|event| event["type"] == "complete"));
 
-    let stats = Command::new(env!("CARGO_BIN_EXE_goal"))
+    let stats = goal_command(&fixture.registry)
         .arg("stats")
-        .arg(&fixture.config)
+        .arg(TEST_GOAL_ID)
         .args(["--output", "json"])
         .output()
         .unwrap();
@@ -1034,9 +1613,9 @@ fn decider_reported_failure_is_recorded_and_the_next_cycle_can_complete() {
     assert!(!events.iter().any(|event| event["type"] == "failure"));
     assert!(events.iter().any(|event| event["type"] == "complete"));
 
-    let stats = Command::new(env!("CARGO_BIN_EXE_goal"))
+    let stats = goal_command(&fixture.registry)
         .arg("stats")
-        .arg(&fixture.config)
+        .arg(TEST_GOAL_ID)
         .args(["--output", "json"])
         .output()
         .unwrap();
@@ -1370,7 +1949,9 @@ esac
 "#,
     );
     fixture.set_max_concurrency(2);
-    fixture.set_timeout("worker", 1);
+    // Leave startup headroom under parallel test load. The timeout task still
+    // sleeps for 10 seconds, so its real timeout and all outcomes remain tested.
+    fixture.set_timeout("worker", 3);
 
     let output = fixture.run();
     assert!(
@@ -1440,9 +2021,9 @@ esac
     assert!(prompt.contains("expected logical refusal"));
     assert!(prompt.contains("Worker invocation failed after it may have modified external state"));
 
-    let stats = Command::new(env!("CARGO_BIN_EXE_goal"))
+    let stats = goal_command(&fixture.registry)
         .arg("stats")
-        .arg(&fixture.config)
+        .arg(TEST_GOAL_ID)
         .args(["--output", "json"])
         .output()
         .unwrap();

@@ -131,6 +131,11 @@ impl Output {
             return Ok(());
         }
         if self.mode != OutputMode::Json {
+            // Sensor stdout is protocol data, not a text diagnostic. The runner
+            // still captures it for the decider and retains its exact run log.
+            if role == "sensor" && stream == "stdout" {
+                return Ok(());
+            }
             if self.mode == OutputMode::Pretty && stream == "stdout" {
                 let rendered = prettify_json_line(line)?;
                 let prefix = format!(

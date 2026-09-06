@@ -16,23 +16,39 @@ Requires Rust 1.85+ and a `goal.toml` plus its configured goal file.
 
 ```sh
 cargo install --path .
-goal up /path/to/goal/goal.toml
+goal add /path/to/goal/goal.toml --id my-goal
+goal up my-goal
 ```
 
-Goal selection is always explicit. `goal` never infers `goal.toml` from the current directory or `GOAL_DIR`. The directory containing the specified TOML file is the child working directory.
+Only `add` accepts a path (a TOML file or a directory containing `goal.toml`). All subsequent commands use the registered ID. `goal` never infers a goal from the current directory or `GOAL_DIR`. The directory containing the canonical TOML file is the child working directory.
 
 Service commands:
 
 ```sh
-goal up /path/to/goal.toml                 # detached; logs to .goal/service.log
-goal up /path/to/goal.toml --foreground    # attached observational TUI
-goal list
-goal tail /path/to/goal.toml
-goal tail /path/to/goal.toml --follow
-goal down /path/to/goal.toml
+goal add /path/to/goal                    # register enabled, but do not start
+goal add /another/goal.toml --id my-goal   # override the directory-derived ID
+goal up                                  # start all enabled registered goals
+goal up my-goal                           # start one; logs to .goal/service.log
+goal up my-goal --foreground              # attached observational TUI; ID required
+goal list                                # all registrations, even stopped/disabled
+goal ls                                  # alias for list
+goal disable my-goal                      # exclude from up; do not stop it
+goal enable my-goal                       # include in up; do not start it
+goal disable my-goal --now                # disable and stop
+goal enable my-goal --now                 # enable and start
+goal tail my-goal --follow
+goal down my-goal                         # stop one without unregistering it
+goal down                                # stop all registered goals, even disabled
+goal remove my-goal                      # unregister; refuses while running
 ```
 
-Paths are canonicalized before being used as service identities. A lock under `.goal/` prevents multiple controllers from running for the same project directory. `goal list --output json` provides structured service discovery.
+IDs default to the canonical project directory name and remain fixed after registration. Use letters, digits, `.`, `_`, and `-`, starting with a letter or digit. Invalid names or ID collisions require an explicit `--id`; a project can only be registered once, including through symlinks.
+
+Enabled/disabled and running/stopped are independent states. A disabled goal must be enabled before an explicit `up` too. Background `up` and `down` skip already-running/already-stopped goals. Bulk operations attempt every eligible goal and exit nonzero if any fail; successful operations are not rolled back. `--now` saves the enabled flag first, so a subsequent start/stop failure does not revert it. `up` is a one-time start operation, not a supervisor or automatic restart policy.
+
+Registrations persist in `goals.json` under `$GOAL_STATE_DIR`, or `$XDG_STATE_HOME/goal`, or `~/.local/state/goal`. They are separate from transient `services.json` runtime records and survive completion, failure, and stopping. `remove` deletes neither configuration nor `.goal/` artifacts. A lock under `.goal/` still prevents multiple controllers for the same project directory. `goal list --output json` returns all registrations with `id`, `enabled`, `status` (`running`/`stopped`), `config_path`, and runtime fields such as `pid` (null when stopped).
+
+**Upgrading from path-based commands:** register each existing configuration with `goal add /path/to/goal.toml --id my-goal`, including services already running. Registration does not restart them. There is no automatic migration; unregistered old services are not shown in the new `list` or targeted by bulk `down`. Existing controllers can continue running without overwriting the new registrations.
 
 A minimal `goal.toml`:
 
@@ -77,11 +93,11 @@ A batch is a cycle boundary, not a durable queue or resumable scheduler. State r
 ## Observe
 
 ```sh
-goal tail /path/to/goal.toml --follow
-goal stats /path/to/goal.toml --since 24h
-goal analysis /path/to/goal.toml
-goal analysis /path/to/goal.toml --since 7d
-goal analysis /path/to/goal.toml --date 2026-08-03
+goal tail my-goal --follow
+goal stats my-goal --since 24h
+goal analysis my-goal
+goal analysis my-goal --since 7d
+goal analysis my-goal --date 2026-08-03
 ```
 
 Foreground TUI: `↑/↓` or `j/k` selects, `PgUp/PgDn` scrolls details, `End` follows, and `q` stops. Redirection automatically falls back to plain output.

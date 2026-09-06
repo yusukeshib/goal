@@ -6,6 +6,7 @@ mod controller;
 mod model;
 mod output;
 mod prompt;
+mod registry;
 mod runner;
 mod service;
 mod state;
@@ -17,7 +18,7 @@ use std::{
     sync::{Arc, atomic::AtomicBool, mpsc},
 };
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use serde_json::json;
 
@@ -30,17 +31,24 @@ const ROOT_HELP: &str = r#"HOW IT WORKS
   the work. Every task in a normally completed batch settles before re-sensing.
 
 TARGET SELECTION
-  Commands never infer a goal from the current directory or GOAL_DIR. Pass the
-  goal.toml path explicitly to every command that operates on one goal. Paths
-  are canonicalized before they are used as service identities.
+  Commands never infer a goal from the current directory or GOAL_DIR.
+  Register a goal.toml file or its directory with `goal add PATH [--id ID]`.
+  The default ID is its canonical directory name; all later commands use IDs.
 
 COMMANDS
-  `goal up GOAL_FILE` starts a detached service and writes its output to
-  .goal/service.log. Add --foreground to keep the controller attached and show
-  its observational TUI. `goal down GOAL_FILE` stops it, `goal list` discovers
-  running services, and `goal tail GOAL_FILE --follow` streams its service log.
-  `goal stats` and `goal analysis` inspect retained artifacts without starting
-  sensor, decider, or worker processes.
+  `goal up [ID]` starts enabled goals in the background, logging to .goal/service.log.
+  `goal up ID --foreground` runs one goal attached with its observational TUI.
+  `goal down [ID]` stops registered goals, including disabled ones.
+  Without an ID, up/down operate on all eligible registered goals. Already
+  running/stopped goals are skipped. Batch failures do not prevent other goals
+  from being processed, but make the command exit non-zero.
+  `goal enable ID` / `goal disable ID` change eligibility, not running state;
+  add --now to also start/stop. Disabled goals must be enabled before starting.
+  `goal remove ID` unregisters a stopped goal without deleting its files.
+  `goal list` (or `goal ls`) shows all registrations and their running state.
+  `goal tail ID --follow` streams a service log. `goal stats ID` and
+  `goal analysis ID` inspect retained artifacts without starting child processes.
+  Existing path-based services must be registered with add to appear in list.
 
 FILES
   goal.toml          Commands, timeouts, and natural-language goal path.
@@ -50,8 +58,9 @@ FILES
 "#;
 
 const RUN_HELP: &str = r#"CONFIGURATION
-  GOAL_FILE must name a goal.toml file. Its parent directory is the project and
-  child working directory. Relative goal and command paths resolve from there.
+  Register a goal.toml file with `goal add PATH`. Its parent directory is the
+  project and child working directory. Relative goal and command paths resolve
+  from there.
 
   Required goal.toml shape:
 
@@ -175,15 +184,15 @@ DECIDER AND WORKER CONTRACT
   deliberately detached process.
 
 FAILURE ANALYSIS
-  Runtime data lives under .goal/ beside GOAL_FILE. Successful and failed
+  Runtime data lives under .goal/ beside the registered TOML file. Successful and failed
   invocations retain prompts, results, stdout, stderr, outcome metadata, and an
   exact launch.json (expanded argv, working directory, timeout, and prompt
   delivery mode) under .goal/runs/. Compact outcomes are appended to
-  .goal/events.jsonl. Run `goal stats GOAL_FILE --since 24h` for outcome counts,
+  .goal/events.jsonl. Run `goal stats ID --since 24h` for outcome counts,
   worker success rate, and role-specific average, p50, and p95 durations. Run
-  `goal analysis GOAL_FILE` for the current local calendar day,
-  `goal analysis GOAL_FILE --date YYYY-MM-DD` for a past local date, or
-  `goal analysis GOAL_FILE --since 24h` for a rolling window. Analysis adds
+  `goal analysis ID` for the current local calendar day,
+  `goal analysis ID --date YYYY-MM-DD` for a past local date, or
+  `goal analysis ID --since 24h` for a rolling window. Analysis adds
   decision/wait activity and exact non-success run IDs, reasons, and artifact
   paths. Historical directories without metadata are counted across all time
   and excluded from filtered metrics.
@@ -210,14 +219,15 @@ OUTPUT
   one JSON report.
 
 EXAMPLES
-  goal up /srv/goals/ci/goal.toml
-  goal up ./goals/ci/goal.toml --foreground
+  goal add /srv/goals/ci/goal.toml --id ci
+  goal up
+  goal up ci --foreground
   goal list --output json
-  goal tail ./goals/ci/goal.toml --follow
-  goal down ./goals/ci/goal.toml
-  goal stats ./goals/ci/goal.toml --since 24h
-  goal analysis ./goals/ci/goal.toml --date 2026-08-03 --output json
-  goal up ./goals/ci/goal.toml --foreground --output json | jq --unbuffered -C .
+  goal tail ci --follow
+  goal down ci
+  goal stats ci --since 24h
+  goal analysis ci --date 2026-08-03 --output json
+  goal up ci --foreground --output json | jq --unbuffered -C .
 
   See examples/fake for a deterministic full cycle. Keep operational goal
   configurations outside this source checkout, for example under ~/goals/."#;
@@ -246,28 +256,54 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start a goal service.
+    /// Register a goal without starting it (enabled by default).
+    Add {
+        /// Path to goal.toml or its directory.
+        #[arg(value_name = "PATH")]
+        path: PathBuf,
+        /// Stable ID; defaults to the canonical project directory name.
+        #[arg(long, value_name = "ID")]
+        id: Option<String>,
+    },
+    /// Unregister a stopped goal without deleting any files.
+    Remove {
+        #[arg(value_name = "ID")]
+        id: String,
+    },
+    /// Start one enabled goal, or all enabled registered goals.
     Up {
-        /// Path to the goal.toml file.
-        #[arg(value_name = "GOAL_FILE")]
-        goal_file: PathBuf,
-        /// Run attached to this terminal instead of starting a background service.
-        #[arg(long)]
+        #[arg(value_name = "ID")]
+        id: Option<String>,
+        /// Run one goal attached to this terminal (requires ID).
+        #[arg(long, requires = "id")]
         foreground: bool,
     },
-    /// Stop a running goal service.
+    /// Stop one goal, or all registered goals, including disabled ones.
     Down {
-        /// Path to the goal.toml file.
-        #[arg(value_name = "GOAL_FILE")]
-        goal_file: PathBuf,
+        #[arg(value_name = "ID")]
+        id: Option<String>,
     },
-    /// List running goal services.
+    /// Include a goal in bulk up; does not start it unless --now is given.
+    Enable {
+        #[arg(value_name = "ID")]
+        id: String,
+        #[arg(long)]
+        now: bool,
+    },
+    /// Exclude a goal from bulk up; does not stop it unless --now is given.
+    Disable {
+        #[arg(value_name = "ID")]
+        id: String,
+        #[arg(long)]
+        now: bool,
+    },
+    /// List all registered goals, including stopped and disabled goals.
+    #[command(visible_alias = "ls")]
     List,
     /// Print or follow a background goal service log.
     Tail {
-        /// Path to the goal.toml file.
-        #[arg(value_name = "GOAL_FILE")]
-        goal_file: PathBuf,
+        #[arg(value_name = "ID")]
+        id: String,
         /// Continue streaming until the service stops or this command is interrupted.
         #[arg(short, long)]
         follow: bool,
@@ -277,18 +313,16 @@ enum Commands {
     },
     /// Summarize recorded child run outcomes and durations.
     Stats {
-        /// Path to the goal.toml file.
-        #[arg(value_name = "GOAL_FILE")]
-        goal_file: PathBuf,
+        #[arg(value_name = "ID")]
+        id: String,
         /// Include runs started within this duration, such as 24h or 7d.
         #[arg(long, value_name = "DURATION")]
         since: Option<String>,
     },
     /// Report activity and non-success runs for offline inspection.
     Analysis {
-        /// Path to the goal.toml file.
-        #[arg(value_name = "GOAL_FILE")]
-        goal_file: PathBuf,
+        #[arg(value_name = "ID")]
+        id: String,
         /// Analyze a rolling duration instead of today's local calendar day.
         #[arg(long, value_name = "DURATION", conflicts_with = "date")]
         since: Option<String>,
@@ -342,40 +376,67 @@ fn effective_output_mode(requested: output::OutputMode) -> output::OutputMode {
 
 fn dispatch(cli: Cli, output_mode: output::OutputMode) -> Result<()> {
     match cli.command {
-        Commands::Up {
-            goal_file,
-            foreground,
-        } => {
+        Commands::Add { path, id } => {
+            let goal = registry::Registry::open()?.add(&path, id.as_deref())?;
+            print_goal_action("added", &goal, None, output_mode)
+        }
+        Commands::Remove { id } => {
+            let goal = registry::Registry::open()?.remove(&id)?;
+            print_goal_action("removed", &goal, None, output_mode)
+        }
+        Commands::Up { id, foreground } => {
+            // Keep the administrative lock until startup has published its runtime
+            // record, so remove/disable cannot race an admitted start. Detached
+            // children only acquire the separate services.json lock.
+            let registry = registry::Registry::open()?;
             if foreground {
-                run_controller(goal_file, output_mode, true, None)
+                let goal = registry.get(id.as_deref().expect("foreground requires ID"))?;
+                require_enabled(&goal)?;
+                run_controller(goal.config_path, output_mode, true, None, Some(registry))
             } else {
-                let loaded = config::LoadedConfig::load(&goal_file)?;
-                let record = service::start_background(&loaded.config_path, &loaded.project_dir)?;
-                print_service_action("started", &record, output_mode)
+                let goals = match id {
+                    Some(id) => vec![registry.get(&id)?],
+                    None => registry
+                        .goals()
+                        .into_iter()
+                        .filter(|goal| goal.enabled)
+                        .collect(),
+                };
+                run_goal_actions(&goals, true, output_mode)
             }
         }
-        Commands::Down { goal_file } => {
-            let config_path = config::canonical_config_path(&goal_file)?;
-            let record = service::stop(&config_path)?;
-            print_service_action("stopped", &record, output_mode)
+        Commands::Down { id } => {
+            // Serialize stop with registration changes and other up/down calls.
+            let registry = registry::Registry::open()?;
+            let goals = match id {
+                Some(id) => vec![registry.get(&id)?],
+                None => registry.goals(),
+            };
+            run_goal_actions(&goals, false, output_mode)
         }
+        Commands::Enable { id, now } => set_enabled(&id, true, now, output_mode),
+        Commands::Disable { id, now } => set_enabled(&id, false, now, output_mode),
         Commands::List => run_list(output_mode),
-        Commands::Tail {
-            goal_file,
-            follow,
-            lines,
-        } => {
-            let config_path = config::canonical_config_path(&goal_file)?;
-            service::tail(&config_path, lines, follow)
+        Commands::Tail { id, follow, lines } => {
+            let goal = registry::Registry::open()?.get(&id)?;
+            service::tail(&goal.config_path, lines, follow)
         }
-        Commands::Stats { goal_file, since } => run_stats(goal_file, since.as_deref(), output_mode),
-        Commands::Analysis {
-            goal_file,
-            since,
-            date,
-        } => run_analysis(goal_file, since.as_deref(), date.as_deref(), output_mode),
+        Commands::Stats { id, since } => {
+            let goal = registry::Registry::open()?.get(&id)?;
+            run_stats(goal.config_path, since.as_deref(), output_mode)
+        }
+        Commands::Analysis { id, since, date } => {
+            let goal = registry::Registry::open()?.get(&id)?;
+            run_analysis(goal.config_path, since.as_deref(), date.as_deref(), output_mode)
+        }
         Commands::Service { goal_file, ready } => {
-            let result = run_controller(goal_file, output::OutputMode::Plain, false, Some(&ready));
+            let result = run_controller(
+                goal_file,
+                output::OutputMode::Plain,
+                false,
+                Some(&ready),
+                None,
+            );
             if let Err(error) = &result
                 && !ready.exists()
             {
@@ -386,13 +447,109 @@ fn dispatch(cli: Cli, output_mode: output::OutputMode) -> Result<()> {
     }
 }
 
+fn require_enabled(goal: &registry::Goal) -> Result<()> {
+    if !goal.enabled {
+        bail!(
+            "goal {} is disabled; run goal enable {} first",
+            goal.id,
+            goal.id
+        );
+    }
+    Ok(())
+}
+
+fn set_enabled(id: &str, enabled: bool, now: bool, output_mode: output::OutputMode) -> Result<()> {
+    let mut registry = registry::Registry::open()?;
+    let goal = registry.set_enabled(id, enabled)?;
+    print_goal_action(
+        if enabled { "enabled" } else { "disabled" },
+        &goal,
+        None,
+        output_mode,
+    )?;
+    if now {
+        run_goal_actions(&[goal], enabled, output_mode)?;
+    }
+    Ok(())
+}
+
+fn run_goal_actions(
+    goals: &[registry::Goal],
+    start: bool,
+    output_mode: output::OutputMode,
+) -> Result<()> {
+    let mut failed = Vec::new();
+    for goal in goals {
+        if let Err(error) = run_goal_action(goal, start, output_mode) {
+            let message = format!("{}: {error:#}", goal.id);
+            if output_mode == output::OutputMode::Json {
+                let mut stdout = io::stdout().lock();
+                serde_json::to_writer(
+                    &mut stdout,
+                    &json!({"status": "error", "id": goal.id, "message": message}),
+                )?;
+                stdout.write_all(b"\n")?;
+                stdout.flush()?;
+            } else {
+                eprintln!("{message}");
+            }
+            failed.push(goal.id.as_str());
+        }
+    }
+    if !failed.is_empty() {
+        bail!(
+            "goal {} failed for: {}",
+            if start { "up" } else { "down" },
+            failed.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn run_goal_action(
+    goal: &registry::Goal,
+    start: bool,
+    output_mode: output::OutputMode,
+) -> Result<()> {
+    if start {
+        require_enabled(goal)?;
+    }
+    let running = service::service_for_config(&goal.config_path)?;
+    let (action, record) = if start {
+        if let Some(record) = running {
+            ("already_running", Some(record))
+        } else {
+            let loaded = config::LoadedConfig::load(&goal.config_path)?;
+            if loaded.config_path != goal.config_path {
+                bail!(
+                    "registered config path changed; remove and add {} again",
+                    goal.id
+                );
+            }
+            (
+                "started",
+                Some(service::start_background(&loaded.config_path, &loaded.project_dir)?),
+            )
+        }
+    } else if running.is_some() {
+        ("stopped", Some(service::stop(&goal.config_path)?))
+    } else {
+        ("already_stopped", None)
+    };
+    print_goal_action(action, goal, record.as_ref(), output_mode)
+}
+
 fn run_controller(
     config: PathBuf,
     output_mode: output::OutputMode,
     foreground: bool,
     ready: Option<&Path>,
+    registry_guard: Option<registry::Registry>,
 ) -> Result<()> {
     let loaded = config::LoadedConfig::load(&config)?;
+    if registry_guard.is_some() && loaded.config_path != config {
+        bail!("registered config path changed; remove and add the goal again");
+    }
     let cancelled = Arc::new(AtomicBool::new(false));
     let signal_flag = Arc::clone(&cancelled);
     ctrlc::set_handler(move || {
@@ -413,6 +570,7 @@ fn run_controller(
             Arc::clone(&cancelled),
         )?;
         announce_ready(ready, registration.record())?;
+        drop(registry_guard);
         tui::run(controller, project, cancelled, receiver)
     } else {
         let config_path = loaded.config_path.clone();
@@ -422,6 +580,7 @@ fn run_controller(
         let registration =
             service::Registration::create(&config_path, &project_dir, foreground, cancelled)?;
         announce_ready(ready, registration.record())?;
+        drop(registry_guard);
         controller.run()
     }
 }
@@ -433,24 +592,32 @@ fn announce_ready(ready: Option<&Path>, record: &service::ServiceRecord) -> Resu
     Ok(())
 }
 
-fn print_service_action(
+fn print_goal_action(
     action: &str,
-    record: &service::ServiceRecord,
+    goal: &registry::Goal,
+    record: Option<&service::ServiceRecord>,
     output_mode: output::OutputMode,
 ) -> Result<()> {
     let mut stdout = io::stdout().lock();
     if output_mode == output::OutputMode::Json {
         serde_json::to_writer(
             &mut stdout,
-            &json!({"status": action, "service": record.info()}),
+            &json!({
+                "status": action,
+                "id": goal.id,
+                "goal": goal,
+                "service": record.map(|record| record.info()),
+            }),
         )?;
         stdout.write_all(b"\n")?;
     } else {
         writeln!(
             stdout,
-            "goal service {action}: {} (pid {})",
-            record.config_path.display(),
-            record.pid
+            "goal {action}: {}{}",
+            goal.id,
+            record
+                .map(|record| format!(" (pid {})", record.pid))
+                .unwrap_or_default()
         )?;
     }
     stdout.flush()?;
@@ -458,31 +625,43 @@ fn print_service_action(
 }
 
 fn run_list(output_mode: output::OutputMode) -> Result<()> {
+    let registry = registry::Registry::open()?;
+    let goals = registry.goals();
     let services = service::list()?;
     let mut stdout = io::stdout().lock();
     if output_mode == output::OutputMode::Json {
-        let services = services
-            .iter()
-            .map(|record| record.info())
-            .collect::<Vec<_>>();
-        serde_json::to_writer(&mut stdout, &services)?;
+        let entries = goals.iter().map(|goal| {
+            let service = services.iter().find(|record| record.config_path == goal.config_path);
+            json!({
+                "id": goal.id,
+                "enabled": goal.enabled,
+                "status": if service.is_some() { "running" } else { "stopped" },
+                "config_path": goal.config_path,
+                "project_dir": goal.config_path.parent(),
+                "pid": service.map(|record| record.pid),
+                "started_at": service.map(|record| record.started_at),
+                "foreground": service.map(|record| record.foreground),
+                "log_path": service.and_then(|record| record.log_path.as_deref()),
+            })
+        }).collect::<Vec<_>>();
+        serde_json::to_writer(&mut stdout, &entries)?;
         stdout.write_all(b"\n")?;
-    } else if services.is_empty() {
-        writeln!(stdout, "no running goal services")?;
+    } else if goals.is_empty() {
+        writeln!(stdout, "no registered goals; use goal add <path>")?;
     } else {
-        writeln!(stdout, "PID\tMODE\tSTARTED\tGOAL_FILE")?;
-        for service in services {
+        writeln!(stdout, "ID\tENABLED\tSTATUS\tPID\tGOAL_FILE")?;
+        for goal in goals {
+            let service = services.iter().find(|record| record.config_path == goal.config_path);
             writeln!(
                 stdout,
-                "{}\t{}\t{}\t{}",
-                service.pid,
-                if service.foreground {
-                    "foreground"
-                } else {
-                    "background"
-                },
-                service.started_at,
-                service.config_path.display()
+                "{}\t{}\t{}\t{}\t{}",
+                goal.id,
+                goal.enabled,
+                if service.is_some() { "running" } else { "stopped" },
+                service
+                    .map(|record| record.pid.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+                goal.config_path.display()
             )?;
         }
     }
