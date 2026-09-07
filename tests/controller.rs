@@ -318,6 +318,10 @@ fn help_fully_describes_configuration_and_process_contracts() {
     }
     assert!(!root.contains("--goal-dir"));
     assert!(!root.contains("CONFIG_OR_DIR"));
+    assert!(root.contains("goal ls --watch"));
+    let watch_help = goal_command(state.path()).args(["ls", "--help"]).output().unwrap();
+    assert!(watch_help.status.success());
+    assert!(String::from_utf8(watch_help.stdout).unwrap().contains("--watch"));
 
     let run = goal_command(state.path()).arg("--help").output().unwrap();
     assert!(run.status.success());
@@ -384,6 +388,88 @@ fn commands_never_infer_a_goal_from_the_current_directory_or_environment() {
     }
     assert!(listed_goals(&empty_registry).is_empty());
     assert!(!fixture.dir.path().join(".goal").exists());
+}
+
+fn watch_records(path: &Path) -> Vec<serde_json::Value> {
+    // The watcher may be halfway through its final line while we inspect it.
+    fs::read_to_string(path).unwrap_or_default().split_inclusive('\n')
+        .filter(|line| line.ends_with('\n'))
+        .map(|line| serde_json::from_str(line).expect("watch must emit JSONL"))
+        .collect()
+}
+
+#[test]
+fn list_watch_emits_snapshot_and_registration_changes_without_holding_locks() {
+    let dir = test_tempdir();
+    let registry = dir.path().join("registry");
+    let log = dir.path().join("watch.jsonl");
+    let mut watcher = ChildGuard::new(goal_command(&registry)
+        .args(["ls", "--watch", "--output", "json"])
+        .stdout(fs::File::create(&log).unwrap())
+        .spawn().unwrap());
+    wait_for("watch snapshot", Duration::from_secs(5), || !watch_records(&log).is_empty());
+    assert_eq!(watch_records(&log)[0]["type"], "snapshot");
+    assert_eq!(watch_records(&log)[0]["details"]["goals"], serde_json::json!([]));
+    let config = write_project(dir.path(), "watched");
+    let mut add = ChildGuard::new(goal_command(&registry)
+        .arg("add").arg(&config).args(["--id", "watched"])
+        .stdout(Stdio::null()).spawn().unwrap());
+    assert!(add.wait().success());
+    wait_for("watch added", Duration::from_secs(5), || watch_records(&log).iter()
+        .any(|event| event["type"] == "goal_added" && event["details"]["goal"]["id"] == "watched"));
+    let mut disable = ChildGuard::new(goal_command(&registry)
+        .args(["disable", "watched"]).stdout(Stdio::null()).spawn().unwrap());
+    assert!(disable.wait().success());
+    wait_for("watch disabled", Duration::from_secs(5), || watch_records(&log).iter()
+        .any(|event| event["type"] == "goal_changed" && event["details"]["goal"]["enabled"] == false));
+    let mut remove = ChildGuard::new(goal_command(&registry)
+        .args(["remove", "watched"]).stdout(Stdio::null()).spawn().unwrap());
+    assert!(remove.wait().success());
+    wait_for("watch removed", Duration::from_secs(5), || watch_records(&log).iter()
+        .any(|event| event["type"] == "goal_removed" && event["details"]["goal"]["id"] == "watched"));
+    watcher.interrupt();
+    assert!(watcher.wait().success());
+    assert!(watch_records(&log).iter().all(|event| event["timestamp"].is_number()));
+}
+
+#[test]
+fn list_watch_exits_cleanly_when_its_output_pipe_closes() {
+    let dir = test_tempdir();
+    let registry = dir.path().join("registry");
+    let config = write_project(dir.path(), "pipe-goal");
+    let mut watcher = ChildGuard::new(goal_command(&registry)
+        .args(["ls", "--watch", "--output", "json"])
+        .stdout(Stdio::piped()).spawn().unwrap());
+    drop(watcher.0.as_mut().unwrap().stdout.take());
+    // Force another write if the initial snapshot raced ahead of pipe closure.
+    let mut add = ChildGuard::new(goal_command(&registry)
+        .arg("add").arg(&config).stdout(Stdio::null()).spawn().unwrap());
+    assert!(add.wait().success());
+    assert!(watcher.wait().success());
+}
+
+#[test]
+fn list_watch_follows_runtime_events_and_interrupt_leaves_service_running() {
+    let fixture = Fixture::new("printf '{}'", "printf '{\"type\":\"wait\",\"retry_after_seconds\":1,\"reason\":\"idle\"}' > \"$GOAL_RESULT_PATH\"", "exit 1");
+    let _services = ServicesGuard::new(&fixture.registry);
+    let started = goal_command(&fixture.registry).args(["up", TEST_GOAL_ID]).output().unwrap();
+    assert!(started.status.success());
+    let before = listed_goals(&fixture.registry);
+    let log = fixture.dir.path().join("watch.jsonl");
+    let mut watcher = ChildGuard::new(goal_command(&fixture.registry)
+        .args(["list", "--watch", "--output", "json"])
+        .stdout(fs::File::create(&log).unwrap()).spawn().unwrap());
+    wait_for("watch snapshot", Duration::from_secs(5), || !watch_records(&log).is_empty());
+    assert_eq!(watch_records(&log)[0]["details"]["goals"], serde_json::json!(before));
+    wait_for("watch runtime event", Duration::from_secs(8), || watch_records(&log).iter()
+        .any(|event| event["type"] == "goal_event"
+            && event["details"]["id"] == TEST_GOAL_ID
+            && event["details"]["event"]["type"] == "sense_succeeded"));
+    watcher.interrupt();
+    assert!(watcher.wait().success());
+    let after = listed_goals(&fixture.registry);
+    assert_eq!(after[0]["pid"], before[0]["pid"]);
+    assert_eq!(after[0]["status"], "running");
 }
 
 #[test]

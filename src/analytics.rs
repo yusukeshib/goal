@@ -108,6 +108,7 @@ pub struct StatsReport {
     pub worker_success_rate: Option<f64>,
     pub roles: BTreeMap<String, RoleStats>,
     pub failures_by_kind: BTreeMap<String, u64>,
+    pub usage: crate::usage::UsageSummary,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -159,6 +160,7 @@ pub fn stats(project_dir: &Path, since: Option<&str>) -> Result<StatsReport> {
     };
     let runs_dir = project_dir.join(".goal/runs");
     let mut metadata = Vec::new();
+    let mut artifact_dirs = Vec::new();
     let mut legacy_runs = 0;
     match fs::read_dir(&runs_dir) {
         Ok(entries) => {
@@ -175,6 +177,7 @@ pub fn stats(project_dir: &Path, since: Option<&str>) -> Result<StatsReport> {
                         let record = RunMetadata::from_slice(&bytes)
                             .with_context(|| format!("parse {}", path.display()))?;
                         if cutoff_ms.is_none_or(|cutoff| record.started_at_ms >= cutoff) {
+                            artifact_dirs.push(entry.path());
                             metadata.push(record);
                         }
                     }
@@ -248,6 +251,7 @@ pub fn stats(project_dir: &Path, since: Option<&str>) -> Result<StatsReport> {
             .then_some(worker_success as f64 / worker_finished as f64),
         roles,
         failures_by_kind,
+        usage: crate::usage::summarize(artifact_dirs.iter().map(|path| path.as_path())),
     })
 }
 
@@ -289,6 +293,7 @@ pub fn render_plain(report: &StatsReport) -> String {
             .join(", ");
         lines.push(format!("failure kinds: {failures}"));
     }
+    lines.push(crate::usage::render_plain(&report.usage));
     lines.join("\n") + "\n"
 }
 
@@ -473,6 +478,27 @@ mod tests {
             let error = stats(dir.path(), None).unwrap_err();
             assert!(error.to_string().contains("metadata.json"));
         }
+    }
+
+    #[test]
+    fn usage_uses_selected_artifact_paths_not_run_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = unix_timestamp_millis();
+        for (folder, started, amount) in [("recent", now.saturating_sub(1000), 2), ("old", 0, 100)] {
+            let artifacts = dir.path().join(".goal/runs").join(folder);
+            fs::create_dir_all(&artifacts).unwrap();
+            RunMetadata::running("../../untrusted", "worker", started)
+                .save(&artifacts.join(METADATA_FILE)).unwrap();
+            fs::write(artifacts.join(crate::usage::USAGE_FILE), format!(
+                r#"{{"schema_version":1,"costs":[{{"currency":"USD","amount":{amount}}}],"metrics":[],"complete":true}}"#,
+            )).unwrap();
+        }
+        let report = stats(dir.path(), Some("1h")).unwrap();
+        assert_eq!(report.usage.selected_runs, 1);
+        assert_eq!(report.usage.costs[0].amount, 2.0);
+        assert_eq!(report.usage.partial_runs, 0);
+        let analysis = crate::analysis::analyze(dir.path(), Some("1h"), None).unwrap();
+        assert_eq!(analysis.usage, report.usage);
     }
 
     #[test]

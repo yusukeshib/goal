@@ -32,6 +32,7 @@ pub struct AnalysisReport {
     pub roles: BTreeMap<String, RoleStats>,
     pub failures_by_kind: BTreeMap<String, u64>,
     pub activity: ActivitySummary,
+    pub usage: crate::usage::UsageSummary,
     pub issues: Vec<RunIssue>,
     pub quality_caveat: &'static str,
 }
@@ -90,7 +91,7 @@ pub fn analyze(
     }
     let generated_at_ms = unix_timestamp_millis();
     let window = analysis_window(generated_at_ms, since, date)?;
-    let (mut metadata, legacy_runs) = load_metadata(project_dir, &window)?;
+    let (mut metadata, legacy_runs, artifact_dirs) = load_metadata(project_dir, &window)?;
     metadata.sort_by_key(|record| record.started_at_ms);
 
     let mut outcomes = OutcomeCounts::default();
@@ -157,6 +158,7 @@ pub fn analyze(
         roles,
         failures_by_kind,
         activity: load_activity(project_dir, &window)?,
+        usage: crate::usage::summarize(artifact_dirs.iter().map(|path| path.as_path())),
         issues,
         quality_caveat: QUALITY_CAVEAT,
     })
@@ -245,6 +247,7 @@ pub fn render_plain(report: &AnalysisReport) -> String {
         ));
         lines.push(format!("  artifacts: {}", issue.artifacts_dir));
     }
+    lines.push(crate::usage::render_plain(&report.usage));
     lines.push(format!("caveat: {}", report.quality_caveat));
     lines.join("\n") + "\n"
 }
@@ -305,9 +308,10 @@ fn analysis_window(
     })
 }
 
-fn load_metadata(project_dir: &Path, window: &AnalysisWindow) -> Result<(Vec<RunMetadata>, u64)> {
+fn load_metadata(project_dir: &Path, window: &AnalysisWindow) -> Result<(Vec<RunMetadata>, u64, Vec<std::path::PathBuf>)> {
     let runs_dir = project_dir.join(".goal/runs");
     let mut metadata = Vec::new();
+    let mut artifact_dirs = Vec::new();
     let mut legacy_runs = 0;
     match fs::read_dir(&runs_dir) {
         Ok(entries) => {
@@ -326,6 +330,7 @@ fn load_metadata(project_dir: &Path, window: &AnalysisWindow) -> Result<(Vec<Run
                         if record.started_at_ms >= window.start_ms
                             && record.started_at_ms < window.end_ms
                         {
+                            artifact_dirs.push(entry.path());
                             metadata.push(record);
                         }
                     }
@@ -341,7 +346,7 @@ fn load_metadata(project_dir: &Path, window: &AnalysisWindow) -> Result<(Vec<Run
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).with_context(|| format!("read {}", runs_dir.display())),
     }
-    Ok((metadata, legacy_runs))
+    Ok((metadata, legacy_runs, artifact_dirs))
 }
 
 fn load_activity(project_dir: &Path, window: &AnalysisWindow) -> Result<ActivitySummary> {

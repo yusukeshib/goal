@@ -4,6 +4,7 @@ mod cancel;
 mod config;
 mod controller;
 mod model;
+mod list_table;
 mod output;
 mod prompt;
 mod registry;
@@ -11,6 +12,8 @@ mod runner;
 mod service;
 mod state;
 mod tui;
+mod watch;
+mod usage;
 
 use std::{
     io::{self, IsTerminal, Write},
@@ -46,6 +49,8 @@ COMMANDS
   add --now to also start/stop. Disabled goals must be enabled before starting.
   `goal remove ID` unregisters a stopped goal without deleting its files.
   `goal list` (or `goal ls`) shows all registrations and their running state.
+  `goal ls --watch` follows changes and new runtime events; --output json emits
+  an initial snapshot and then JSONL changes. Ctrl-C stops only the watcher.
   `goal tail ID --follow` streams a service log. `goal stats ID` and
   `goal analysis ID` inspect retained artifacts without starting child processes.
   Existing path-based services must be registered with add to appear in list.
@@ -299,7 +304,13 @@ enum Commands {
     },
     /// List all registered goals, including stopped and disabled goals.
     #[command(visible_alias = "ls")]
-    List,
+    List {
+        /// Follow registry changes and new runtime events (one-second sampling).
+        /// JSON output is a snapshot followed by change events in JSONL.
+        /// Ctrl-C ends only the watcher; running goals are left untouched.
+        #[arg(long)]
+        watch: bool,
+    },
     /// Print or follow a background goal service log.
     Tail {
         #[arg(value_name = "ID")]
@@ -416,7 +427,8 @@ fn dispatch(cli: Cli, output_mode: output::OutputMode) -> Result<()> {
         }
         Commands::Enable { id, now } => set_enabled(&id, true, now, output_mode),
         Commands::Disable { id, now } => set_enabled(&id, false, now, output_mode),
-        Commands::List => run_list(output_mode),
+        Commands::List { watch: true } => watch::run(output_mode),
+        Commands::List { watch: false } => run_list(output_mode),
         Commands::Tail { id, follow, lines } => {
             let goal = registry::Registry::open()?.get(&id)?;
             service::tail(&goal.config_path, lines, follow)
@@ -624,13 +636,13 @@ fn print_goal_action(
     Ok(())
 }
 
-fn run_list(output_mode: output::OutputMode) -> Result<()> {
+/// Shared source of truth for one-shot lists and watches. All administrative
+/// locks are released on return, before the caller writes output or waits.
+fn list_snapshot() -> Result<Vec<serde_json::Value>> {
     let registry = registry::Registry::open()?;
     let goals = registry.goals();
     let services = service::list()?;
-    let mut stdout = io::stdout().lock();
-    if output_mode == output::OutputMode::Json {
-        let entries = goals.iter().map(|goal| {
+    Ok(goals.iter().map(|goal| {
             let service = services.iter().find(|record| record.config_path == goal.config_path);
             json!({
                 "id": goal.id,
@@ -643,25 +655,34 @@ fn run_list(output_mode: output::OutputMode) -> Result<()> {
                 "foreground": service.map(|record| record.foreground),
                 "log_path": service.and_then(|record| record.log_path.as_deref()),
             })
-        }).collect::<Vec<_>>();
+        }).collect())
+}
+
+fn run_list(output_mode: output::OutputMode) -> Result<()> {
+    let entries = list_snapshot()?;
+    let mut stdout = io::stdout().lock();
+    if output_mode == output::OutputMode::Json {
         serde_json::to_writer(&mut stdout, &entries)?;
         stdout.write_all(b"\n")?;
-    } else if goals.is_empty() {
+    } else if matches!(output_mode, output::OutputMode::Tui | output::OutputMode::Pretty)
+        && io::stdout().is_terminal()
+    {
+        let (width, _) = crossterm::terminal::size().unwrap_or((100, 24));
+        list_table::write(&mut stdout, &entries, width, list_table::height(&entries))?;
+    } else if entries.is_empty() {
         writeln!(stdout, "no registered goals; use goal add <path>")?;
     } else {
         writeln!(stdout, "ID\tENABLED\tSTATUS\tPID\tGOAL_FILE")?;
-        for goal in goals {
-            let service = services.iter().find(|record| record.config_path == goal.config_path);
+        for entry in entries {
             writeln!(
                 stdout,
                 "{}\t{}\t{}\t{}\t{}",
-                goal.id,
-                goal.enabled,
-                if service.is_some() { "running" } else { "stopped" },
-                service
-                    .map(|record| record.pid.to_string())
+                entry["id"].as_str().unwrap_or_default(),
+                entry["enabled"],
+                entry["status"].as_str().unwrap_or_default(),
+                entry["pid"].as_u64().map(|pid| pid.to_string())
                     .unwrap_or_else(|| "-".to_owned()),
-                goal.config_path.display()
+                entry["config_path"].as_str().unwrap_or_default()
             )?;
         }
     }

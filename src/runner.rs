@@ -412,6 +412,7 @@ impl Runner {
             .env("GOAL_RUN_ID", &artifacts.id)
             .env("GOAL_PROMPT_PATH", &artifacts.prompt_path)
             .env("GOAL_RESULT_PATH", &artifacts.result_path)
+            .env("GOAL_USAGE_PATH", artifacts.dir.join(crate::usage::USAGE_FILE))
             .env("GOAL_PROJECT_DIR", &self.project_dir)
             .stdin(if prompt.is_some() && !uses_placeholder {
                 Stdio::piped()
@@ -825,6 +826,23 @@ mod tests {
         assert_eq!(launch["cwd"], dir.path().to_str().unwrap());
         assert_eq!(launch["timeout_seconds"], 1);
         assert_eq!(launch["prompt_delivery"], "path_argument");
+    }
+
+    #[test]
+    fn accepts_optional_generic_usage_without_changing_result_protocol() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = command(
+            "printf '%s' '{\"schema_version\":1,\"costs\":[{\"currency\":\"USD\",\"amount\":0.25}],\"metrics\":[{\"name\":\"cpu_time\",\"unit\":\"seconds\",\"value\":12}],\"complete\":true}' > \"$GOAL_USAGE_PATH.tmp\"; mv \"$GOAL_USAGE_PATH.tmp\" \"$GOAL_USAGE_PATH\"; printf '{\"ok\":true}' > \"$GOAL_RESULT_PATH\"",
+        );
+        let (result, artifacts) = runner(dir.path())
+            .run_json::<serde_json::Value>("worker", &config, "prompt")
+            .unwrap();
+        assert_eq!(result["ok"], true);
+        let usage: serde_json::Value = serde_json::from_slice(
+            &fs::read(artifacts.dir.join("usage.json")).unwrap(),
+        ).unwrap();
+        assert_eq!(usage["costs"][0]["amount"], 0.25);
+        assert_eq!(usage["metrics"][0]["unit"], "seconds");
     }
 
     #[test]
