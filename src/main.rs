@@ -10,6 +10,7 @@ mod prompt;
 mod registry;
 mod runner;
 mod service;
+mod shell;
 mod state;
 mod tui;
 mod watch;
@@ -51,6 +52,8 @@ COMMANDS
   `goal list` (or `goal ls`) shows all registrations and their running state.
   `goal ls --watch` follows changes and new runtime events; --output json emits
   an initial snapshot and then JSONL changes. Ctrl-C stops only the watcher.
+  `goal config zsh` prints shell integration with live goal-ID completion.
+  Source it after compinit: eval "$(goal config zsh)".
   `goal tail ID --follow` streams a service log. `goal stats ID` and
   `goal analysis ID` inspect retained artifacts without starting child processes.
   Existing path-based services must be registered with add to appear in list.
@@ -341,6 +344,14 @@ enum Commands {
         #[arg(long, value_name = "YYYY-MM-DD", conflicts_with = "since")]
         date: Option<String>,
     },
+    /// Print shell integration (source after your shell completion system).
+    Config {
+        #[arg(value_parser = ["zsh"])]
+        shell: String,
+    },
+    /// Internal read-only, lock-free goal ID completion.
+    #[command(name = "__complete", hide = true)]
+    CompleteIds,
     /// Internal entry point for a detached service process.
     #[command(name = "__service", hide = true)]
     Service {
@@ -387,6 +398,17 @@ fn effective_output_mode(requested: output::OutputMode) -> output::OutputMode {
 
 fn dispatch(cli: Cli, output_mode: output::OutputMode) -> Result<()> {
     match cli.command {
+        Commands::Config { shell: _ } => {
+            io::stdout().lock().write_all(shell::ZSH.as_bytes())?;
+            Ok(())
+        }
+        Commands::CompleteIds => {
+            let mut stdout = io::stdout().lock();
+            for candidate in shell::goal_ids() {
+                writeln!(stdout, "{candidate}")?;
+            }
+            Ok(())
+        }
         Commands::Add { path, id } => {
             let goal = registry::Registry::open()?.add(&path, id.as_deref())?;
             print_goal_action("added", &goal, None, output_mode)

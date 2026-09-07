@@ -390,6 +390,47 @@ fn commands_never_infer_a_goal_from_the_current_directory_or_environment() {
     assert!(!fixture.dir.path().join(".goal").exists());
 }
 
+#[test]
+fn zsh_integration_is_available_without_creating_goal_state() {
+    let dir = test_tempdir();
+    let state = dir.path().join("missing-state");
+    let output = goal_command(&state).args(["config", "zsh"]).output().unwrap();
+    assert!(output.status.success());
+    let script = String::from_utf8(output.stdout).unwrap();
+    assert!(script.contains("compdef _goal goal"));
+    assert!(script.contains("command goal __complete"));
+    assert!(script.contains("enable:Enable a goal"));
+    assert!(script.contains("--watch"));
+    assert!(!state.exists());
+    let ids = goal_command(&state).arg("__complete").output().unwrap();
+    assert!(ids.status.success());
+    assert!(ids.stdout.is_empty());
+    assert!(!state.exists());
+    assert!(!goal_command(&state).args(["config", "invalid-shell"]).output().unwrap().status.success());
+}
+
+#[test]
+fn shell_id_completion_does_not_wait_for_administrative_locks() {
+    let dir = test_tempdir();
+    let state = dir.path().join("state");
+    fs::create_dir(&state).unwrap();
+    let goals_lock = fs::File::create(state.join("goals.lock")).unwrap();
+    let services_lock = fs::File::create(state.join("services.lock")).unwrap();
+    fs2::FileExt::lock_exclusive(&goals_lock).unwrap();
+    fs2::FileExt::lock_exclusive(&services_lock).unwrap();
+    fs::write(state.join("goals.json"),
+        r#"{"goals":[{"id":"sample","config_path":"/tmp/sample/goal.toml","enabled":false}]}"#).unwrap();
+    let log = dir.path().join("completion.txt");
+    let mut child = ChildGuard::new(goal_command(&state).arg("__complete")
+        .stdout(fs::File::create(&log).unwrap()).spawn().unwrap());
+    wait_for("lock-free completion", Duration::from_secs(5), || {
+        child.0.as_mut().unwrap().try_wait().unwrap().is_some()
+    });
+    assert!(child.wait().success());
+    assert!(fs::read_to_string(log).unwrap().starts_with("sample:disabled / state unknown"));
+    assert!(!state.join("services.json").exists());
+}
+
 fn watch_records(path: &Path) -> Vec<serde_json::Value> {
     // The watcher may be halfway through its final line while we inspect it.
     fs::read_to_string(path).unwrap_or_default().split_inclusive('\n')

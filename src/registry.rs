@@ -144,7 +144,7 @@ impl Registry {
     }
 }
 
-fn validate_id(id: &str) -> Result<()> {
+pub(crate) fn validate_id(id: &str) -> Result<()> {
     if id.is_empty()
         || !id.as_bytes()[0].is_ascii_alphanumeric()
         || !id

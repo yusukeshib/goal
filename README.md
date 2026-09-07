@@ -10,6 +10,26 @@ sense → decide → run one task or fixed bounded batch → sense
 
 The decider is one-shot and read-only. Workers are disposable and non-interactive. A decision may dispatch one worker or a fixed batch through a bounded worker pool; every admitted task settles before the controller senses again. There is no child PTY or persistent agent conversation, and the foreground TUI is observational only.
 
+## Zsh integration
+
+After your usual `compinit` initialization, add this to `.zshrc`:
+
+```zsh
+eval "$(goal config zsh)"
+```
+
+This completes subcommands, options, output formats, paths, and current goal IDs
+with enabled/disabled and service-state descriptions. It also supports `goal ls`.
+Goal IDs are read fresh on Tab, so caching the generated script does not cache
+registrations. Completion respects `GOAL_STATE_DIR`, `XDG_STATE_HOME`, and `HOME`;
+it never starts/stops services, creates state, takes locks, or prunes records.
+Service descriptions are advisory snapshots, not lifecycle guarantees. Missing or
+malformed state degrades quietly without breaking command/option completion.
+No Python, jq, or extra completion dependency is required.
+
+If your shell has a binary-aware cache helper, use
+`_cached_eval goal goal config zsh` instead. Open a new shell after setup.
+
 ## Run
 
 Requires Rust 1.85+ and a `goal.toml` plus its configured goal file.
