@@ -68,7 +68,7 @@ pub fn run(output_mode: OutputMode) -> Result<()> {
         }
     }
 
-    let tty = output_mode == OutputMode::Tui && io::stdout().is_terminal();
+    let tty = output_mode == OutputMode::Pretty && io::stdout().is_terminal();
     let mut display = Display::new(output_mode, tty)?;
     if let Err(error) = display.snapshot(&rows) {
         return finish_io(error);

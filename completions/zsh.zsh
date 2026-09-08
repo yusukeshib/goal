@@ -34,7 +34,7 @@ _goal() {
     local -a common
     common=(
         '(-h --help)'{-h,--help}'[Show help]'
-        '--output=[Output format]:format:(tui plain pretty json)'
+        '--output=[Output format]:format:(plain pretty json)'
     )
     _arguments -C "${common[@]}" \
         '(-V --version)'{-V,--version}'[Show version]' \

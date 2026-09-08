@@ -8,7 +8,7 @@ sense → decide → run one task or fixed bounded batch → sense
              ↘ complete                           → exit 0
 ```
 
-The decider is one-shot and read-only. Workers are disposable and non-interactive. A decision may dispatch one worker or a fixed batch through a bounded worker pool; every admitted task settles before the controller senses again. There is no child PTY or persistent agent conversation, and the foreground TUI is observational only.
+The decider is one-shot and read-only. Workers are disposable and non-interactive. A decision may dispatch one worker or a fixed batch through a bounded worker pool; every admitted task settles before the controller senses again. There is no child PTY or persistent agent conversation, and foreground output is an append-only log stream.
 
 ## Zsh integration
 
@@ -49,7 +49,7 @@ goal add /path/to/goal                    # register enabled, but do not start
 goal add /another/goal.toml --id my-goal   # override the directory-derived ID
 goal up                                  # start all enabled registered goals
 goal up my-goal                           # start one; logs to .goal/service.log
-goal up my-goal --foreground              # attached observational TUI; ID required
+goal up my-goal --foreground              # attached plain logs; ID required
 goal list                                # all registrations, even stopped/disabled
 goal ls                                  # alias for list
 goal ls --watch                          # watch registrations and runtime events
@@ -212,7 +212,10 @@ are shortened; JSON event objects remain intact. Persistent source errors can
 repeat `watch_gap` notices. The watcher does not infer hangs or verify task
 outcomes. Plain and JSON `ls` output remain unchanged.
 
-Foreground controller TUI: `↑/↓` or `j/k` selects, `PgUp/PgDn` scrolls details, `End` follows, and `q` stops. Redirection automatically falls back to plain output.
+Foreground controllers print timestamped plain logs by default, both in a terminal
+and when redirected. Ctrl-C stops the controller and its children. Use
+`--output pretty` to indent child JSON or `--output json` for strict JSONL envelopes.
+There is no fullscreen UI, keyboard navigation, or mouse capture.
 
 State, events, prompts, results, exact child logs, and run metadata are stored under `.goal/`. `stats` and `analysis` inspect these artifacts without starting children. When `max_completed_runs` is set, the controller retains the newest finished run directories and never prunes running, malformed, state, or event artifacts.
 

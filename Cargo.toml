@@ -13,8 +13,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 ctrlc = { version = "3.4", features = ["termination"] }
 fs2 = "0.4"
 libc = "0.2"
-ratatui = "0.29"
-crossterm = "0.28"
+# Static list tables only; no interactive terminal backend or input events.
+ratatui = { version = "0.29", default-features = false }
+crossterm = { version = "0.28", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tempfile = "3.15"

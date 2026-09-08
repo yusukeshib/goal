@@ -1175,7 +1175,7 @@ fn background_service_can_be_listed_tailed_and_stopped() {
 }
 
 #[test]
-fn default_non_tty_output_falls_back_to_plain_and_hides_sensor_protocol() {
+fn default_output_streams_plain_logs_and_hides_sensor_protocol() {
     let fixture = Fixture::new(
         r#"printf '{\"private_observation\":\"sensor-payload\"}'"#,
         r#"grep -q 'sensor-payload' "$GOAL_PROMPT_PATH"; printf '{\"type\":\"complete\",\"summary\":\"observation received\"}' > "$GOAL_RESULT_PATH""#,

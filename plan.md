@@ -27,8 +27,8 @@ Confirmed design
 6. Worker claims do not prove convergence. After `done`, the controller senses
    reality again.
 7. Human input is not part of the controller workflow. There are no questions,
-   pending approvals, or resumable conversations. The default fullscreen TUI is
-   observational only and cannot steer child work.
+   pending approvals, or resumable conversations. Foreground output is an
+   append-only log stream and cannot steer child work.
 8. If the decider determines that the current cycle cannot make automatic
    progress, or a worker cannot complete its assigned task, it returns `failure`
    with a concrete reason.
@@ -43,8 +43,8 @@ Confirmed design
 10. The controller can run as a detached service or in the foreground. A bounded
     worker pool executes only the fixed batch selected for that cycle. There is
     no rolling admission of newly discovered tasks, durable queue, workflow DAG,
-    child PTY, or persistent agent conversation. A bounded observational TUI is
-    available only for foreground operation.
+    child PTY, or persistent agent conversation. Foreground operation streams
+    timestamped plain logs by default.
 
 State machine
 -------------

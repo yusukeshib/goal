@@ -19,7 +19,6 @@ use crate::{
     analytics::{METADATA_FILE, RunMetadata, RunOutcome},
     config::CommandConfig,
     output::Output,
-    tui::ArtifactRange,
 };
 
 const MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
@@ -664,7 +663,6 @@ fn tee(
     let mut log = File::create(&path).with_context(|| format!("open {}", path.display()))?;
     let mut buffer = [0_u8; 16 * 1024];
     let mut line = Vec::new();
-    let mut offset = 0_u64;
     let mut total = 0_usize;
     loop {
         match reader.read(&mut buffer) {
@@ -690,8 +688,7 @@ fn tee(
                     }
                     line.extend_from_slice(segment);
                     if line.ends_with(b"\n") {
-                        emit_line(&mut log, &output, &role, stream, &run_id, &path, offset, &line)?;
-                        offset += line.len() as u64;
+                        emit_line(&mut log, &output, &role, stream, &run_id, &line)?;
                         line.clear();
                     }
                 }
@@ -706,35 +703,22 @@ fn tee(
         }
     }
     if !line.is_empty() {
-        emit_line(&mut log, &output, &role, stream, &run_id, &path, offset, &line)?;
+        emit_line(&mut log, &output, &role, stream, &run_id, &line)?;
     }
     log.flush()?;
     Ok(captured)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn emit_line(
     log: &mut File,
     output: &Output,
     role: &str,
     stream: &str,
     run_id: &str,
-    path: &Path,
-    offset: u64,
     line: &[u8],
 ) -> Result<()> {
     log.flush()?;
-    output.child_line(
-        role,
-        stream,
-        run_id,
-        ArtifactRange {
-            path: path.to_owned(),
-            offset,
-            length: line.len() as u64,
-        },
-        line,
-    )
+    output.child_line(role, stream, run_id, line)
 }
 
 #[cfg(unix)]
@@ -894,15 +878,14 @@ mod tests {
     }
 
     #[test]
-    fn tui_notifications_reference_exact_logged_lines() {
+    fn streaming_preserves_exact_logs_and_unterminated_final_line() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("stdout.log");
-        let input = b"first\n{\"second\":true}\n";
-        let (sender, receiver) = std::sync::mpsc::sync_channel(4);
+        let input = b"first\n{\"second\":true}\nlast";
         let captured = tee(
             std::io::Cursor::new(input),
             path.clone(),
-            Output::tui(sender),
+            Output::new(crate::output::OutputMode::Plain),
             "decider".to_owned(),
             "stdout",
             "run".to_owned(),
@@ -912,19 +895,6 @@ mod tests {
         .unwrap();
         assert_eq!(captured, input);
         assert_eq!(fs::read(&path).unwrap(), input);
-
-        let first = receiver.recv().unwrap();
-        let second = receiver.recv().unwrap();
-        assert!(matches!(
-            first,
-            crate::tui::Activity::Child { artifact, .. }
-                if artifact.offset == 0 && artifact.length == 6 && artifact.path == path
-        ));
-        assert!(matches!(
-            second,
-            crate::tui::Activity::Child { artifact, .. }
-                if artifact.offset == 6 && artifact.length == 16 && artifact.path == path
-        ));
     }
 
     #[test]

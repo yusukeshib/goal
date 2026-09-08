@@ -12,14 +12,13 @@ mod runner;
 mod service;
 mod shell;
 mod state;
-mod tui;
 mod watch;
 mod usage;
 
 use std::{
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
-    sync::{Arc, atomic::AtomicBool, mpsc},
+    sync::{Arc, atomic::AtomicBool},
 };
 
 use anyhow::{Result, bail};
@@ -41,7 +40,7 @@ TARGET SELECTION
 
 COMMANDS
   `goal up [ID]` starts enabled goals in the background, logging to .goal/service.log.
-  `goal up ID --foreground` runs one goal attached with its observational TUI.
+  `goal up ID --foreground` runs one goal attached with timestamped logs.
   `goal down [ID]` stops registered goals, including disabled ones.
   Without an ID, up/down operate on all eligible registered goals. Already
   running/stopped goals are skipped. Batch failures do not prevent other goals
@@ -210,10 +209,9 @@ FAILURE ANALYSIS
   waiving unmet requirements.
 
 OUTPUT
-  Foreground `up` defaults to a fullscreen streaming activity feed on an
-  interactive terminal. Selecting a row shows its details beside the activity
-  list, or below it when the terminal is narrow. Mouse wheel scrolling follows
-  the pane under the pointer. TUI mode falls back to plain output when redirected.
+  Foreground `up` defaults to timestamped plain logs, including in a terminal.
+  Ctrl-C stops the controller and its children. `list` defaults to a readable
+  table in a terminal and tab-separated output when redirected.
   --output plain prints timestamped text. --output pretty indents child JSON up
   to 16 KiB as one terminal block and leaves larger diagnostics unformatted.
   stdout.log and stderr.log retain the exact received byte streams. For
@@ -223,7 +221,7 @@ OUTPUT
   prompt/result paths, and prompt delivery mode; worker phases also include the
   selected task. JSON diagnostics over 16 KiB are summarized; inputs over 1 MiB
   use a bounded text preview instead of being parsed for display. For stats and
-  analysis, tui, plain, and pretty emit a human-readable report, while json emits
+  analysis, plain and pretty emit a human-readable report, while json emits
   one JSON report.
 
 EXAMPLES
@@ -249,14 +247,9 @@ EXAMPLES
     after_help = RUN_HELP
 )]
 struct Cli {
-    /// Select fullscreen TUI, plain, pretty-printed, or machine-readable JSON output.
-    #[arg(
-        long,
-        value_enum,
-        global = true,
-        default_value_t = output::OutputMode::Tui
-    )]
-    output: output::OutputMode,
+    /// Select plain, pretty, or JSON output (default: plain; list: pretty).
+    #[arg(long, value_enum, global = true)]
+    output: Option<output::OutputMode>,
 
     #[command(subcommand)]
     command: Commands,
@@ -364,20 +357,15 @@ enum Commands {
 
 fn main() {
     let cli = Cli::parse();
-    let output_mode = effective_output_mode(cli.output);
+    let output_mode = effective_output_mode(&cli);
     if let Err(error) = dispatch(cli, output_mode) {
-        let report_mode = if output_mode == output::OutputMode::Tui {
-            output::OutputMode::Plain
-        } else {
-            output_mode
-        };
-        let output = output::Output::new(report_mode);
+        let output = output::Output::new(output_mode);
         if error.downcast_ref::<cancel::Interrupted>().is_some() {
             let _ = output.event("stopped", json!({"reason": "interrupted"}));
             let _ = output.plain_stderr("controller stopped\n");
             return;
         }
-        if report_mode == output::OutputMode::Json {
+        if output_mode == output::OutputMode::Json {
             let _ = output.event("error", json!({"message": format!("{error:#}")}));
         } else {
             let _ = output.plain_stderr(&format!("Error: {error:#}\n"));
@@ -386,13 +374,57 @@ fn main() {
     }
 }
 
-fn effective_output_mode(requested: output::OutputMode) -> output::OutputMode {
-    if requested == output::OutputMode::Tui
-        && !(io::stdin().is_terminal() && io::stdout().is_terminal())
-    {
-        output::OutputMode::Plain
-    } else {
-        requested
+fn effective_output_mode(cli: &Cli) -> output::OutputMode {
+    cli.output.unwrap_or(match &cli.command {
+        Commands::List { .. } => output::OutputMode::Pretty,
+        _ => output::OutputMode::Plain,
+    })
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use output::OutputMode;
+
+    #[test]
+    fn foreground_defaults_to_plain_without_terminal_detection() {
+        let cli = Cli::try_parse_from(["goal", "up", "example", "--foreground"]).unwrap();
+        assert_eq!(effective_output_mode(&cli), OutputMode::Plain);
+    }
+
+    #[test]
+    fn list_and_watch_default_to_existing_table_renderer() {
+        for args in [
+            vec!["goal", "list"],
+            vec!["goal", "ls"],
+            vec!["goal", "ls", "--watch"],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert_eq!(effective_output_mode(&cli), OutputMode::Pretty);
+        }
+    }
+
+    #[test]
+    fn explicit_output_modes_override_command_defaults() {
+        for (name, mode) in [
+            ("plain", OutputMode::Plain),
+            ("pretty", OutputMode::Pretty),
+            ("json", OutputMode::Json),
+        ] {
+            for args in [
+                vec!["goal", "up", "example", "--foreground", "--output", name],
+                vec!["goal", "ls", "--output", name],
+                vec!["goal", "--output", name, "ls", "--watch"],
+            ] {
+                let cli = Cli::try_parse_from(args).unwrap();
+                assert_eq!(effective_output_mode(&cli), mode);
+            }
+        }
+    }
+
+    #[test]
+    fn removed_interactive_output_mode_is_rejected() {
+        assert!(Cli::try_parse_from(["goal", "ls", "--output", "tui"]).is_err());
     }
 }
 
@@ -590,33 +622,15 @@ fn run_controller(
         signal_flag.store(true, std::sync::atomic::Ordering::SeqCst);
     })?;
 
-    if output_mode == output::OutputMode::Tui {
-        let (sender, receiver) = mpsc::sync_channel(1_024);
-        let project = loaded.project_dir.display().to_string();
-        let config_path = loaded.config_path.clone();
-        let project_dir = loaded.project_dir.clone();
-        let output = output::Output::tui(sender);
-        let controller = controller::Controller::new(loaded, Arc::clone(&cancelled), output)?;
-        let registration = service::Registration::create(
-            &config_path,
-            &project_dir,
-            foreground,
-            Arc::clone(&cancelled),
-        )?;
-        announce_ready(ready, registration.record())?;
-        drop(registry_guard);
-        tui::run(controller, project, cancelled, receiver)
-    } else {
-        let config_path = loaded.config_path.clone();
-        let project_dir = loaded.project_dir.clone();
-        let output = output::Output::new(output_mode);
-        let controller = controller::Controller::new(loaded, Arc::clone(&cancelled), output)?;
-        let registration =
-            service::Registration::create(&config_path, &project_dir, foreground, cancelled)?;
-        announce_ready(ready, registration.record())?;
-        drop(registry_guard);
-        controller.run()
-    }
+    let config_path = loaded.config_path.clone();
+    let project_dir = loaded.project_dir.clone();
+    let output = output::Output::new(output_mode);
+    let controller = controller::Controller::new(loaded, Arc::clone(&cancelled), output)?;
+    let registration =
+        service::Registration::create(&config_path, &project_dir, foreground, cancelled)?;
+    announce_ready(ready, registration.record())?;
+    drop(registry_guard);
+    controller.run()
 }
 
 fn announce_ready(ready: Option<&Path>, record: &service::ServiceRecord) -> Result<()> {
@@ -686,7 +700,7 @@ fn run_list(output_mode: output::OutputMode) -> Result<()> {
     if output_mode == output::OutputMode::Json {
         serde_json::to_writer(&mut stdout, &entries)?;
         stdout.write_all(b"\n")?;
-    } else if matches!(output_mode, output::OutputMode::Tui | output::OutputMode::Pretty)
+    } else if output_mode == output::OutputMode::Pretty
         && io::stdout().is_terminal()
     {
         let (width, _) = crossterm::terminal::size().unwrap_or((100, 24));
@@ -722,7 +736,7 @@ fn run_analysis(
     let report = analysis::analyze(&project_dir, since, date)?;
     let mut stdout = io::stdout().lock();
     match output_mode {
-        output::OutputMode::Tui | output::OutputMode::Plain | output::OutputMode::Pretty => {
+        output::OutputMode::Plain | output::OutputMode::Pretty => {
             stdout.write_all(analysis::render_plain(&report).as_bytes())?
         }
         output::OutputMode::Json => {
@@ -743,7 +757,7 @@ fn run_stats(
     let report = analytics::stats(&project_dir, since)?;
     let mut stdout = io::stdout().lock();
     match output_mode {
-        output::OutputMode::Tui | output::OutputMode::Plain | output::OutputMode::Pretty => {
+        output::OutputMode::Plain | output::OutputMode::Pretty => {
             stdout.write_all(analytics::render_plain(&report).as_bytes())?
         }
         output::OutputMode::Json => {

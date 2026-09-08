@@ -1,6 +1,6 @@
 use std::{
     io::{self, Write},
-    sync::{Arc, Mutex, mpsc::SyncSender},
+    sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result};
@@ -9,10 +9,7 @@ use clap::ValueEnum;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::{
-    state::unix_timestamp,
-    tui::{Activity, ArtifactRange, NoticeLevel, summarize_line},
-};
+use crate::state::unix_timestamp;
 
 const MAX_STREAM_PAYLOAD_BYTES: usize = 16 * 1024;
 const MAX_STREAM_JSON_PARSE_BYTES: usize = 1024 * 1024;
@@ -20,7 +17,6 @@ const CONTENT_PREVIEW_BYTES: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum OutputMode {
-    Tui,
     Plain,
     Pretty,
     Json,
@@ -29,12 +25,7 @@ pub enum OutputMode {
 #[derive(Clone)]
 pub struct Output {
     mode: OutputMode,
-    backend: Arc<OutputBackend>,
-}
-
-enum OutputBackend {
-    Stream { write_lock: Mutex<()> },
-    Tui { sender: SyncSender<Activity> },
+    write_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Serialize)]
@@ -47,43 +38,21 @@ struct Envelope<'a> {
 
 impl Output {
     pub fn new(mode: OutputMode) -> Self {
-        debug_assert_ne!(mode, OutputMode::Tui, "use Output::tui for TUI output");
         Self {
             mode,
-            backend: Arc::new(OutputBackend::Stream {
-                write_lock: Mutex::new(()),
-            }),
-        }
-    }
-
-    pub fn tui(sender: SyncSender<Activity>) -> Self {
-        Self {
-            mode: OutputMode::Tui,
-            backend: Arc::new(OutputBackend::Tui { sender }),
+            write_lock: Arc::new(Mutex::new(())),
         }
     }
 
     pub fn event(&self, kind: &str, details: Value) -> Result<()> {
         match self.mode {
             OutputMode::Json => self.write_envelope(kind, details),
-            OutputMode::Tui => {
-                self.send_activity(Activity::Controller {
-                    timestamp: unix_timestamp(),
-                    kind: kind.to_owned(),
-                    details,
-                });
-                Ok(())
-            }
             OutputMode::Plain | OutputMode::Pretty => Ok(()),
         }
     }
 
     pub fn marker(&self, text: &str) -> Result<()> {
         match self.mode {
-            OutputMode::Tui => self.send_activity(Activity::Marker {
-                timestamp: unix_timestamp(),
-                text: text.to_owned(),
-            }),
             OutputMode::Plain | OutputMode::Pretty => {
                 self.write_plain(false, format!("{text}\n").as_bytes())?;
             }
@@ -93,18 +62,14 @@ impl Output {
     }
 
     pub fn plain_stdout(&self, message: &str) -> Result<()> {
-        if self.mode == OutputMode::Tui {
-            self.send_notice(NoticeLevel::Info, message);
-        } else if self.mode != OutputMode::Json {
+        if self.mode != OutputMode::Json {
             self.write_plain(false, message.as_bytes())?;
         }
         Ok(())
     }
 
     pub fn plain_stderr(&self, message: &str) -> Result<()> {
-        if self.mode == OutputMode::Tui {
-            self.send_notice(NoticeLevel::Error, message);
-        } else if self.mode != OutputMode::Json {
+        if self.mode != OutputMode::Json {
             self.write_plain(true, message.as_bytes())?;
         }
         Ok(())
@@ -115,21 +80,8 @@ impl Output {
         role: &str,
         stream: &str,
         run_id: &str,
-        artifact: ArtifactRange,
         line: &[u8],
     ) -> Result<()> {
-        if self.mode == OutputMode::Tui {
-            self.send_activity(Activity::Child {
-                timestamp: unix_timestamp(),
-                role: role.to_owned(),
-                stream: stream.to_owned(),
-                run_id: run_id.to_owned(),
-                artifact,
-                summary: summarize_line(line),
-                original_bytes: line.len(),
-            });
-            return Ok(());
-        }
         if self.mode != OutputMode::Json {
             // Sensor stdout is protocol data, not a text diagnostic. The runner
             // still captures it for the decider and retains its exact run log.
@@ -178,22 +130,6 @@ impl Output {
         self.write_envelope("child_output", details)
     }
 
-    fn send_notice(&self, level: NoticeLevel, message: &str) {
-        self.send_activity(Activity::Notice {
-            timestamp: unix_timestamp(),
-            level,
-            text: message.trim_end().to_owned(),
-        });
-    }
-
-    fn send_activity(&self, activity: Activity) {
-        if let OutputBackend::Tui { sender } = self.backend.as_ref() {
-            // A disconnected UI is handled by the runtime, not converted into
-            // a child-process or protocol failure.
-            let _ = sender.send(activity);
-        }
-    }
-
     fn write_envelope(&self, kind: &str, details: Value) -> Result<()> {
         let envelope = Envelope {
             timestamp: unix_timestamp(),
@@ -211,10 +147,8 @@ impl Output {
     }
 
     fn write_bytes(&self, stderr: bool, bytes: &[u8]) -> Result<()> {
-        let OutputBackend::Stream { write_lock } = self.backend.as_ref() else {
-            return Ok(());
-        };
-        let _guard = write_lock
+        let _guard = self
+            .write_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("output lock poisoned"))?;
         if stderr {
@@ -375,43 +309,6 @@ mod tests {
             )
             .as_bytes()
         );
-    }
-
-    #[test]
-    fn tui_emits_one_card_for_sensor_protocol_output() {
-        let (sender, receiver) = std::sync::mpsc::sync_channel(4);
-        let output = Output::tui(sender);
-        let artifact = ArtifactRange {
-            path: "stdout.log".into(),
-            offset: 0,
-            length: 13,
-        };
-        output
-            .child_line(
-                "decider",
-                "stdout",
-                "run-1",
-                artifact.clone(),
-                b"{\"type\":\"x\"}\n",
-            )
-            .unwrap();
-        assert!(matches!(
-            receiver.try_recv().unwrap(),
-            Activity::Child { role, run_id, .. } if role == "decider" && run_id == "run-1"
-        ));
-        output
-            .child_line(
-                "sensor",
-                "stdout",
-                "run-2",
-                artifact,
-                b"{\"secret\":true}\n",
-            )
-            .unwrap();
-        assert!(matches!(
-            receiver.try_recv().unwrap(),
-            Activity::Child { role, run_id, .. } if role == "sensor" && run_id == "run-2"
-        ));
     }
 
     #[test]
