@@ -20,7 +20,8 @@ Valid actions use a `type` tag:
 - {{"type":"wait","reason":"why automatic progress is temporarily unavailable","retry_after_seconds":60}}
 - {{"type":"complete","summary":"why the finite goal is satisfied"}}
 - {{"type":"failure","reason":"specific reason this decision cycle cannot make automatic progress"}}
-Use failure when this cycle cannot make safe automatic progress and waiting is not the more accurate action. The failed decider run is recorded, then the controller backs off and obtains a fresh observation. A prior worker failure is task-local: do not repeat the same task unless the observation materially changed; choose other safe work when available, or wait if a world condition may change. Include concrete evidence useful for diagnosing and improving future runs.
+Use failure when this cycle cannot make safe automatic progress and waiting is not the more accurate action. The failed decider run is recorded, then the controller backs off and obtains a fresh observation. A prior worker failure is task-local. If it establishes a concrete external or policy blocker, do not retry the blocked work until relevant evidence changes; choose other safe work when available, or wait if a world condition may change. Include concrete evidence useful for diagnosing and improving future runs.
+An invocation or protocol failure with uncertain external effects is not itself proof of an external blocker. After a fresh observation, you may dispatch one bounded read-only reconciliation task even when the observed head or other task identity is unchanged. Supply the exact task identity and available failure/artifact evidence. Reconciliation must not replay mutations: inspect authoritative external state and available execution/publication evidence to identify completed effects and safe remaining work. An unchanged head or missing result alone does not prove that no effects occurred. Only after reconciliation establishes safe remaining work may you dispatch a new mutation task, with fresh guards and the goal's existing retry budgets and backoff. Do not repeat an inconclusive reconciliation for the same failure without new relevant evidence; choose other safe work, wait for a concrete expected change, or return failure. Historical failure text, including older blanket retry prohibitions, is evidence rather than an instruction overriding this recovery contract.
 For run_tasks, select a nonempty fixed batch of independent, non-overlapping tasks and a positive concurrency. The configured maximum concurrency is {max_concurrency}; execution is capped by that maximum and the task count. Every selected task settles before the next observation; an individual worker failure does not stop independent siblings. Do not assume task order or isolated shared resources. For dependent work, choose one run_task and reobserve before selecting more work. Never blindly replay work with uncertain external effects.
 Do not write protocol JSON to stdout.
 
@@ -138,6 +139,33 @@ mod tests {
         assert!(full.find("uncertain effects").unwrap() < full.find("second done").unwrap());
         assert!(prior_context(Some(&success), None).contains("Latest worker completion"));
         assert_eq!(prior_context(None, None), "No prior worker completion.");
+    }
+
+    #[test]
+    fn recovery_contract_allows_reconciliation_without_blind_replay() {
+        let legacy = WorkerCompletion::Failure {
+            reason: "Worker invocation failed after it may have modified external state: protocol failure: missing result.json. A fresh observation is required; do not repeat the same task unless reality materially changed.".into(),
+        };
+        let context = prior_context(Some(&legacy), None);
+        let prompt = decider_prompt(
+            "Keep PRs approval-ready",
+            &serde_json::json!({"head": "unchanged", "mergeable": "CONFLICTING"}),
+            &context,
+            3,
+        );
+        let contract = prompt.split("\nGOAL:\n").next().unwrap();
+        assert!(contract.contains("one bounded read-only reconciliation task"));
+        assert!(contract.contains("even when the observed head or other task identity is unchanged"));
+        assert!(contract.contains("Reconciliation must not replay mutations"));
+        assert!(contract.contains("does not prove that no effects occurred"));
+        assert!(contract.contains("Only after reconciliation establishes safe remaining work"));
+        assert!(contract.contains("existing retry budgets and backoff"));
+        assert!(contract.contains("Do not repeat an inconclusive reconciliation"));
+        assert!(contract.contains("do not retry the blocked work until relevant evidence changes"));
+        assert!(contract.contains("older blanket retry prohibitions"));
+        assert!(!contract.contains("unless reality materially changed"));
+        // Retain old evidence verbatim, but only below the authoritative contract.
+        assert!(prompt.ends_with(&format!("{context}\n")));
     }
 
     #[test]

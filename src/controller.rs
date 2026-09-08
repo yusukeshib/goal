@@ -648,7 +648,7 @@ impl Controller {
 fn uncertain_worker_completion(error: &str) -> WorkerCompletion {
     WorkerCompletion::Failure {
         reason: format!(
-            "Worker invocation failed after it may have modified external state: {error}. A fresh observation is required; do not repeat the same task unless reality materially changed."
+            "Worker invocation failed after it may have modified external state: {error}. A fresh observation is required. A bounded read-only reconciliation may establish completed effects and safe remaining work even if the observed task identity is unchanged; do not blindly replay mutations or infer absence of effects from a missing result. Preserve the goal's retry budgets and backoff, and fail closed if effects remain uncertain."
         ),
     }
 }
@@ -685,7 +685,23 @@ fn parse_sensor_retry_after_hint(stderr: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FailureBackoff, cap_wait, parse_sensor_retry_after_hint};
+    use super::{FailureBackoff, cap_wait, parse_sensor_retry_after_hint, uncertain_worker_completion};
+
+    #[test]
+    fn uncertain_failure_preserves_evidence_and_allows_read_only_recovery() {
+        let error = "protocol failure: read /runs/worker/result.json: No such file";
+        let crate::model::WorkerCompletion::Failure { reason } = uncertain_worker_completion(error)
+        else {
+            panic!("uncertain effects must remain a failure");
+        };
+        assert!(reason.contains(error));
+        assert!(reason.contains("may have modified external state"));
+        assert!(reason.contains("A fresh observation is required"));
+        assert!(reason.contains("bounded read-only reconciliation"));
+        assert!(reason.contains("do not blindly replay mutations"));
+        assert!(reason.contains("fail closed if effects remain uncertain"));
+        assert!(!reason.contains("unless reality materially changed"));
+    }
 
     #[test]
     fn wait_duration_is_capped() {

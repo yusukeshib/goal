@@ -1671,6 +1671,78 @@ fn missing_worker_result_is_recorded_and_the_controller_resenses() {
 }
 
 #[test]
+fn missing_result_can_reconcile_then_resume_with_an_unchanged_observation() {
+    // Deterministic protocol/contract regression, not a model-behavior evaluation.
+    let fixture = Fixture::new(
+        r#"printf '{"head":"same-head","mergeable":"CONFLICTING"}'"#,
+        r#"
+n=0; test ! -f decider-count || n=$(cat decider-count)
+n=$((n+1)); echo "$n" > decider-count
+case "$n" in
+  1) r='{"type":"run_task","task":"initial attempt"}' ;;
+  2)
+    grep -q 'one bounded read-only reconciliation task' "$1"
+    grep -q 'even when the observed head or other task identity is unchanged' "$1"
+    grep -q 'protocol failure' "$1"
+    grep -q 'may have modified external state' "$1"
+    grep -q 'Only after reconciliation establishes safe remaining work' "$1"
+    r='{"type":"run_task","task":"read-only reconciliation of initial attempt"}' ;;
+  3)
+    grep -q 'reconciled initial attempt: no publication attempted; safe remaining work at same-head' "$1"
+    r='{"type":"run_task","task":"fresh guarded attempt at same-head"}' ;;
+  4) r='{"type":"complete","summary":"recovery sequence finished"}' ;;
+  *) exit 1 ;;
+esac
+printf '%s' "$r" > "$GOAL_RESULT_PATH"
+"#,
+        r#"
+n=0; test ! -f worker-count || n=$(cat worker-count)
+n=$((n+1)); echo "$n" > worker-count
+case "$n" in
+  1)
+    printf 'stopped before publication\n' > attempt-evidence
+    exit 0 ;;
+  2)
+    grep -q 'read-only reconciliation of initial attempt' "$GOAL_PROMPT_PATH"
+    grep -q 'stopped before publication' attempt-evidence
+    test ! -e published
+    r='{"type":"done","summary":"reconciled initial attempt: no publication attempted; safe remaining work at same-head"}' ;;
+  3)
+    grep -q 'fresh guarded attempt at same-head' "$GOAL_PROMPT_PATH"
+    test ! -e published
+    printf 'published once\n' > published
+    r='{"type":"done","summary":"remaining work published once"}' ;;
+  *) exit 1 ;;
+esac
+printf '%s' "$r" > "$GOAL_RESULT_PATH"
+"#,
+    );
+    let output = fixture.run();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fixture.count("decider-count"), 4);
+    assert_eq!(fixture.count("worker-count"), 3);
+    assert_eq!(
+        fs::read_to_string(fixture.dir.path().join("published")).unwrap(),
+        "published once\n"
+    );
+    let recorded = events(&fixture);
+    assert_eq!(
+        recorded.iter().filter(|event| event["type"] == "worker_failed").count(),
+        1
+    );
+    assert_eq!(
+        recorded.iter().filter(|event| event["type"] == "worker_completed").count(),
+        2
+    );
+    assert!(!recorded.iter().any(|event| event["type"] == "wait"));
+    assert!(recorded.iter().any(|event| event["type"] == "complete"));
+}
+
+#[test]
 fn malformed_worker_result_is_recorded_and_the_controller_resenses() {
     let fixture = Fixture::new(
         COUNT_SENSOR,
