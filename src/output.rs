@@ -1,6 +1,11 @@
 use std::{
+    fs::{self, OpenOptions},
     io::{self, Write},
-    sync::{Arc, Mutex},
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use anyhow::{Context, Result};
@@ -26,6 +31,13 @@ pub enum OutputMode {
 pub struct Output {
     mode: OutputMode,
     write_lock: Arc<Mutex<()>>,
+    service_log: Option<Arc<ServiceLogLimit>>,
+}
+
+struct ServiceLogLimit {
+    path: PathBuf,
+    max_bytes: u64,
+    rotation_disabled: AtomicBool,
 }
 
 #[derive(Serialize)]
@@ -41,7 +53,20 @@ impl Output {
         Self {
             mode,
             write_lock: Arc::new(Mutex::new(())),
+            service_log: None,
         }
+    }
+
+    pub fn for_service(mode: OutputMode, path: PathBuf, max_bytes: Option<u64>) -> Self {
+        let mut output = Self::new(mode);
+        output.service_log = max_bytes.map(|max_bytes| {
+            Arc::new(ServiceLogLimit {
+                path,
+                max_bytes,
+                rotation_disabled: AtomicBool::new(false),
+            })
+        });
+        output
     }
 
     pub fn event(&self, kind: &str, details: Value) -> Result<()> {
@@ -151,6 +176,17 @@ impl Output {
             .write_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("output lock poisoned"))?;
+        if let Some(limit) = &self.service_log {
+            // Rotation is maintenance-only: failure leaves the active service
+            // writing to its existing log instead of terminating the controller.
+            // Disable further attempts to avoid repeatedly copying a large log.
+            if !limit.rotation_disabled.load(Ordering::Relaxed)
+                && rotate_service_log_if_needed(&limit.path, limit.max_bytes, bytes.len() as u64)
+                    .is_err()
+            {
+                limit.rotation_disabled.store(true, Ordering::Relaxed);
+            }
+        }
         if stderr {
             let mut writer = io::stderr().lock();
             writer.write_all(bytes).context("write stderr")?;
@@ -162,6 +198,39 @@ impl Output {
         }
         Ok(())
     }
+}
+
+fn rotate_service_log_if_needed(path: &Path, max_bytes: u64, incoming_bytes: u64) -> Result<()> {
+    let current = match fs::metadata(path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("inspect service log for rotation"),
+    };
+    if current.saturating_add(incoming_bytes) <= max_bytes {
+        return Ok(());
+    }
+
+    let backup = path.with_file_name("service.log.1");
+    let temporary = path.with_file_name(format!(".service.log.1.{}.tmp", std::process::id()));
+    let result = (|| -> Result<()> {
+        fs::copy(path, &temporary).context("copy service log rotation backup")?;
+        OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .context("truncate rotated service log")?;
+        if let Err(error) = fs::rename(&temporary, &backup) {
+            fs::copy(&temporary, path).with_context(|| {
+                format!("restore service log after backup publication failed: {error}")
+            })?;
+            return Err(error).context("publish service log rotation backup");
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn child_prefix(role: &str, run_id: &str) -> String {
@@ -338,5 +407,38 @@ mod tests {
         assert_eq!(summary["role"], "assistant");
         assert_eq!(summary["message"]["type"], "tool_call");
         assert!(serde_json::to_vec(&summary).unwrap().len() < 1024);
+    }
+
+    #[test]
+    fn service_log_rotation_preserves_previous_segment_and_active_inode() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("service.log");
+        fs::write(&path, b"previous-segment").unwrap();
+        let identity = fs::metadata(&path).unwrap();
+
+        rotate_service_log_if_needed(&path, 16, 2).unwrap();
+
+        assert_eq!(
+            fs::read(directory.path().join("service.log.1")).unwrap(),
+            b"previous-segment"
+        );
+        assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(identity.ino(), fs::metadata(&path).unwrap().ino());
+        }
+    }
+
+    #[test]
+    fn service_log_below_limit_is_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("service.log");
+        fs::write(&path, b"current").unwrap();
+
+        rotate_service_log_if_needed(&path, 16, 2).unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"current");
+        assert!(!directory.path().join("service.log.1").exists());
     }
 }

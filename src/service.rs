@@ -454,6 +454,9 @@ pub fn tail(config_path: &Path, lines: usize, follow: bool) -> Result<()> {
             stdout.flush()?;
             continue;
         }
+        if rewind_if_truncated(&mut file)? {
+            continue;
+        }
         if service_for_config(config_path)?.is_none() {
             return Ok(());
         }
@@ -494,6 +497,15 @@ fn tail_start(file: &mut File, lines: usize) -> Result<u64> {
         }
     }
     Ok(0)
+}
+
+fn rewind_if_truncated(file: &mut File) -> Result<bool> {
+    let position = file.stream_position()?;
+    if file.metadata()?.len() >= position {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::Start(0))?;
+    Ok(true)
 }
 
 fn copy_available(file: &mut File, writer: &mut impl Write) -> Result<u64> {
@@ -693,5 +705,26 @@ mod tests {
         fs::write(&path, b"one\ntwo\nthree").unwrap();
         let mut file = File::open(path).unwrap();
         assert_eq!(tail_start(&mut file, 2).unwrap(), 4);
+    }
+
+    #[test]
+    fn follower_rewinds_after_active_log_is_truncated() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("log");
+        fs::write(&path, b"old segment").unwrap();
+        let mut file = File::open(&path).unwrap();
+        file.seek(SeekFrom::End(0)).unwrap();
+
+        OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        fs::write(&path, b"new").unwrap();
+
+        assert!(rewind_if_truncated(&mut file).unwrap());
+        let mut content = String::new();
+        file.read_to_string(&mut content).unwrap();
+        assert_eq!(content, "new");
     }
 }

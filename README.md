@@ -81,6 +81,7 @@ max_wait_seconds = 3600
 max_concurrency = 1          # optional worker cap; defaults to serial execution
 worker_observation = "full" # or "none" when the task is self-contained
 max_completed_runs = 200    # optional; prunes only finished run directories
+max_service_log_bytes = 16777216 # optional; rotate background log (minimum 64 KiB)
 
 [sensor]
 command = ["./sensor.sh"]
@@ -217,7 +218,7 @@ and when redirected. Ctrl-C stops the controller and its children. Use
 `--output pretty` to indent child JSON or `--output json` for strict JSONL envelopes.
 There is no fullscreen UI, keyboard navigation, or mouse capture.
 
-State, events, prompts, results, exact child logs, and run metadata are stored under `.goal/`. `stats` and `analysis` inspect these artifacts without starting children. When `max_completed_runs` is set, the controller retains the newest finished run directories and never prunes running, malformed, state, or event artifacts.
+State, events, prompts, results, exact child logs, and run metadata are stored under `.goal/`. `stats` and `analysis` inspect these artifacts without starting children. When `max_completed_runs` is set, the controller retains the newest finished run directories and never prunes running, malformed, state, or event artifacts. When `max_service_log_bytes` is set, background output rotates under its shared write lock: the prior segment becomes `.goal/service.log.1`, then the active inode is truncated so already-open stdout/stderr descriptors continue safely. Rotation failure leaves the controller running and preserves the existing log; foreground output is unaffected.
 
 ## Examples
 

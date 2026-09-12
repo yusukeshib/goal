@@ -77,6 +77,7 @@ const RUN_HELP: &str = r#"CONFIGURATION
     max_concurrency = 1          # optional worker cap; defaults to 1
     worker_observation = "full" # optional: "none" for self-contained tasks
     max_completed_runs = 200    # optional: retain newest finished runs
+    max_service_log_bytes = 16777216 # optional: rotate background log at >=64 KiB
 
     [sensor]
     command = ["./sensor.sh"]
@@ -216,7 +217,10 @@ OUTPUT
   to 16 KiB as one terminal block and leaves larger diagnostics unformatted.
   stdout.log and stderr.log retain the exact received byte streams. For
   foreground controllers, --output json emits strict JSONL envelopes on stdout.
-  Background controllers always append plain output to .goal/service.log.
+  Background controllers append plain output to .goal/service.log. When
+  max_service_log_bytes is set, the previous segment is atomically published as
+  .goal/service.log.1 and the active inode is truncated under the output lock
+  before the next write would cross the configured threshold.
   phase_started includes the run ID, expanded argv, working directory, timeout,
   prompt/result paths, and prompt delivery mode; worker phases also include the
   selected task. JSON diagnostics over 16 KiB are summarized; inputs over 1 MiB
@@ -624,7 +628,15 @@ fn run_controller(
 
     let config_path = loaded.config_path.clone();
     let project_dir = loaded.project_dir.clone();
-    let output = output::Output::new(output_mode);
+    let output = if foreground {
+        output::Output::new(output_mode)
+    } else {
+        output::Output::for_service(
+            output_mode,
+            project_dir.join(".goal/service.log"),
+            loaded.config.max_service_log_bytes,
+        )
+    };
     let controller = controller::Controller::new(loaded, Arc::clone(&cancelled), output)?;
     let registration =
         service::Registration::create(&config_path, &project_dir, foreground, cancelled)?;

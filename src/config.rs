@@ -6,6 +6,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+const MIN_SERVICE_LOG_BYTES: u64 = 64 * 1024;
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -19,6 +21,8 @@ pub struct Config {
     pub worker_observation: WorkerObservation,
     #[serde(default)]
     pub max_completed_runs: Option<usize>,
+    #[serde(default)]
+    pub max_service_log_bytes: Option<u64>,
     pub sensor: CommandConfig,
     pub decider: CommandConfig,
     pub worker: CommandConfig,
@@ -119,6 +123,12 @@ impl Config {
         if self.max_completed_runs == Some(0) {
             bail!("max_completed_runs must be greater than zero when set");
         }
+        if self
+            .max_service_log_bytes
+            .is_some_and(|bytes| bytes < MIN_SERVICE_LOG_BYTES)
+        {
+            bail!("max_service_log_bytes must be at least {MIN_SERVICE_LOG_BYTES}");
+        }
         validate_command("sensor", &self.sensor)?;
         validate_command("decider", &self.decider)?;
         validate_command("worker", &self.worker)?;
@@ -168,6 +178,7 @@ timeout_seconds = 1
         assert_eq!(loaded.project_dir, fs::canonicalize(dir.path()).unwrap());
         assert_eq!(loaded.config.worker_observation, WorkerObservation::Full);
         assert_eq!(loaded.config.max_completed_runs, None);
+        assert_eq!(loaded.config.max_service_log_bytes, None);
         assert_eq!(loaded.config.max_concurrency, 1);
     }
 
@@ -176,13 +187,14 @@ timeout_seconds = 1
         let dir = tempfile::tempdir().unwrap();
         let text = valid().replace(
             "max_wait_seconds = 10",
-            "max_wait_seconds = 10\nworker_observation = \"none\"\nmax_completed_runs = 25\nmax_concurrency = 3",
+            "max_wait_seconds = 10\nworker_observation = \"none\"\nmax_completed_runs = 25\nmax_service_log_bytes = 16777216\nmax_concurrency = 3",
         );
         fs::write(dir.path().join("goal.toml"), text).unwrap();
         fs::write(dir.path().join("GOAL.md"), "Ship the feature").unwrap();
         let loaded = LoadedConfig::load(&dir.path().join("goal.toml")).unwrap();
         assert_eq!(loaded.config.worker_observation, WorkerObservation::None);
         assert_eq!(loaded.config.max_completed_runs, Some(25));
+        assert_eq!(loaded.config.max_service_log_bytes, Some(16_777_216));
         assert_eq!(loaded.config.max_concurrency, 3);
     }
 
@@ -207,6 +219,14 @@ timeout_seconds = 1
             valid().replace(
                 "max_wait_seconds = 10",
                 "max_wait_seconds = 10\nworker_observation = \"selected\"",
+            ),
+            valid().replace(
+                "max_wait_seconds = 10",
+                "max_wait_seconds = 10\nmax_service_log_bytes = 0",
+            ),
+            valid().replace(
+                "max_wait_seconds = 10",
+                "max_wait_seconds = 10\nmax_service_log_bytes = 65535",
             ),
         ];
         for (index, text) in invalid.iter().enumerate() {
